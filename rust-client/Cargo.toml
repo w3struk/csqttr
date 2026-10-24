@@ -55,6 +55,23 @@ nix = { version = "0.31.3", features = ["socket", "uio"] }
 proptest = "1.11.0"
 tokio = { version = "1.53.1", features = ["test-util"] }
 
+[profile.dev]
+# The client handles crypto and RTP in the data path, so the stock
+# opt-level = 0 build is far too slow for interactive debugging.
+opt-level = 1
+# Keep file:line for panics and backtraces, but drop the full debuginfo: the
+# debug APK ships these binaries for three ABIs, and full debuginfo makes each
+# one ~200 MB (measured, arm64-v8a) without adding anything at runtime.
+debug = "line-tables-only"
+
+# Shipped into the debug APK: same code generation as dev, but the DWARF line
+# tables are stripped, because the full debuginfo of this binary is ~200 MB per
+# ABI and the debug APK carries three of them. Host builds (cargo test, cargo run)
+# keep the plain dev profile with full debuginfo.
+[profile.android-debug]
+inherits = "dev"
+strip = "debuginfo"
+
 [profile.release]
 opt-level = 3
 lto = true

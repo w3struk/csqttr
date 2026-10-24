@@ -5,7 +5,9 @@ import android.content.Context
 import android.content.Intent
 import android.os.SystemClock
 import android.util.Base64
+import android.util.Log
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -16,10 +18,12 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.sync.withLock
+import java.io.BufferedReader
 import java.io.File
 import java.lang.ref.WeakReference
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import org.json.JSONObject
 
 import androidx.compose.runtime.Immutable
@@ -1179,7 +1183,7 @@ object TunnelManager {
 
         val pb = ProcessBuilder(cmd)
         pb.directory(context.filesDir)
-        pb.redirectErrorStream(true)
+        pb.redirectErrorStream(false)
         pb.environment()["LD_LIBRARY_PATH"] = context.applicationInfo.nativeLibraryDir
         pb.environment()[CsqttConstants.Tunnel.PROCESS_ENV_EVENTS] = "1"
         pb.environment()["RAYON_NUM_THREADS"] = "2"
@@ -1278,287 +1282,29 @@ object TunnelManager {
     private fun startLogReader(identity: ProcessIdentity) {
         val targetProcess = identity.process
         readerJob = activeScope.launch {
-            val reader = targetProcess.inputStream.bufferedReader()
-            var lastDiagnostic: String? = null
-
+            val lastDiagnostic = AtomicReference<String?>(null)
             try {
-                reader.forEachLine { line ->
-                    if (!isCurrent(identity)) return@forEachLine
-
-                    val stripped =
-                        if (line.length > 19 && line[0].isDigit() && line[4] == '/') {
-                            line.replace(LOG_TIMESTAMP_PREFIX, "")
-                        } else {
-                            line
-                        }
-                    var lineTrim = stripped.trim()
-                    val eventPrefix = CsqttConstants.General.CSQTT_EVENT_PREFIX
-                    val eventIdx = lineTrim.indexOf(eventPrefix)
-                    if (eventIdx >= 0) {
-                        val eventPart = lineTrim.substring(eventIdx)
-                        lineTrim = lineTrim.substring(0, eventIdx).trim()
-                        val event = TunnelEventParser.parse(eventPart)
-                        if (event != null) {
-                            handleTunnelEvent(event, identity)
-                        }
-                        if (lineTrim.isEmpty()) {
-                            return@forEachLine
-                        }
-                    } else {
-                        val event = TunnelEventParser.parse(lineTrim)
-                        if (event != null && handleTunnelEvent(event, identity)) {
-                            return@forEachLine
-                        }
-                    }
-
-                    val isCritical = lineTrim.startsWith("CAPTCHA_SOLVE|") ||
-                        lineTrim.contains("FATAL_") ||
-                        lineTrim.contains("[ФАТАЛ]", true) ||
-                        lineTrim.contains("[PANIC]", true) ||
-                        lineTrim.contains("AUTH_RETRY") ||
-                        lineTrim.contains("WRAP_AUTH_TIMEOUT", true) ||
-                        lineTrim.contains("[WRAP]") ||
-                        lineTrim.startsWith("[ВОРКЕР") ||
-                        lineTrim.startsWith("[КРЕД") ||
-                        lineTrim.startsWith("[СЕТЬ]") ||
-                        lineTrim.startsWith("[ПОТОКИ]") ||
-                        lineTrim.startsWith("[VK JS]") ||
-                        lineTrim.contains("DENIED:", true) ||
-                        lineTrim.contains("Ошибка", true) ||
-                        lineTrim.contains("error", true) ||
-                        lineTrim.contains("FAIL", true)
-
-                    if (lineTrim.contains("[КЛИЕНТ] Все воркеры завершены", true) || isCritical) {
-                        lastDiagnostic = lineTrim.take(240)
-                    }
-
-                    if (!isLoggingEnabled && !isCritical) {
-                        return@forEachLine
-                    }
-
-                    if (TunnelLogPolicy.isInternalRecovery(lineTrim)) {
-                        return@forEachLine
-                    }
-
-                    if (lineTrim.contains("WRAP_AUTH_TIMEOUT", true)) {
-                        if (activeWorkers.value > 0) {
-                            wrapAuthTimeoutCount = 0
-                            updateProcessLog(
-                                identity,
-                                "wrap_timeout_recovered",
-                                "[WRAP] Один поток не прошёл handshake, активных=${activeWorkers.value}; повторяем",
-                                50,
-                                true
-                            )
-                        } else {
-                            wrapAuthTimeoutCount++
-                            updateProcessLog(
-                                identity,
-                                "wrap_timeout_wait",
-                                "[WRAP] Handshake не подтвердился, проверяем пароль/сеть ($wrapAuthTimeoutCount)",
-                                50,
-                                true
-                            )
-                        }
-                        return@forEachLine
-                    }
-
-                    if (lineTrim.contains("FATAL_AUTH") || lineTrim.contains("AUTH_RETRY")) {
-                        val reason = when {
-                            lineTrim.contains("неверный пароль") -> "Неверный пароль подключения"
-                            lineTrim.contains("истёк") -> "Срок действия пароля истёк"
-                            lineTrim.contains("деактивирован") -> "Аккаунт деактивирован"
-                            else -> "Ошибка авторизации"
-                        }
-                        handleCriticalError("\uD83D\uDD12 $reason. Воркеры остановлены.", identity)
-                        return@forEachLine
-                    }
-
-                    if (lineTrim.contains("FATAL_PROTOCOL")) {
-                        handleCriticalError(
-                            "🔁 Клиент и сервер используют разные версии протокола. Выполните деплой из этой версии приложения. Воркеры остановлены.",
+                coroutineScope {
+                    launch {
+                        pumpRustStream(
                             identity,
+                            targetProcess,
+                            targetProcess.inputStream.bufferedReader(),
+                            RustLogStream.PROTOCOL,
+                            lastDiagnostic,
                         )
-                        return@forEachLine
                     }
-
-                    if (lineTrim.startsWith("CAPTCHA_SOLVE|")) {
-                        val payload = lineTrim.substringAfter("CAPTCHA_SOLVE|")
-                        val parts = payload.split("|", limit = 3)
-                        when (parts.size) {
-                            3 -> {
-                                val requestMode = parts[0]
-                                val redirectUri = parts[1]
-                                val sessionToken = parts[2]
-                                activeScope.launch {
-                                    if (isCurrent(identity)) {
-                                        handleCaptchaSolve(requestMode, redirectUri, sessionToken, identity)
-                                    }
-                                }
-                            }
-                            2 -> {
-                                val redirectUri = parts[0]
-                                val sessionToken = parts[1]
-                                activeScope.launch {
-                                    if (isCurrent(identity)) {
-                                        handleCaptchaSolve("selected", redirectUri, sessionToken, identity)
-                                    }
-                                }
-                            }
-                            else -> {
-                                writeCaptchaResult("error:invalid CAPTCHA_SOLVE format", identity)
-                            }
-                        }
-                        return@forEachLine
+                    launch {
+                        pumpRustStream(
+                            identity,
+                            targetProcess,
+                            targetProcess.errorStream.bufferedReader(),
+                            RustLogStream.DIAGNOSTIC,
+                            lastDiagnostic,
+                        )
                     }
-
-                    val isError = lineTrim.contains("Ошибка", true) || lineTrim.contains("error", true) || lineTrim.contains("FAIL", true) || lineTrim.contains("timeout", true) || lineTrim.contains("refused", true) || lineTrim.contains("FATAL_", true)
-
-                    when {
-                        lineTrim.contains("[КАПЧА] AUTO:") -> {
-                            var text = lineTrim.substringAfter("[КАПЧА] AUTO:").trim()
-                            text = text.replace(Regex("\\s*\\([^)]+\\)\\s*"), " ").trim()
-
-                            val isErr = text.contains("ошибка", true) ||
-                                text.contains("timeout", true) ||
-                                text.contains("не решил", true)
-                            val stableKey = when {
-                                text.contains("старт") -> "captcha_auto_1"
-                                (text.contains("Go v2") || text.contains("Rust v2")) && text.contains("2 попыт") -> "captcha_auto_2"
-                                text.contains("WBV Auto попытка") -> "captcha_auto_3"
-                                text.contains("финальная") -> "captcha_auto_4"
-                                text.contains("ручной WebView") -> "captcha_auto_5"
-                                text.contains("решил") || text.contains("решила") -> "captcha_auto_done"
-                                else -> "captcha_auto_${text.take(18).hashCode()}"
-                            }
-                            updateProcessLog(identity, stableKey, "[КАПЧА AUTO] $text", 60, isErr)
-                        }
-
-                        lineTrim.contains("[КАПЧА] RJS:") -> {
-                            var text = lineTrim.substringAfter("[КАПЧА] RJS:").trim()
-                            text = text.replace(Regex("\\s*\\([^)]+\\)\\s*"), " ").trim()
-
-                            val stableKey = when {
-                                text.contains("Загрузка") || text.contains("fetch") -> "captcha_rjs_1"
-                                text.contains("PoW") -> "captcha_rjs_2"
-                                text.contains("осматривает") || text.contains("человек") -> "captcha_rjs_3"
-                                text.contains("captchaNotRobot") || text.contains("Отправка") -> "captcha_rjs_4"
-                                text.contains("endSession") -> "captcha_rjs_5"
-                                text.contains("решена") -> "captcha_rjs_6"
-                                else -> "captcha_rjs_${text.take(15).hashCode()}"
-                            }
-                            updateProcessLog(identity, stableKey, "[КАПЧА RJS] $text", 60, false)
-                        }
-
-                        lineTrim.contains("[КАПЧА] WBV:") -> {
-                            var text = lineTrim.substringAfter("[КАПЧА] WBV:").trim()
-                            text = text.replace(Regex("\\s*\\([^)]+\\)\\s*"), " ").trim()
-
-                            val isErr = text.contains("Ошибка")
-                            val stableKey = when {
-                                text.contains("Запрос") -> "captcha_wv_step_2"
-                                text.contains("Токен") -> "captcha_wv_step_5"
-                                isErr -> "captcha_wv_err"
-                                else -> "captcha_wv_go_other"
-                            }
-                            updateProcessLog(identity, stableKey, "[КАПЧА WBV] $text", 60, isErr)
-                        }
-
-                        lineTrim.contains("Решаю VK Smart Captcha") ->
-                            updateProcessLog(identity, "captcha_start", "[КАПЧА] Решение капчи...", 60, false)
-                        lineTrim.contains("Smart Captcha решена") ->
-                            updateProcessLog(identity, "captcha_done", "[КАПЧА] Капча решена ✓", 60, false)
-                        lineTrim.contains("капча не решена") || lineTrim.contains("ошибка решения капчи") ->
-                            updateProcessLog(identity, "captcha_failed", "[КАПЧА] Ошибка решения капчи", 99, true, LogLevel.ERR)
-                        lineTrim == "[VK JS] Звонок создан" || lineTrim.contains("Звонок VK создан") || lineTrim.contains("Звонок создан") -> {
-                            updateProcessLog(identity, "vk_js_call_progress", "[VK JS] Звонок VK создан ✓", 16, false, LogLevel.OK)
-                        }
-                        lineTrim.startsWith("[VK JS] Создатель вышел из звонков") ->
-                            updateProcessLog(identity, "vk_js_creator_left", "[VK JS] Владелец вышел из звонка ✓", 19, false, LogLevel.OK)
-                        lineTrim.startsWith("[VK JS] Звонки завершены") ->
-                            updateProcessLog(identity, "vk_js_call_finished", "[VK JS] Звонок завершён ✓", 19, false, LogLevel.OK)
-                        lineTrim.startsWith("[VK JS] Создатель удерживает звонок") ->
-                            updateProcessLog(identity, "vk_js_creator_held", "[VK JS] Владелец удерживает звонок до отключения", 18, false, LogLevel.OK)
-
-                        lineTrim.startsWith("[VK JS] Креды аккаунта") && lineTrim.contains("недоступны") -> {
-                            updateProcessLog(identity, "vk_js_account_credentials_progress", "[VK JS] Креды аккаунта недоступны", 17, true, LogLevel.ERR)
-                        }
-                        lineTrim.startsWith("[VK JS] Креды аккаунта") -> {
-                            updateProcessLog(identity, "vk_js_account_credentials_progress", "[VK JS] Креды аккаунта готовы ✓", 17, false, LogLevel.OK)
-                        }
-                        lineTrim.startsWith("[VK JS] Переход на Авто") -> {
-                            val text = lineTrim.substringAfter("[VK JS]").trim()
-                            val failed = text.contains("не выполнен")
-                            val suffix = if (failed) "" else " ✓"
-                            updateProcessLog(identity, "vk_js_account_fallback_progress", "[VK JS] $text$suffix", 17, failed, if (failed) LogLevel.ERR else LogLevel.OK)
-                        }
-                        lineTrim.contains("[WRAP]") -> {
-                            updateProcessLog(identity, "wrap_status", "[WRAP] Ключ вычислен ✓", 10, false, LogLevel.OK)
-                        }
-                        lineTrim.startsWith("[ПОТОКИ]") -> {
-                            val text = lineTrim.substringAfter("[ПОТОКИ]").trim()
-                            val isRepair = text.contains("не пришёл", true) ||
-                                text.contains("частично", true) ||
-                                text.contains("Перезапуск", true)
-                            val (stableKey, priority) = when {
-                                text.startsWith("Отправлен ping", true) -> "stream_probe_ping" to 56
-                                text.startsWith("ACK получен", true) || text.startsWith("Все активные", true) -> "stream_probe_ack" to 57
-                                text.contains("ChannelBind", true) -> "stream_probe_rebind" to 58
-                                text.contains("проверяю", true) -> "stream_probe_all" to 58
-                                text.contains("Перезапуск", true) -> "stream_probe_restart" to 59
-                                else -> "stream_probe_${text.take(24).hashCode()}" to 59
-                            }
-                            updateProcessLog(identity, stableKey, "[ПОТОКИ] $text", priority, isRepair, if (isRepair) LogLevel.ERR else LogLevel.LOG)
-                        }
-                        lineTrim.contains("[TURN]") -> {
-                            val text = lineTrim.substringAfter("[TURN]").trim()
-                            if (text.contains("Используются TURN IP", true)) {
-                                return@forEachLine
-                            }
-                            val turnError = TunnelLogPolicy.isTurnStreamFailure(lineTrim) || isError
-                            val (stableKey, priority) = when {
-                                turnError -> "turn_error_${text.hashCode()}" to 99
-                                text.contains("CreatePermission", true) -> "turn_permission_status" to 52
-                                text.contains("ChannelBind", true) || text.contains("Канал", true) -> "turn_channel_status" to 53
-                                text.contains("готова к передаче", true) -> "turn_ready_status" to 54
-                                text.contains("Refresh", true) -> "turn_refresh_status" to 55
-                                else -> null to 0
-                            }
-                            if (stableKey != null) {
-                                updateProcessLog(identity, stableKey, "[TURN] $text", priority, turnError, if (turnError) LogLevel.ERR else LogLevel.LOG)
-                            }
-                        }
-                        lineTrim.contains("Рукопожатие...") ->
-                            updateProcessLog(identity, "peer_handshake", "Рукопожатие...", 65, false)
-
-                        isError -> {
-                            val errorKey = when {
-                                lineTrim.contains("lookup login.vk.ru", true) -> "err_vk_dns"
-                                lineTrim.contains("connection refused") -> "err_conn_refused"
-                                lineTrim.contains("timeout") -> "err_timeout"
-                                lineTrim.contains("кредов") -> "err_creds"
-                                lineTrim.contains("PEER") -> "err_peer"
-                                else -> "general_error_" + lineTrim.take(15).hashCode()
-                            }
-                            val errorMessage = if (errorKey == "err_vk_dns") {
-                                "[СЕТЬ] DNS до VK недоступен: login.vk.ru"
-                            } else {
-                                lineTrim
-                            }
-                            updateProcessLog(identity, errorKey, errorMessage, 99, true)
-                        }
-                    }
-                }
-            } catch (e: Exception) {
-                if (
-                    isCurrent(identity) &&
-                    targetProcess.isAlive &&
-                    !e.readableMessage().contains("read interrupted by close", ignoreCase = true)
-                ) {
-                    lastDiagnostic = e.readableMessage().take(240)
                 }
             } finally {
-                runCatching { reader.close() }
                 startStopMutex.withLock {
                     if (processIdentity === identity && process === targetProcess) {
                         val lifecycleWantsRestart = lifecycleState.processEnded(identity.ticket)
@@ -1604,7 +1350,7 @@ object TunnelManager {
                         }
                         if (shouldRestart && restartParams != null && restartContext != null) {
                             currentParams = restartParams
-                            val reason = lastDiagnostic?.let { " Причина: $it" }.orEmpty()
+                            val reason = lastDiagnostic.get()?.let { " Причина: $it" }.orEmpty()
                             updateLog(
                                 "process_restart",
                                 "✗ Rust-клиент завершился (код ${exitCode ?: "?"}). Перезапуск...$reason",
@@ -1630,13 +1376,332 @@ object TunnelManager {
                             updateLog(
                                 "process_exit",
                                 "✗ Rust-клиент завершился без перезапуска (код ${exitCode ?: "?"})." +
-                                    lastDiagnostic?.let { " Причина: $it" }.orEmpty(),
+                                    lastDiagnostic.get()?.let { " Причина: $it" }.orEmpty(),
                                 99,
                                 true,
                             )
                         }
                     }
                 }
+            }
+        }
+    }
+
+
+    private suspend fun pumpRustStream(
+        identity: ProcessIdentity,
+        targetProcess: Process,
+        reader: BufferedReader,
+        stream: RustLogStream,
+        lastDiagnostic: AtomicReference<String?>,
+    ) {
+        try {
+            reader.forEachLine { line ->
+                handleLogLine(identity, line, stream, lastDiagnostic)
+            }
+        } catch (e: kotlin.coroutines.cancellation.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            if (
+                isCurrent(identity) &&
+                targetProcess.isAlive &&
+                !e.readableMessage().contains("read interrupted by close", ignoreCase = true)
+            ) {
+                lastDiagnostic.set(e.readableMessage().take(240))
+            }
+        } finally {
+            runCatching { reader.close() }
+        }
+    }
+
+    private fun handleLogLine(
+        identity: ProcessIdentity,
+        line: String,
+        stream: RustLogStream,
+        lastDiagnostic: AtomicReference<String?>,
+    ) {
+        if (!isCurrent(identity)) return
+
+        val stripped =
+            if (line.length > 19 && line[0].isDigit() && line[4] == '/') {
+                line.replace(LOG_TIMESTAMP_PREFIX, "")
+            } else {
+                line
+            }
+        var lineTrim = stripped.trim()
+        mirrorRustLineToLogcat(lineTrim, stream)
+        val eventPrefix = CsqttConstants.General.CSQTT_EVENT_PREFIX
+        val eventIdx = lineTrim.indexOf(eventPrefix)
+        if (eventIdx >= 0) {
+            val eventPart = lineTrim.substring(eventIdx)
+            lineTrim = lineTrim.substring(0, eventIdx).trim()
+            val event = TunnelEventParser.parse(eventPart)
+            if (event != null) {
+                handleTunnelEvent(event, identity)
+            }
+            if (lineTrim.isEmpty()) {
+                return
+            }
+        } else {
+            val event = TunnelEventParser.parse(lineTrim)
+            if (event != null && handleTunnelEvent(event, identity)) {
+                return
+            }
+        }
+
+        val isCritical = lineTrim.startsWith("CAPTCHA_SOLVE|") ||
+            lineTrim.contains("FATAL_") ||
+            lineTrim.contains("[ФАТАЛ]", true) ||
+            lineTrim.contains("[PANIC]", true) ||
+            lineTrim.contains("AUTH_RETRY") ||
+            lineTrim.contains("WRAP_AUTH_TIMEOUT", true) ||
+            lineTrim.contains("[WRAP]") ||
+            lineTrim.startsWith("[ВОРКЕР") ||
+            lineTrim.startsWith("[КРЕД") ||
+            lineTrim.startsWith("[СЕТЬ]") ||
+            lineTrim.startsWith("[ПОТОКИ]") ||
+            lineTrim.startsWith("[VK JS]") ||
+            lineTrim.contains("DENIED:", true) ||
+            lineTrim.contains("Ошибка", true) ||
+            lineTrim.contains("error", true) ||
+            lineTrim.contains("FAIL", true)
+
+        if (lineTrim.contains("[КЛИЕНТ] Все воркеры завершены", true) || isCritical) {
+            lastDiagnostic.set(lineTrim.take(240))
+        }
+
+        if (!isLoggingEnabled && !isCritical) {
+            return
+        }
+
+        if (TunnelLogPolicy.isInternalRecovery(lineTrim)) {
+            return
+        }
+
+        if (lineTrim.contains("WRAP_AUTH_TIMEOUT", true)) {
+            if (activeWorkers.value > 0) {
+                wrapAuthTimeoutCount = 0
+                updateProcessLog(
+                    identity,
+                    "wrap_timeout_recovered",
+                    "[WRAP] Один поток не прошёл handshake, активных=${activeWorkers.value}; повторяем",
+                    50,
+                    true
+                )
+            } else {
+                wrapAuthTimeoutCount++
+                updateProcessLog(
+                    identity,
+                    "wrap_timeout_wait",
+                    "[WRAP] Handshake не подтвердился, проверяем пароль/сеть ($wrapAuthTimeoutCount)",
+                    50,
+                    true
+                )
+            }
+            return
+        }
+
+        if (lineTrim.contains("FATAL_AUTH") || lineTrim.contains("AUTH_RETRY")) {
+            val reason = when {
+                lineTrim.contains("неверный пароль") -> "Неверный пароль подключения"
+                lineTrim.contains("истёк") -> "Срок действия пароля истёк"
+                lineTrim.contains("деактивирован") -> "Аккаунт деактивирован"
+                else -> "Ошибка авторизации"
+            }
+            handleCriticalError("\uD83D\uDD12 $reason. Воркеры остановлены.", identity)
+            return
+        }
+
+        if (lineTrim.contains("FATAL_PROTOCOL")) {
+            handleCriticalError(
+                "🔁 Клиент и сервер используют разные версии протокола. Выполните деплой из этой версии приложения. Воркеры остановлены.",
+                identity,
+            )
+            return
+        }
+
+        if (lineTrim.startsWith("CAPTCHA_SOLVE|")) {
+            val payload = lineTrim.substringAfter("CAPTCHA_SOLVE|")
+            val parts = payload.split("|", limit = 3)
+            when (parts.size) {
+                3 -> {
+                    val requestMode = parts[0]
+                    val redirectUri = parts[1]
+                    val sessionToken = parts[2]
+                    activeScope.launch {
+                        if (isCurrent(identity)) {
+                            handleCaptchaSolve(requestMode, redirectUri, sessionToken, identity)
+                        }
+                    }
+                }
+                2 -> {
+                    val redirectUri = parts[0]
+                    val sessionToken = parts[1]
+                    activeScope.launch {
+                        if (isCurrent(identity)) {
+                            handleCaptchaSolve("selected", redirectUri, sessionToken, identity)
+                        }
+                    }
+                }
+                else -> {
+                    writeCaptchaResult("error:invalid CAPTCHA_SOLVE format", identity)
+                }
+            }
+            return
+        }
+
+        val isError = lineTrim.contains("Ошибка", true) || lineTrim.contains("error", true) || lineTrim.contains("FAIL", true) || lineTrim.contains("timeout", true) || lineTrim.contains("refused", true) || lineTrim.contains("FATAL_", true)
+
+        when {
+            lineTrim.contains("[КАПЧА] AUTO:") -> {
+                var text = lineTrim.substringAfter("[КАПЧА] AUTO:").trim()
+                text = text.replace(Regex("\\s*\\([^)]+\\)\\s*"), " ").trim()
+
+                val isErr = text.contains("ошибка", true) ||
+                    text.contains("timeout", true) ||
+                    text.contains("не решил", true)
+                val stableKey = when {
+                    text.contains("старт") -> "captcha_auto_1"
+                    (text.contains("Go v2") || text.contains("Rust v2")) && text.contains("2 попыт") -> "captcha_auto_2"
+                    text.contains("WBV Auto попытка") -> "captcha_auto_3"
+                    text.contains("финальная") -> "captcha_auto_4"
+                    text.contains("ручной WebView") -> "captcha_auto_5"
+                    text.contains("решил") || text.contains("решила") -> "captcha_auto_done"
+                    else -> "captcha_auto_${text.take(18).hashCode()}"
+                }
+                updateProcessLog(identity, stableKey, "[КАПЧА AUTO] $text", 60, isErr)
+            }
+
+            lineTrim.contains("[КАПЧА] RJS:") -> {
+                var text = lineTrim.substringAfter("[КАПЧА] RJS:").trim()
+                text = text.replace(Regex("\\s*\\([^)]+\\)\\s*"), " ").trim()
+
+                val stableKey = when {
+                    text.contains("Загрузка") || text.contains("fetch") -> "captcha_rjs_1"
+                    text.contains("PoW") -> "captcha_rjs_2"
+                    text.contains("осматривает") || text.contains("человек") -> "captcha_rjs_3"
+                    text.contains("captchaNotRobot") || text.contains("Отправка") -> "captcha_rjs_4"
+                    text.contains("endSession") -> "captcha_rjs_5"
+                    text.contains("решена") -> "captcha_rjs_6"
+                    else -> "captcha_rjs_${text.take(15).hashCode()}"
+                }
+                updateProcessLog(identity, stableKey, "[КАПЧА RJS] $text", 60, false)
+            }
+
+            lineTrim.contains("[КАПЧА] WBV:") -> {
+                var text = lineTrim.substringAfter("[КАПЧА] WBV:").trim()
+                text = text.replace(Regex("\\s*\\([^)]+\\)\\s*"), " ").trim()
+
+                val isErr = text.contains("Ошибка")
+                val stableKey = when {
+                    text.contains("Запрос") -> "captcha_wv_step_2"
+                    text.contains("Токен") -> "captcha_wv_step_5"
+                    isErr -> "captcha_wv_err"
+                    else -> "captcha_wv_go_other"
+                }
+                updateProcessLog(identity, stableKey, "[КАПЧА WBV] $text", 60, isErr)
+            }
+
+            lineTrim.contains("Решаю VK Smart Captcha") ->
+                updateProcessLog(identity, "captcha_start", "[КАПЧА] Решение капчи...", 60, false)
+            lineTrim.contains("Smart Captcha решена") ->
+                updateProcessLog(identity, "captcha_done", "[КАПЧА] Капча решена ✓", 60, false)
+            lineTrim.contains("капча не решена") || lineTrim.contains("ошибка решения капчи") ->
+                updateProcessLog(identity, "captcha_failed", "[КАПЧА] Ошибка решения капчи", 99, true, LogLevel.ERR)
+            lineTrim == "[VK JS] Звонок создан" || lineTrim.contains("Звонок VK создан") || lineTrim.contains("Звонок создан") -> {
+                updateProcessLog(identity, "vk_js_call_progress", "[VK JS] Звонок VK создан ✓", 16, false, LogLevel.OK)
+            }
+            lineTrim.startsWith("[VK JS] Создатель вышел из звонков") ->
+                updateProcessLog(identity, "vk_js_creator_left", "[VK JS] Владелец вышел из звонка ✓", 19, false, LogLevel.OK)
+            lineTrim.startsWith("[VK JS] Звонки завершены") ->
+                updateProcessLog(identity, "vk_js_call_finished", "[VK JS] Звонок завершён ✓", 19, false, LogLevel.OK)
+            lineTrim.startsWith("[VK JS] Создатель удерживает звонок") ->
+                updateProcessLog(identity, "vk_js_creator_held", "[VK JS] Владелец удерживает звонок до отключения", 18, false, LogLevel.OK)
+
+            lineTrim.startsWith("[VK JS] Креды аккаунта") && lineTrim.contains("недоступны") -> {
+                updateProcessLog(identity, "vk_js_account_credentials_progress", "[VK JS] Креды аккаунта недоступны", 17, true, LogLevel.ERR)
+            }
+            lineTrim.startsWith("[VK JS] Креды аккаунта") -> {
+                updateProcessLog(identity, "vk_js_account_credentials_progress", "[VK JS] Креды аккаунта готовы ✓", 17, false, LogLevel.OK)
+            }
+            lineTrim.startsWith("[VK JS] Переход на Авто") -> {
+                val text = lineTrim.substringAfter("[VK JS]").trim()
+                val failed = text.contains("не выполнен")
+                val suffix = if (failed) "" else " ✓"
+                updateProcessLog(identity, "vk_js_account_fallback_progress", "[VK JS] $text$suffix", 17, failed, if (failed) LogLevel.ERR else LogLevel.OK)
+            }
+            lineTrim.contains("[WRAP]") -> {
+                updateProcessLog(identity, "wrap_status", "[WRAP] Ключ вычислен ✓", 10, false, LogLevel.OK)
+            }
+            lineTrim.startsWith("[ПОТОКИ]") -> {
+                val text = lineTrim.substringAfter("[ПОТОКИ]").trim()
+                val isRepair = text.contains("не пришёл", true) ||
+                    text.contains("частично", true) ||
+                    text.contains("Перезапуск", true)
+                val (stableKey, priority) = when {
+                    text.startsWith("Отправлен ping", true) -> "stream_probe_ping" to 56
+                    text.startsWith("ACK получен", true) || text.startsWith("Все активные", true) -> "stream_probe_ack" to 57
+                    text.contains("ChannelBind", true) -> "stream_probe_rebind" to 58
+                    text.contains("проверяю", true) -> "stream_probe_all" to 58
+                    text.contains("Перезапуск", true) -> "stream_probe_restart" to 59
+                    else -> "stream_probe_${text.take(24).hashCode()}" to 59
+                }
+                updateProcessLog(identity, stableKey, "[ПОТОКИ] $text", priority, isRepair, if (isRepair) LogLevel.ERR else LogLevel.LOG)
+            }
+            lineTrim.contains("[TURN]") -> {
+                val text = lineTrim.substringAfter("[TURN]").trim()
+                if (text.contains("Используются TURN IP", true)) {
+                    return
+                }
+                val turnError = TunnelLogPolicy.isTurnStreamFailure(lineTrim) || isError
+                val (stableKey, priority) = when {
+                    turnError -> "turn_error_${text.hashCode()}" to 99
+                    text.contains("CreatePermission", true) -> "turn_permission_status" to 52
+                    text.contains("ChannelBind", true) || text.contains("Канал", true) -> "turn_channel_status" to 53
+                    text.contains("готова к передаче", true) -> "turn_ready_status" to 54
+                    text.contains("Refresh", true) -> "turn_refresh_status" to 55
+                    else -> null to 0
+                }
+                if (stableKey != null) {
+                    updateProcessLog(identity, stableKey, "[TURN] $text", priority, turnError, if (turnError) LogLevel.ERR else LogLevel.LOG)
+                }
+            }
+            lineTrim.contains("Рукопожатие...") ->
+                updateProcessLog(identity, "peer_handshake", "Рукопожатие...", 65, false)
+
+            isError -> {
+                val errorKey = when {
+                    lineTrim.contains("lookup login.vk.ru", true) -> "err_vk_dns"
+                    lineTrim.contains("connection refused") -> "err_conn_refused"
+                    lineTrim.contains("timeout") -> "err_timeout"
+                    lineTrim.contains("кредов") -> "err_creds"
+                    lineTrim.contains("PEER") -> "err_peer"
+                    else -> "general_error_" + lineTrim.take(15).hashCode()
+                }
+                val errorMessage = if (errorKey == "err_vk_dns") {
+                    "[СЕТЬ] DNS до VK недоступен: login.vk.ru"
+                } else {
+                    lineTrim
+                }
+                updateProcessLog(identity, errorKey, errorMessage, 99, true)
+            }
+        }
+    }
+
+    /**
+     * Mirrors one Rust line into logcat in debug builds only: the two pipes get
+     * distinct tags so `adb logcat -s CSQTT/Protocol,CSQTT/Diagnostic` shows the
+     * whole child-process stream next to the Kotlin logs. Release builds skip it.
+     */
+    private fun mirrorRustLineToLogcat(line: String, stream: RustLogStream) {
+        if (!BuildConfig.DEBUG) return
+        val tag = RustLogSinkPolicy.tag(stream)
+        val severity = RustLogSinkPolicy.severity(stream, line)
+        for (chunk in RustLogSinkPolicy.chunks(line)) {
+            when (severity) {
+                RustLogSeverity.DEBUG -> Log.d(tag, chunk)
+                RustLogSeverity.INFO -> Log.i(tag, chunk)
+                RustLogSeverity.ERROR -> Log.e(tag, chunk)
             }
         }
     }

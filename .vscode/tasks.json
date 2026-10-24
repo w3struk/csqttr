@@ -1,0 +1,52 @@
+{
+  // Gradle tasks for VSCodium.
+  //
+  // Both tasks call the Gradle install tasks directly: Gradle asks the device
+  // for its ABI at configuration time (scripts/device_abi.sh) and narrows the
+  // build to it, so cargo runs once per build and only one APK is packaged and
+  // installed instead of three splits plus the universal APK. No device
+  // connected? The build fails at configuration time with a clear message; name
+  // the ABI explicitly with -Pcsqtt.abis=<abi> to build without a device.
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Install release",
+      "type": "shell",
+      "command": "./gradlew",
+      "args": [
+        ":app:installCsqttRelease"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true
+      }
+    },
+    {
+      "label": "Install debug",
+      "type": "shell",
+      "command": "./gradlew",
+      "args": [
+        ":app:installCsqttDebug"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": "build",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true
+      }
+    }
+  ]
+}
