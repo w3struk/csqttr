@@ -320,7 +320,9 @@ impl UplinkState {
 
     fn evict_flows(&mut self, now: std::time::Instant) {
         self.flow_evict_counter = self.flow_evict_counter.wrapping_add(1);
-        if self.flow_evict_counter % FLOW_EVICT_EVERY != 0 && self.flows.len() < FLOW_TABLE_MAX {
+        if !self.flow_evict_counter.is_multiple_of(FLOW_EVICT_EVERY)
+            && self.flows.len() < FLOW_TABLE_MAX
+        {
             return;
         }
         self.flows
@@ -1909,7 +1911,10 @@ mod tests {
         for i in 1..320u64 {
             let now = start + Duration::from_micros(i * 15_625);
             let small = i % 2 == 0;
-            assert!(state.keeps_pin(now, if small { 120 } else { 1200 }, small), "packet {i}");
+            assert!(
+                state.keeps_pin(now, if small { 120 } else { 1200 }, small),
+                "packet {i}"
+            );
         }
     }
 

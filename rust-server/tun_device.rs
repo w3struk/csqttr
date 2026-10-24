@@ -218,7 +218,9 @@ impl ClientRoute {
 
     fn evict_flows(&mut self, now: std::time::Instant) {
         self.flow_evict_counter = self.flow_evict_counter.wrapping_add(1);
-        if self.flow_evict_counter % FLOW_EVICT_EVERY != 0 && self.flows.len() < FLOW_TABLE_MAX {
+        if !self.flow_evict_counter.is_multiple_of(FLOW_EVICT_EVERY)
+            && self.flows.len() < FLOW_TABLE_MAX
+        {
             return;
         }
         self.flows
@@ -663,10 +665,14 @@ mod tests {
         for i in 0..4000u64 {
             let now = start + std::time::Duration::from_micros(i * 520);
             let pkt = if i % 385 == 0 { &small } else { &big };
-            *per.entry(table.select_packet(2, now, pkt).unwrap().worker_id).or_insert(0usize) += 1;
+            *per.entry(table.select_packet(2, now, pkt).unwrap().worker_id)
+                .or_insert(0usize) += 1;
         }
         let top = per.values().copied().max().unwrap();
-        assert!(per.len() == 10 && top < 4000 / 5, "a bulk flow must use every stream: {per:?}");
+        assert!(
+            per.len() == 10 && top < 4000 / 5,
+            "a bulk flow must use every stream: {per:?}"
+        );
     }
 
     #[test]
@@ -681,9 +687,17 @@ mod tests {
         let mut ids = Vec::new();
         for i in 0..320u64 {
             let now = start + std::time::Duration::from_micros(i * 15_625);
-            ids.push(table.select_packet(2, now, if i % 2 == 0 { &small } else { &big }).unwrap().worker_id);
+            ids.push(
+                table
+                    .select_packet(2, now, if i % 2 == 0 { &small } else { &big })
+                    .unwrap()
+                    .worker_id,
+            );
         }
-        assert!(ids.iter().all(|&w| w == ids[0]), "a game flow must keep one stream: {ids:?}");
+        assert!(
+            ids.iter().all(|&w| w == ids[0]),
+            "a game flow must keep one stream: {ids:?}"
+        );
     }
 
     #[test]
