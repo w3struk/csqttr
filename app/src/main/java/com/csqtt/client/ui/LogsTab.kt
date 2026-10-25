@@ -42,6 +42,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.csqtt.client.DeployManager
 import com.csqtt.client.LogEntry
+import com.csqtt.client.LogTimestampPolicy
 import com.csqtt.client.R
 import com.csqtt.client.SettingsStore
 import com.csqtt.client.TunnelManager
@@ -142,7 +143,7 @@ private fun LogsTerminal() {
         ) {
             IconButton(
                 onClick = {
-                    val text = currentLogs.joinToString("\n") { "${it.message} (x${it.count})" }
+                    val text = currentLogs.joinToString("\n") { LogTimestampPolicy.copyLine(it) }
                     val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                     clipboard.setPrimaryClip(ClipData.newPlainText("CSQTT Logs", text))
                     context.showRaisedToast(copiedMessage, Toast.LENGTH_SHORT)

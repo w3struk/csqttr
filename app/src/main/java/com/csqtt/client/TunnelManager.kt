@@ -48,6 +48,7 @@ data class LogEntry(
     val priority: Int = 99, 
     val isError: Boolean = false,
     val level: LogLevel? = null,
+    val timestampMillis: Long,
 )
 
 private val LOG_STICKERS = Regex("[\\p{So}\\p{Sk}\\uFE0F\\u200D]")
@@ -144,6 +145,7 @@ object TunnelManager {
         val isError: Boolean,
         val level: LogLevel?,
         var count: Int,
+        var timestampMillis: Long,
     )
 
     private const val LOG_UI_FLUSH_MS = 120L
@@ -891,16 +893,18 @@ object TunnelManager {
         val cleanMessage = withoutLogStickers(message).take(MAX_LOG_MESSAGE_LENGTH)
         if (cleanMessage.isEmpty()) return
         val pendingKey = "${identity?.generation ?: 0L}:$key:$priority:$isError:${level?.name.orEmpty()}"
+        val timestamp = System.currentTimeMillis()
         synchronized(pendingLogLock) {
             val pending = pendingLogs[pendingKey]
             if (pending == null) {
                 if (pendingLogs.size >= MAX_PENDING_LOGS) {
                     pendingLogs.remove(pendingLogs.entries.first().key)
                 }
-                pendingLogs[pendingKey] = PendingLog(identity, key, cleanMessage, priority, isError, level, 1)
+                pendingLogs[pendingKey] = PendingLog(identity, key, cleanMessage, priority, isError, level, 1, timestamp)
             } else {
                 pending.message = cleanMessage
                 pending.count += 1
+                pending.timestampMillis = timestamp
             }
             scheduleLogFlushLocked()
         }
@@ -931,39 +935,26 @@ object TunnelManager {
         if (pending.isError && index == -1) {
             unreadErrorCount.value++
         }
+        val incoming = LogEntry(
+            key = pending.key,
+            message = pending.message,
+            count = pending.count,
+            priority = pending.priority,
+            isError = pending.isError,
+            level = pending.level,
+            timestampMillis = pending.timestampMillis,
+        )
         if (index != -1) {
             val entry = logs[index]
+            val merged = LogAggregationPolicy.merge(entry, incoming)
             if (entry.priority == pending.priority) {
-                logs[index] = entry.copy(
-                    count = entry.count + pending.count,
-                    message = pending.message,
-                    isError = pending.isError,
-                    level = pending.level,
-                )
+                logs[index] = merged
             } else {
                 logs.removeAt(index)
-                insertSorted(
-                    LogEntry(
-                        pending.key,
-                        pending.message,
-                        entry.count + pending.count,
-                        pending.priority,
-                        pending.isError,
-                        pending.level,
-                    )
-                )
+                insertSorted(merged)
             }
         } else {
-            insertSorted(
-                LogEntry(
-                    pending.key,
-                    pending.message,
-                    pending.count,
-                    pending.priority,
-                    pending.isError,
-                    pending.level,
-                )
-            )
+            insertSorted(incoming)
         }
 
         while (logs.size > MAX_LOG_ENTRIES) {

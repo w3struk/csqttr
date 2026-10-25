@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -23,6 +24,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.csqtt.client.LogEntry
 import com.csqtt.client.LogLevel
+import com.csqtt.client.LogTimestampPolicy
 import com.csqtt.client.ui.design.CsqttShapes
 import com.csqtt.client.ui.design.CsqttSpacing
 import com.csqtt.client.ui.design.CsqttTheme
@@ -171,6 +173,20 @@ internal fun LogLine(
         horizontalArrangement = Arrangement.spacedBy(CsqttSpacing.Sm),
         verticalAlignment = Alignment.Top,
     ) {
+        Text(
+            text = LogTimestampPolicy.format(entry.timestampMillis),
+            color = terminalColors.terminalMuted,
+            style = MaterialTheme.typography.bodySmall.copy(
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Normal,
+                lineHeight = 16.sp,
+            ),
+            fontFamily = FontFamily.Monospace,
+            maxLines = 1,
+            softWrap = false,
+            modifier = Modifier.width(52.dp),
+        )
+
         Surface(
             shape = CsqttShapes.Pill,
             color = tagColors.background,
