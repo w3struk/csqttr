@@ -224,6 +224,10 @@ class TunVpnService : VpnService() {
                     } else {
                         val settingsStore = SettingsStore(applicationContext)
                         ipWhite = settingsStore.ipIsWhitelist.first()
+                        // IP-роутинг включается ровно тогда, когда список непуст: отдельного
+                        // выключателя нет (сохранение IP ставит ipRoutingEnabled, ничего его не
+                        // снимает, у старых конфигов его нет), значит список и есть намерение —
+                        // то же правило, что в командной строке клиента и в сборщиках TunnelParams
                         ipListStr = if (ipWhite) {
                             settingsStore.directIpsWhite.first()
                         } else {
