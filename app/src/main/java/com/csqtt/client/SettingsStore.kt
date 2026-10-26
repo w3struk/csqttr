@@ -223,6 +223,9 @@ class SettingsStore(context: Context) {
         internal var cachedIsWhitelist: Boolean? = null
 
         @Volatile
+        internal var cachedShowSystemApps: Boolean? = null
+
+        @Volatile
         internal var cachedDomainRoutingEnabled: Boolean? = null
 
         @Volatile
@@ -676,6 +679,7 @@ class SettingsStore(context: Context) {
                 launch { excludedApps.collect { cachedExcludedApps = it } }
                 launch { whitelistApps.collect { cachedWhitelistApps = it } }
                 launch { isWhitelist.collect { cachedIsWhitelist = it } }
+                launch { showSystemApps.collect { cachedShowSystemApps = it } }
                 launch { domainRoutingEnabled.collect { cachedDomainRoutingEnabled = it } }
                 launch { domainIsWhitelist.collect { cachedDomainIsWhitelist = it } }
                 launch { excludeRuZonesEnabled.collect { cachedExcludeRuZonesEnabled = it } }

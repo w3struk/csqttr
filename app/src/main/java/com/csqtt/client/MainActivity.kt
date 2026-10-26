@@ -322,7 +322,9 @@ fun MainScreen(
     val whitelistApps by settingsStore.whitelistApps.collectAsStateWithLifecycle(
         initialValue = SettingsStore.cachedWhitelistApps ?: ""
     )
-    val showSystemApps by settingsStore.showSystemApps.collectAsStateWithLifecycle(initialValue = false)
+    val showSystemApps by settingsStore.showSystemApps.collectAsStateWithLifecycle(
+        initialValue = SettingsStore.cachedShowSystemApps ?: false
+    )
     val isWhitelist by settingsStore.isWhitelist.collectAsStateWithLifecycle(
         initialValue = SettingsStore.cachedIsWhitelist ?: false
     )

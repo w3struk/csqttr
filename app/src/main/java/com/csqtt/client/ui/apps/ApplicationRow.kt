@@ -91,14 +91,34 @@ internal fun AppRow(
             }
 
             Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                Text(
-                    text = app.name,
-                    style = MaterialTheme.typography.bodyLarge,
-                    fontWeight = if (isSelected) androidx.compose.ui.text.font.FontWeight.SemiBold else androidx.compose.ui.text.font.FontWeight.Normal,
-                    maxLines = 1,
-                    softWrap = false,
-                    overflow = TextOverflow.Ellipsis,
-                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Text(
+                        text = app.name,
+                        style = MaterialTheme.typography.bodyLarge,
+                        fontWeight = if (isSelected) androidx.compose.ui.text.font.FontWeight.SemiBold else androidx.compose.ui.text.font.FontWeight.Normal,
+                        maxLines = 1,
+                        softWrap = false,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                    if (app.isSystem) {
+                        Surface(
+                            shape = CsqttShapes.Small,
+                            color = colors.surfaceVariant,
+                            contentColor = colors.onSurfaceVariant,
+                        ) {
+                            Text(
+                                text = "Системное",
+                                style = MaterialTheme.typography.labelSmall,
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                            )
+                        }
+                    }
+                }
                 Text(
                     text = app.packageName,
                     style = MaterialTheme.typography.bodySmall,
