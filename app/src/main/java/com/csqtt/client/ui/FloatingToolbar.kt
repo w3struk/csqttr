@@ -41,7 +41,6 @@ import androidx.core.content.ContextCompat
 import androidx.compose.ui.platform.LocalContext
 import com.csqtt.client.ui.dialogs.ImportExportDialog
 import com.csqtt.client.ui.dialogs.QrScannerDialog
-import com.csqtt.client.ui.dialogs.SupportDeveloperDialog
 import com.csqtt.client.ui.dialogs.TurnSubnetsDialog
 
 private enum class UsageRole { Owner, Participant }
@@ -75,7 +74,6 @@ fun FloatingToolbar(
     )
     var isExpanded by rememberSaveable { mutableStateOf(false) }
     var showQrScanner by rememberSaveable { mutableStateOf(false) }
-    var showSupportDeveloperDialog by rememberSaveable { mutableStateOf(false) }
     var showImportExportDialog by rememberSaveable { mutableStateOf(false) }
     var showAutoPauseInfo by rememberSaveable { mutableStateOf(false) }
     var showTurnSubnetsDialog by rememberSaveable { mutableStateOf(false) }
@@ -105,18 +103,6 @@ fun FloatingToolbar(
         horizontalArrangement = Arrangement.spacedBy(4.dp),
         modifier = modifier
     ) {
-        IconButton(
-            onClick = { showSupportDeveloperDialog = true },
-            modifier = Modifier.size(38.dp),
-        ) {
-            Icon(
-                painter = painterResource(id = R.drawable.ic_donate_heart),
-                contentDescription = "Поддержать разработчика",
-                modifier = Modifier.size(24.dp),
-                tint = settingsIconTint,
-            )
-        }
-
         if (!csqttLinkMode) {
             IconButton(
                 onClick = { showImportExportDialog = true },
@@ -161,12 +147,6 @@ fun FloatingToolbar(
                 tint = settingsIconTint,
             )
         }
-    }
-
-    if (showSupportDeveloperDialog) {
-        SupportDeveloperDialog(
-            onDismissRequest = { showSupportDeveloperDialog = false }
-        )
     }
 
     if (showImportExportDialog) {
@@ -361,6 +341,10 @@ fun FloatingToolbar(
                             )
                         }
                     }
+
+                    CsqttActionsCard(
+                        settingsStore = settingsStore,
+                    )
                 }
             }
         }

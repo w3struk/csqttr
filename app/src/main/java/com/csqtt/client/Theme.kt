@@ -250,9 +250,6 @@ object CSQTTColors {
     val terminalCyan = Color(0xFF00BCD4)
     val terminalRed = Color(0xFFEF5350)
     val terminalCounter = Color(0xFF1E88E5)
-
-    val donate = Color(0xFF8B3FFD)
-    val telegram = Color(0xFF24A1DE)
 }
 
 @Composable

@@ -65,8 +65,6 @@ class SettingsStore(context: Context) {
         private val ACTIVE_PROFILE = intPreferencesKey("active_profile")
         private val SHOW_SYSTEM_APPS = booleanPreferencesKey("show_system_apps")
         private val LOGGING_ENABLED = booleanPreferencesKey("logging_enabled")
-        private val INFO_ACTIONS_EXPANDED = booleanPreferencesKey("info_actions_expanded")
-        private val INFO_PROJECT_EXPANDED = booleanPreferencesKey("info_project_expanded")
         private val CSQTT_LINK = stringPreferencesKey("csqtt_link")
         private val CSQTT_LINK_MODE = booleanPreferencesKey("csqtt_link_mode")
         private val PARTICIPANT_SHOW_LOGS = booleanPreferencesKey("participant_show_logs")
@@ -334,8 +332,6 @@ class SettingsStore(context: Context) {
     }
     val showSystemApps: Flow<Boolean> = dataStore.data.map { it[SHOW_SYSTEM_APPS] ?: false }
     val loggingEnabled: Flow<Boolean> = dataStore.data.map { it[LOGGING_ENABLED] ?: true }
-    val infoActionsExpanded: Flow<Boolean> = dataStore.data.map { it[INFO_ACTIONS_EXPANDED] ?: false }
-    val infoProjectExpanded: Flow<Boolean> = dataStore.data.map { it[INFO_PROJECT_EXPANDED] ?: false }
     val csqttLink: Flow<String> = dataStore.data.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(CSQTT_LINK, profile)] ?: ""
@@ -849,18 +845,6 @@ class SettingsStore(context: Context) {
     suspend fun saveLoggingEnabled(enabled: Boolean) {
         dataStore.edit { prefs ->
             prefs[LOGGING_ENABLED] = enabled
-        }
-    }
-
-    suspend fun saveInfoActionsExpanded(expanded: Boolean) {
-        dataStore.edit { prefs ->
-            prefs[INFO_ACTIONS_EXPANDED] = expanded
-        }
-    }
-
-    suspend fun saveInfoProjectExpanded(expanded: Boolean) {
-        dataStore.edit { prefs ->
-            prefs[INFO_PROJECT_EXPANDED] = expanded
         }
     }
 

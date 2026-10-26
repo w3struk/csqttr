@@ -175,11 +175,6 @@ object CsqttConstants {
 
     object Links {
         const val RELEASES = "https://github.com/amurcanov/csqtt/releases"
-        const val ISSUES = "https://github.com/amurcanov/csqtt/issues/new"
-        const val DEVELOPER_PROFILE = "https://github.com/amurcanov"
-        const val REPOSITORY = "https://github.com/amurcanov/csqtt"
-        const val TELEGRAM = "https://t.me/amurcanov_telegram"
-        const val TELEGRAM_HANDLE = "t.me/amurcanov_telegram"
     }
 
     object Patterns {

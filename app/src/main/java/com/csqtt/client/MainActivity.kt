@@ -72,7 +72,6 @@ import com.csqtt.client.ui.LogsTab
 import com.csqtt.client.ui.SettingsTab
 import com.csqtt.client.CsqttConstants
 import com.csqtt.client.ui.DeployTab
-import com.csqtt.client.ui.InfoTab
 import com.csqtt.client.ui.components.LocalCsqttHeaderActions
 import com.csqtt.client.ui.design.CsqttMotion
 import com.csqtt.client.ui.design.CsqttShapes
@@ -327,8 +326,6 @@ fun MainScreen(
     val isWhitelist by settingsStore.isWhitelist.collectAsStateWithLifecycle(
         initialValue = SettingsStore.cachedIsWhitelist ?: false
     )
-    val infoActionsExpanded by settingsStore.infoActionsExpanded.collectAsStateWithLifecycle(initialValue = false)
-    val infoProjectExpanded by settingsStore.infoProjectExpanded.collectAsStateWithLifecycle(initialValue = false)
     var selectedTab by rememberSaveable { mutableIntStateOf(0) }
     var tunnelValidationRequest by rememberSaveable { mutableIntStateOf(0) }
     val dragTargetIndex = remember { mutableIntStateOf(-1) }

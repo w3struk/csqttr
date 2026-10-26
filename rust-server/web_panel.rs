@@ -7949,7 +7949,7 @@ const PANEL_HTML: &str = r##"
         * { box-sizing: border-box; margin: 0; padding: 0; font-family: system-ui, -apple-system, 'Segoe UI', Roboto, Arial, sans-serif; }
         body { background-color: var(--bg-color); color: var(--text-main); min-height: 100vh; display: flex; flex-direction: column; overflow-x: hidden; width: 100%; }
 
-        body, header, .header-container, .brand, .brand-logo, .version-logo, .support-card, .header-actions, .btn, main, .glass-panel,
+        body, header, .header-container, .brand, .brand-logo, .version-logo, .header-actions, .btn, main, .glass-panel,
         .stat-card, .stat-icon, .stat-value, .stat-sub, .progress-bar, .progress-fill,
         .section-header, .section-title, .table-wrapper, table, th, td, tr,
         .client-name, .client-pw, .client-hash, .traffic-flex, .badge, .actions,
@@ -7966,25 +7966,6 @@ const PANEL_HTML: &str = r##"
         .brand { display: flex; align-items: center; flex: 0 1 auto; min-width: 0; }
         .brand-logo { display: block; width: 165px; height: auto; }
         .version-logo { display: block; width: 180px; height: auto; flex: 0 1 auto; }
-        .crypto-button {
-            display: inline-flex; align-items: center; justify-content: center; width: 100%;
-            height: 48px; min-height: 48px; padding: 0 16px; border: 0; border-radius: 12px;
-            background: #1e293b; box-shadow: 0 4px 12px rgba(30, 41, 59, 0.38); text-decoration: none; cursor: pointer;
-        }
-        .crypto-button:hover { background: #334155; transform: translateY(-1px); box-shadow: 0 6px 16px rgba(30, 41, 59, 0.48); }
-        .crypto-button:active { transform: scale(0.96); }
-        .crypto-button:focus-visible { outline: 2px solid #38bdf8; outline-offset: 3px; }
-        .crypto-logo { display: block; width: 120px; height: auto; }
-        .telegram-button {
-            display: inline-flex; align-items: center; justify-content: center; gap: 10px; width: 100%;
-            height: 48px; min-height: 48px; padding: 0 16px; border: 0; border-radius: 12px;
-            background: #24a1de; box-shadow: 0 4px 12px rgba(36, 161, 222, 0.32); text-decoration: none;
-            color: #ffffff; font-size: 15px; font-weight: 600; cursor: pointer; transition: all 0.2s;
-        }
-        .telegram-button:hover { background: #1f94cd; transform: translateY(-1px); box-shadow: 0 6px 16px rgba(36, 161, 222, 0.44); color: #ffffff; }
-        .telegram-button:active { transform: scale(0.96); }
-        .telegram-button:focus-visible { outline: 2px solid #24a1de; outline-offset: 3px; }
-        .tg-plane-icon { display: block; width: 22px; height: 22px; flex-shrink: 0; }
 
         .header-actions { display: flex; gap: 16px; align-items: center; }
 
@@ -8229,8 +8210,6 @@ const PANEL_HTML: &str = r##"
         .settings-action-btn.reboot:hover { color: #005fcc; }
         .settings-action-btn.danger { color: #ef4444; }
         .settings-action-btn.danger:hover { color: #dc2626; }
-        .support-card { padding: 24px; display: flex; flex-direction: column; gap: 18px; }
-        .support-card-title { margin: 0; color: var(--text-main); font-size: 16px; font-weight: 600; }
         .proxy-info-btn {
             width: 24px; height: 24px; flex: 0 0 24px; display: inline-flex; align-items: center; justify-content: center;
             border: 1px solid var(--border); border-radius: 50%; background: var(--bg-color); color: var(--text-muted);
@@ -9342,25 +9321,6 @@ const PANEL_HTML: &str = r##"
                     <div id="proxyProfilesList" class="proxy-profiles"></div>
                 </div>
             </section>
-
-            <section style="margin-top: 20px;">
-                <div class="glass-panel support-card">
-                    <h3 class="support-card-title">Поддержать разработчика Amurcanov</h3>
-                    <a class="telegram-button" href="https://t.me/amurcanov_telegram" target="_blank" rel="noopener noreferrer" aria-label="Telegram: amurcanov_telegram" title="Telegram: amurcanov_telegram">
-                        <svg class="tg-plane-icon" viewBox="0 0 24 24" width="22" height="22" fill="#ffffff" aria-hidden="true">
-                            <path d="M9.78 18.65l.28-4.23 7.68-6.92c.34-.31-.07-.46-.52-.19L7.74 13.3 3.64 12c-.88-.25-.89-.86.2-1.3l15.97-6.16c.73-.33 1.43.18 1.15 1.3l-2.72 12.81c-.19.91-.74 1.13-1.5.71L12.6 16.3l-1.99 1.93c-.23.23-.42.42-.83.42z"/>
-                        </svg>
-                        <span>t.me/amurcanov_telegram</span>
-                    </a>
-                    <button class="crypto-button" type="button" onclick="openCryptoDonateDlg()" aria-label="Поддержать криптовалютой" title="CRYPTO">
-                        <svg class="crypto-logo" viewBox="0 0 320 60" aria-hidden="true">
-                            <g transform="translate(160, 30) scale(0.9) translate(-160, -30)">
-                                <path fill="#FFFFFF" d="M35,30 C35,17 45,8 60,8 C70,8 78,13 82,21 L70,28 C68,23 64,20 60,20 C52,20 47,24 47,30 C47,36 52,40 60,40 C64,40 68,37 70,32 L82,39 C78,47 70,52 60,52 C45,52 35,43 35,30 Z M92,10 L115,10 C126,10 133,16 133,24 C133,30 129,35 122,37 L135,50 L120,50 L109,38 L104,38 L104,50 L92,50 L92,10 Z M104,20 L104,29 L114,29 C118,29 121,27 121,24 C121,21 118,20 114,20 L104,20 Z M148,10 L160,29 L172,10 L186,10 L167,36 L167,50 L153,50 L153,36 L134,10 L148,10 Z M196,10 L219,10 C231,10 238,17 238,26 C238,35 231,42 219,42 L208,42 L208,50 L196,50 L196,10 Z M208,20 L208,32 L218,32 C223,32 226,30 226,26 C226,22 223,20 218,20 L208,20 Z M243,10 L279,10 L279,21 L267,21 L267,50 L255,50 L255,21 L243,21 L243,10 Z M285,30 C285,17 296,8 310,8 C324,8 335,17 335,30 C335,43 324,52 310,52 C296,52 285,43 285,30 Z M297,30 C297,37 302,41 310,41 C318,41 323,37 323,30 C323,23 318,19 310,19 C302,19 297,23 297,30 Z"></path>
-                            </g>
-                        </svg>
-                    </button>
-                </div>
-            </section>
         </div>
     </main>
 
@@ -9370,45 +9330,6 @@ const PANEL_HTML: &str = r##"
         <div class="dlg-actions" style="margin-top: 0;">
             <button class="btn btn-ghost" onclick="document.getElementById('confirmDlg').close()">Отмена</button>
             <button class="btn btn-primary" id="confirmActionBtn">Подтвердить</button>
-        </div>
-    </dialog>
-
-    <dialog id="cryptoDonateDlg">
-        <h2 style="font-size: 20px; margin-bottom: 8px;">Поддержать криптовалютой</h2>
-        <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 20px; line-height: 1.5;">Переведите криптовалюту на один из указанных адресов кошельков.</p>
-
-        <div style="background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 14px; margin-bottom: 14px;">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
-                <span style="font-size: 13px; font-weight: 700; color: #31A1F5;">GRAM (Сеть TON)</span>
-            </div>
-            <div style="font-family: monospace; font-size: 13px; word-break: break-all; color: var(--text-main); line-height: 1.4; user-select: all;" id="gramWalletAddr">UQCsHSj_Bev5AG3vCz-84TQC7BSWjNdNdOjP9M2gWUEmbyD7</div>
-            <div style="margin-top: 8px; text-align: right;">
-                <button class="btn btn-ghost" style="padding: 4px 10px; font-size: 12px;" onclick="copyText('UQCsHSj_Bev5AG3vCz-84TQC7BSWjNdNdOjP9M2gWUEmbyD7', this)">Скопировать</button>
-            </div>
-        </div>
-
-        <div style="background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 14px; margin-bottom: 14px;">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
-                <span style="font-size: 13px; font-weight: 700; color: #50AF95;">USDT (Сеть TON)</span>
-            </div>
-            <div style="font-family: monospace; font-size: 13px; word-break: break-all; color: var(--text-main); line-height: 1.4; user-select: all;" id="usdtTonWalletAddr">UQCsHSj_Bev5AG3vCz-84TQC7BSWjNdNdOjP9M2gWUEmbyD7</div>
-            <div style="margin-top: 8px; text-align: right;">
-                <button class="btn btn-ghost" style="padding: 4px 10px; font-size: 12px;" onclick="copyText('UQCsHSj_Bev5AG3vCz-84TQC7BSWjNdNdOjP9M2gWUEmbyD7', this)">Скопировать</button>
-            </div>
-        </div>
-
-        <div style="background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 14px; margin-bottom: 20px;">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
-                <span style="font-size: 13px; font-weight: 700; color: #50AF95;">USDT (Сеть TRC20)</span>
-            </div>
-            <div style="font-family: monospace; font-size: 13px; word-break: break-all; color: var(--text-main); line-height: 1.4; user-select: all;" id="usdtTrcWalletAddr">TD1oiQiHmjqsRDPxfUjUbSWxEmcr4k7Lob</div>
-            <div style="margin-top: 8px; text-align: right;">
-                <button class="btn btn-ghost" style="padding: 4px 10px; font-size: 12px;" onclick="copyText('TD1oiQiHmjqsRDPxfUjUbSWxEmcr4k7Lob', this)">Скопировать</button>
-            </div>
-        </div>
-
-        <div class="dlg-actions" style="margin-top: 0;">
-            <button class="btn btn-primary" onclick="document.getElementById('cryptoDonateDlg').close()">Хорошо</button>
         </div>
     </dialog>
 
@@ -10612,9 +10533,6 @@ const PANEL_HTML: &str = r##"
             window.addEventListener('load', () => {
                 navigator.serviceWorker.register((basePath || '') + '/sw.js', { scope: (basePath || '') + '/' }).catch(() => {});
             });
-        }
-        function openCryptoDonateDlg() {
-            document.getElementById('cryptoDonateDlg').showModal();
         }
         async function copyText(text, btn) {
             if (await copyToClipboard(text)) {

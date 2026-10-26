@@ -11,7 +11,6 @@
     <string name="nav_deploy">Деплой</string>
     <string name="nav_exceptions">Маршрут</string>
     <string name="nav_logs">Логи</string>
-    <string name="nav_info">Инфо</string>
 
     <string name="action_clear">Очистить</string>
     <string name="action_copy">Копировать</string>

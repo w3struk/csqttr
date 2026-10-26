@@ -1,5 +1,11 @@
 package com.csqtt.client.ui.utils
 
+import android.content.Context
+import android.content.Intent
+import android.util.Log
+import android.widget.Toast
+import androidx.core.net.toUri
+import com.csqtt.client.showRaisedToast
 import java.security.MessageDigest
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
@@ -242,3 +248,43 @@ fun formatCsqttLink(
     val plain = "connect?" + queryParts.joinToString("&")
     return "csqtt://" + encryptCsqttPayload(plain)
 }
+
+internal val browserPackages = listOf(
+    "com.android.chrome",
+    "com.google.android.googlequicksearchbox",
+    "org.mozilla.firefox",
+    "com.yandex.browser",
+    "ru.yandex.searchplugin",
+    "com.yandex.browser.lite",
+    "com.opera.browser",
+    "com.opera.mini.native",
+    "com.microsoft.emmx",
+    "com.brave.browser",
+    "com.duckduckgo.mobile.android",
+    "com.sec.android.app.sbrowser",
+    "com.vivaldi.browser",
+    "com.kiwibrowser.browser",
+)
+
+internal fun openUrlInBrowser(context: Context, url: String) {
+    try {
+        val pm = context.packageManager
+        val uri = url.toUri()
+        for (pkg in browserPackages) {
+            val intent = Intent(Intent.ACTION_VIEW, uri).apply {
+                addCategory(Intent.CATEGORY_BROWSABLE)
+                setPackage(pkg)
+            }
+            if (intent.resolveActivity(pm) != null) {
+                context.startActivity(intent)
+                return
+            }
+        }
+        val intent = Intent(Intent.ACTION_VIEW, uri).apply { addCategory(Intent.CATEGORY_BROWSABLE) }
+        if (intent.resolveActivity(pm) != null) context.startActivity(intent)
+    } catch (error: Exception) {
+        Log.w("CSQTT", "Не удалось открыть ссылку: $url", error)
+        context.showRaisedToast("Не удалось открыть ссылку", Toast.LENGTH_SHORT)
+    }
+}
+
