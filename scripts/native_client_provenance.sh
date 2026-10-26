@@ -217,13 +217,13 @@ build_input_files() {
     require_dir "$ROOT/rust-client/vendor/primp" "Vendored primp sources"
     (
         cd "$ROOT/rust-client/vendor/primp"
-        find . -type f -printf 'rust-client/vendor/primp/%P\n'
+        find . -type f -not -path './target/*' -printf 'rust-client/vendor/primp/%P\n'
     )
 
     require_dir "$ROOT/rust-client/vendor/netstack-smoltcp" "Vendored netstack-smoltcp sources"
     (
         cd "$ROOT/rust-client/vendor/netstack-smoltcp"
-        find . -type f -printf 'rust-client/vendor/netstack-smoltcp/%P\n'
+        find . -type f -not -path './target/*' -printf 'rust-client/vendor/netstack-smoltcp/%P\n'
     )
 }
 
