@@ -29,6 +29,7 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.csqtt.client.BuildConfig
 import com.csqtt.client.R
 
 internal val LocalCsqttHeaderActions = staticCompositionLocalOf<(@Composable RowScope.() -> Unit)?> { null }
@@ -75,9 +76,9 @@ fun CsqttScreen(
                     )
                     Icon(
                         painter = painterResource(id = R.drawable.ic_version),
-                        contentDescription = "v2.5.1",
+                        contentDescription = "Версия ${BuildConfig.VERSION_NAME}",
                         tint = Color.Unspecified,
-                        modifier = Modifier.height(14.dp)
+                        modifier = Modifier.height(22.dp)
                     )
                 }
 
