@@ -63,9 +63,9 @@ fun CsqttScreen(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Column(
-                    verticalArrangement = Arrangement.spacedBy(1.dp),
-                    horizontalAlignment = Alignment.Start
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(CsqttSpacing.Xs),
                 ) {
                     Icon(
                         painter = painterResource(id = R.drawable.ic_csqtt_logo),
@@ -74,10 +74,10 @@ fun CsqttScreen(
                         modifier = Modifier.height(22.dp)
                     )
                     Icon(
-                        painter = painterResource(id = R.drawable.ic_v250_by_amurcanov),
-                        contentDescription = "v2.5.0 by amurcanov",
+                        painter = painterResource(id = R.drawable.ic_version),
+                        contentDescription = "v2.5.1",
                         tint = Color.Unspecified,
-                        modifier = Modifier.height(13.dp)
+                        modifier = Modifier.height(14.dp)
                     )
                 }
 

@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-FileCopyrightText: 2026 amurcanov -->
+<!-- SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0 -->
+
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="54dp"
+    android:height="24dp"
+    android:viewportWidth="144"
+    android:viewportHeight="64"
+    android:autoMirrored="false">
+
+    <path
+        android:fillColor="@android:color/transparent"
+        android:strokeWidth="6"
+        android:strokeAlpha="1"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="
+            M8,24
+            L18,48
+            L28,24
+
+            M34,20
+            Q38,14 46,14
+            H50
+            Q58,14 58,22
+            Q58,28 52,33
+            L36,48
+            H58
+
+            M67,47
+            L67.8,47
+
+            M102,14
+            H80
+            V28
+            H92
+            Q102,28 102,38
+            Q102,48 90,48
+            Q80,48 78,42
+
+            M110,47
+            L110.8,47
+
+            M128,22
+            L136,14
+            V48">
+
+        <aapt:attr name="android:strokeColor">
+            <gradient
+                android:type="linear"
+                android:startX="0"
+                android:startY="0"
+                android:endX="144"
+                android:endY="64"
+                android:tileMode="clamp">
+
+                <item
+                    android:offset="0.0"
+                    android:color="#45B7FF" />
+
+                <item
+                    android:offset="0.45"
+                    android:color="#2087FF" />
+
+                <item
+                    android:offset="1.0"
+                    android:color="#075BFF" />
+
+            </gradient>
+        </aapt:attr>
+
+    </path>
+
+</vector>

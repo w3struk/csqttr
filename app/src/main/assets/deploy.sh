@@ -5,7 +5,7 @@ set -Eeuo pipefail
 export DEBIAN_FRONTEND=noninteractive
 export TERM="${TERM:-xterm}"
 
-readonly SCRIPT_VERSION="2.5.0"
+readonly SCRIPT_VERSION="2.5.1"
 readonly LOG_FILE="${CSQTT_INSTALL_LOG_FILE:-/var/log/csqtt-install.log}"
 readonly PEER_PORT="${CSQTT_PEER_PORT:-46000}"
 readonly SSH_PORT="${CSQTT_SSH_PORT:-22}"
@@ -36,7 +36,7 @@ readonly UPLOAD_OVERRIDES_FILE="/tmp/.csqtt-upload-overrides.json"
 readonly CSQTT_SYSCTL_FILE="/etc/sysctl.d/99-csqtt.conf"
 readonly CSQTT_UDP_SYSCTL_FILE="/etc/sysctl.d/99-csqtt-udp-buffers.conf"
 readonly IPT_COMMENT="CSQTT_MANAGED"
-readonly CSQTT_DOCKER_IMAGE="csqtt:2.5.0"
+readonly CSQTT_DOCKER_IMAGE="csqtt:2.5.1"
 readonly CSQTT_DOCKER_CONTAINER="csqtt"
 readonly CSQTT_DOCKER_PREREQ_SERVICE="csqtt-docker-prereq.service"
 readonly CSQTT_DOCKER_PREREQ_HELPER="/usr/local/lib/csqtt/docker-prereq.sh"

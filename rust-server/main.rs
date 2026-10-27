@@ -1183,7 +1183,7 @@ async fn async_main() -> Result<()> {
         });
     }
 
-    log_event(&app, "INFO", "SYSTEM", " CSQTT Server 2.5.0");
+    log_event(&app, "INFO", "SYSTEM", " CSQTT Server 2.5.1");
     log_event(
         &app,
         "INFO",
