@@ -230,7 +230,7 @@ class TunnelService : Service() {
                         val domainList = if (domainWhite) store.directDomainsWhite.first() else store.directDomainsBlack.first()
                         val ipWhite = store.ipIsWhitelist.first()
                         val ipList = if (ipWhite) store.directIpsWhite.first() else store.directIpsBlack.first()
-                        val hasDomains = if (domainWhite) domainList.isNotBlank() else (domainList.isNotBlank() || store.templateDomainsEnabled.first() || store.excludeRuZonesEnabled.first())
+                        val hasDomains = if (domainWhite) domainList.isNotBlank() else (domainList.isNotBlank() || store.templateDomainsEnabled.first())
                         val effectiveDomainEnabled = store.domainRoutingEnabled.first() && hasDomains
                         val effectiveIpEnabled = IpRoutingPolicy.isEnabled(ipList)   // список и есть переключатель
 
@@ -263,7 +263,6 @@ class TunnelService : Service() {
                             vkAccessToken = resolvedHashes.accessToken,
                             domainRoutingEnabled = effectiveDomainEnabled,
                             domainIsWhitelist = domainWhite,
-                            excludeRuZones = if (domainWhite) false else store.excludeRuZonesEnabled.first(),
                             templateDomains = if (domainWhite) false else store.templateDomainsEnabled.first(),
                             directDomains = domainList,
                             ipRoutingEnabled = effectiveIpEnabled,
@@ -477,10 +476,8 @@ class TunnelService : Service() {
                     vkAccessToken = restoredHashes?.accessToken.orEmpty(),
                     domainRoutingEnabled = store.domainRoutingEnabled.first() ||
                         (!domainWhite && store.templateDomainsEnabled.first()) ||
-                        domainList.isNotBlank() ||
-                        (!domainWhite && store.excludeRuZonesEnabled.first()),
+                        domainList.isNotBlank(),
                     domainIsWhitelist = domainWhite,
-                    excludeRuZones = if (domainWhite) false else store.excludeRuZonesEnabled.first(),
                     templateDomains = if (domainWhite) false else store.templateDomainsEnabled.first(),
                     directDomains = domainList,
                     ipRoutingEnabled = ipRouting,
@@ -1100,13 +1097,11 @@ class TunnelService : Service() {
             val store = SettingsStore(applicationContext)
             combine(
                 store.domainRoutingEnabled,
-                store.excludeRuZonesEnabled,
                 store.templateDomainsEnabled,
                 store.directDomains,
-            ) { domainEnabled, excludeRu, templateEnabled, domains ->
+            ) { domainEnabled, templateEnabled, domains ->
                 DomainRoutingUpdate(
-                    enabled = domainEnabled || templateEnabled || domains.isNotBlank() || excludeRu,
-                    excludeRuZones = excludeRu,
+                    enabled = domainEnabled || templateEnabled || domains.isNotBlank(),
                     templateDomains = templateEnabled,
                     directDomains = domains,
                 )
@@ -1114,7 +1109,6 @@ class TunnelService : Service() {
                 if (TunnelManager.running.value && !TunnelManager.serverRoutingActive.value) {
                     TunnelManager.updateDomainRouting(
                         enabled = update.enabled,
-                        excludeRuZones = update.excludeRuZones,
                         templateDomains = update.templateDomains,
                         directDomains = update.directDomains,
                     )
@@ -1531,7 +1525,6 @@ class TunnelService : Service() {
 
 private data class DomainRoutingUpdate(
     val enabled: Boolean,
-    val excludeRuZones: Boolean,
     val templateDomains: Boolean,
     val directDomains: String,
 )

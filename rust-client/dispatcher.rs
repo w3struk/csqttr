@@ -480,7 +480,6 @@ pub struct WorkerChannels {
 #[derive(Clone, Debug, Default)]
 pub struct DomainRoutingConfig {
     pub enabled: bool,
-    pub exclude_ru_zones: bool,
     pub template_domains: bool,
     pub direct_domains: Arc<Vec<String>>,
     pub is_whitelist: bool,
@@ -1223,7 +1222,6 @@ impl Dispatcher {
 
     pub fn update_domain_routing(&self, payload: &str) {
         let mut enabled = false;
-        let mut ru = false;
         let mut template = false;
         let mut is_whitelist = false;
         let mut ip_routing_enabled = false;
@@ -1234,7 +1232,6 @@ impl Dispatcher {
             if let Some((k, v)) = part.split_once('=') {
                 match k.trim() {
                     "enabled" => enabled = v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"),
-                    "ru" => ru = v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"),
                     "template" => {
                         template = v.trim() == "1" || v.trim().eq_ignore_ascii_case("true")
                     }
@@ -1261,7 +1258,6 @@ impl Dispatcher {
         domains.truncate(1024);
         let new_config = DomainRoutingConfig {
             enabled,
-            exclude_ru_zones: ru,
             template_domains: template,
             direct_domains: Arc::new(domains.clone()),
             is_whitelist,
@@ -1271,9 +1267,8 @@ impl Dispatcher {
         };
         self.domain_routing.store(Arc::new(new_config.clone()));
         crate::log_error!(
-            "[КЛИЕНТ] Горячее обновление доменов: вкл={}, RU={}, шаблоны={}, кастомных={}, ЧС/БС={}, IP вкл={}, IP ЧС/БС={}, IP правил={}",
+            "[КЛИЕНТ] Горячее обновление доменов: вкл={}, шаблоны={}, кастомных={}, ЧС/БС={}, IP вкл={}, IP ЧС/БС={}, IP правил={}",
             enabled,
-            ru,
             template,
             domains.len(),
             is_whitelist,
@@ -1302,7 +1297,6 @@ impl Dispatcher {
                 && crate::sni::is_direct_domain_mode(
                     &domain,
                     config.is_whitelist,
-                    config.exclude_ru_zones,
                     config.template_domains,
                     &config.direct_domains,
                 )
@@ -1327,7 +1321,6 @@ impl Dispatcher {
                 && crate::sni::is_direct_domain_mode(
                     sni,
                     config.is_whitelist,
-                    config.exclude_ru_zones,
                     config.template_domains,
                     &config.direct_domains,
                 )
@@ -2312,7 +2305,6 @@ mod tests {
             crate::dispatcher::DomainRoutingConfig {
                 enabled: true,
                 is_whitelist: false,
-                exclude_ru_zones: true,
                 template_domains: false,
                 direct_domains: vec!["example.com".to_string()].into(),
                 ip_routing_enabled: false,

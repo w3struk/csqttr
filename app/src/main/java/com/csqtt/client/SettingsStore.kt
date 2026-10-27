@@ -146,7 +146,6 @@ class SettingsStore(context: Context) {
         private val AUTO_PAUSE_ON_WIFI = booleanPreferencesKey("auto_pause_on_wifi")
         private val DOMAIN_ROUTING_ENABLED = booleanPreferencesKey("domain_routing_enabled")
         private val DOMAIN_IS_WHITELIST = booleanPreferencesKey("domain_is_whitelist")
-        private val EXCLUDE_RU_ZONES_ENABLED = booleanPreferencesKey("exclude_ru_zones_enabled")
         private val TEMPLATE_DOMAINS_ENABLED = booleanPreferencesKey("template_domains_enabled")
         private val DIRECT_DOMAINS = stringPreferencesKey("direct_domains")
         private val DIRECT_DOMAINS_BLACK = stringPreferencesKey("direct_domains_black")
@@ -238,9 +237,6 @@ class SettingsStore(context: Context) {
         internal var cachedDomainIsWhitelist: Boolean? = null
 
         @Volatile
-        internal var cachedExcludeRuZonesEnabled: Boolean? = null
-
-        @Volatile
         internal var cachedTemplateDomainsEnabled: Boolean? = null
 
         @Volatile
@@ -274,7 +270,7 @@ class SettingsStore(context: Context) {
             return when (baseKey) {
                 PEER, VK_HASHES, SECONDARY_VK_HASH, PROTOCOL, SNI, USER_AGENT, DEPLOY_IP, DEPLOY_LOGIN, DEPLOY_PASSWORD, DEPLOY_PASSWORD_ENCRYPTED, DEPLOY_SSH_PORT, EXCLUDED_APPS, WHITELIST_APPS, DIRECT_DOMAINS, DIRECT_DOMAINS_BLACK, DIRECT_DOMAINS_WHITE, DIRECT_IPS_BLACK, DIRECT_IPS_WHITE, CONNECTION_PASSWORD, CONNECTION_PASSWORD_ENCRYPTED, CONNECTION_PASSWORD_LOCAL, DEPLOY_MAIN_PASSWORD, DEPLOY_MAIN_PASSWORD_ENCRYPTED, DEPLOY_WEB_LOGIN, DEPLOY_WEB_PASSWORD, DEPLOY_WEB_PASSWORD_ENCRYPTED, PROXY_MODE, PROXY_HOST, VK_AUTH_MODE, OBFS_MODE, TURN_TRANSPORT, SRTP_MODE, CAPTCHA_MODE, CAPTCHA_SOLVE_METHOD, CAPTCHA_WBV_SOLVE_METHOD, CSQTT_LINK, SELECTED_FINGERPRINT, ACTIVE_CLIENT_IDS, VK_HASH_MODE, VK_ACCESS_TOKEN, VK_ACCESS_TOKEN_ENCRYPTED, VK_ACCESS_TOKEN_USER_ID, SSH_PRIVATE_KEY, SSH_PRIVATE_KEY_ENCRYPTED, SSH_KEY_PASSPHRASE, SSH_KEY_PASSPHRASE_ENCRYPTED, SSH_CERTIFICATE, SSH_CERTIFICATE_ENCRYPTED, VK_HASH_CHECK_RESULTS, CLIENT_ID_CHECK_RESULTS, CUSTOM_TURN_IPS, SELECTED_TURN_SUBNET -> stringPreferencesKey(newName) as Preferences.Key<T>
                 WORKERS_PER_HASH, LISTEN_PORT, SERVER_PEER_PORT, PROXY_PORT, SERVER_WEB_PORT -> intPreferencesKey(newName) as Preferences.Key<T>
-                MANUAL_PORTS_ENABLED, NO_DNS, IS_WHITELIST, CSQTT_LINK_MODE, DETAILED_LOGS, SSH_KEYS_MODE, DOCKER_INSTALL, EXTRA_WORKERS, SPLIT_TUNNEL_WHITELIST_MIGRATED, DOMAIN_ROUTING_ENABLED, DOMAIN_IS_WHITELIST, EXCLUDE_RU_ZONES_ENABLED, TEMPLATE_DOMAINS_ENABLED, IP_ROUTING_ENABLED, IP_IS_WHITELIST -> booleanPreferencesKey(newName) as Preferences.Key<T>
+                MANUAL_PORTS_ENABLED, NO_DNS, IS_WHITELIST, CSQTT_LINK_MODE, DETAILED_LOGS, SSH_KEYS_MODE, DOCKER_INSTALL, EXTRA_WORKERS, SPLIT_TUNNEL_WHITELIST_MIGRATED, DOMAIN_ROUTING_ENABLED, DOMAIN_IS_WHITELIST, TEMPLATE_DOMAINS_ENABLED, IP_ROUTING_ENABLED, IP_IS_WHITELIST -> booleanPreferencesKey(newName) as Preferences.Key<T>
                 CONNECTION_GENERATION -> longPreferencesKey(newName) as Preferences.Key<T>
                 else -> stringPreferencesKey(newName) as Preferences.Key<T>
             }
@@ -537,11 +533,6 @@ class SettingsStore(context: Context) {
         prefs[getProfileKey(DOMAIN_ROUTING_ENABLED, profile)] ?: false
     }
 
-    val excludeRuZonesEnabled: Flow<Boolean> = dataStore.data.map { prefs ->
-        val profile = prefs[ACTIVE_PROFILE] ?: 0
-        prefs[getProfileKey(EXCLUDE_RU_ZONES_ENABLED, profile)] ?: false
-    }
-
     val templateDomainsEnabled: Flow<Boolean> = dataStore.data.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(TEMPLATE_DOMAINS_ENABLED, profile)] ?: false
@@ -690,7 +681,6 @@ class SettingsStore(context: Context) {
                 launch { orangeTunnelEnabled.collect { cachedOrangeTunnelEnabled = it } }
                 launch { domainRoutingEnabled.collect { cachedDomainRoutingEnabled = it } }
                 launch { domainIsWhitelist.collect { cachedDomainIsWhitelist = it } }
-                launch { excludeRuZonesEnabled.collect { cachedExcludeRuZonesEnabled = it } }
                 launch { templateDomainsEnabled.collect { cachedTemplateDomainsEnabled = it } }
                 launch { directDomains.collect { cachedDirectDomains = it } }
                 launch { directDomainsBlack.collect { cachedDirectDomainsBlack = it } }
@@ -1296,13 +1286,6 @@ class SettingsStore(context: Context) {
         }
     }
 
-    suspend fun saveExcludeRuZonesEnabled(enabled: Boolean) {
-        dataStore.edit { prefs ->
-            val profile = prefs[ACTIVE_PROFILE] ?: 0
-            prefs[getProfileKey(EXCLUDE_RU_ZONES_ENABLED, profile)] = enabled
-        }
-    }
-
     suspend fun saveTemplateDomainsEnabled(enabled: Boolean) {
         dataStore.edit { prefs ->
             val profile = prefs[ACTIVE_PROFILE] ?: 0
@@ -1580,7 +1563,6 @@ class SettingsStore(context: Context) {
             exc.put("is_whitelist", prefs[getProfileKey(IS_WHITELIST, p)] ?: false)
             exc.put("domain_routing_enabled", prefs[getProfileKey(DOMAIN_ROUTING_ENABLED, p)] ?: false)
             exc.put("domain_is_whitelist", prefs[getProfileKey(DOMAIN_IS_WHITELIST, p)] ?: false)
-            exc.put("exclude_ru_zones_enabled", prefs[getProfileKey(EXCLUDE_RU_ZONES_ENABLED, p)] ?: false)
             exc.put("template_domains_enabled", prefs[getProfileKey(TEMPLATE_DOMAINS_ENABLED, p)] ?: false)
             exc.put("direct_domains_black", prefs[getProfileKey(DIRECT_DOMAINS_BLACK, p)] ?: prefs[getProfileKey(DIRECT_DOMAINS, p)] ?: "")
             exc.put("direct_domains_white", prefs[getProfileKey(DIRECT_DOMAINS_WHITE, p)] ?: "")
@@ -1674,7 +1656,6 @@ class SettingsStore(context: Context) {
                     if (exc.has("is_whitelist")) mutable[getProfileKey(IS_WHITELIST, p)] = exc.getBoolean("is_whitelist")
                     if (exc.has("domain_routing_enabled")) mutable[getProfileKey(DOMAIN_ROUTING_ENABLED, p)] = exc.getBoolean("domain_routing_enabled")
                     if (exc.has("domain_is_whitelist")) mutable[getProfileKey(DOMAIN_IS_WHITELIST, p)] = exc.getBoolean("domain_is_whitelist")
-                    if (exc.has("exclude_ru_zones_enabled")) mutable[getProfileKey(EXCLUDE_RU_ZONES_ENABLED, p)] = exc.getBoolean("exclude_ru_zones_enabled")
                     if (exc.has("template_domains_enabled")) mutable[getProfileKey(TEMPLATE_DOMAINS_ENABLED, p)] = exc.getBoolean("template_domains_enabled")
                     if (exc.has("direct_domains_black")) mutable[getProfileKey(DIRECT_DOMAINS_BLACK, p)] = exc.getString("direct_domains_black")
                     if (exc.has("direct_domains_white")) mutable[getProfileKey(DIRECT_DOMAINS_WHITE, p)] = exc.getString("direct_domains_white")

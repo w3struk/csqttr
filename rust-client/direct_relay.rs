@@ -543,7 +543,6 @@ impl DirectRelay {
                     let is_direct = crate::sni::is_direct_domain_mode(
                         &domain,
                         config.is_whitelist,
-                        config.exclude_ru_zones,
                         config.template_domains,
                         &config.direct_domains,
                     );
@@ -669,7 +668,6 @@ impl DirectRelay {
             domain.as_deref(),
             config.enabled,
             config.is_whitelist,
-            config.exclude_ru_zones,
             config.template_domains,
             &config.direct_domains,
             config.ip_routing_enabled,
@@ -1310,7 +1308,6 @@ mod tests {
             crate::dispatcher::DomainRoutingConfig {
                 enabled: true,
                 is_whitelist: false,
-                exclude_ru_zones: true,
                 template_domains: false,
                 direct_domains: vec!["example.com".to_string()].into(),
                 ip_routing_enabled: false,
@@ -1397,7 +1394,6 @@ mod tests {
             crate::dispatcher::DomainRoutingConfig {
                 enabled: true,
                 is_whitelist: false,
-                exclude_ru_zones: true,
                 template_domains: false,
                 direct_domains: vec!["example.com".to_string()].into(),
                 ip_routing_enabled: false,
@@ -1442,7 +1438,6 @@ mod tests {
             crate::dispatcher::DomainRoutingConfig {
                 enabled: true,
                 is_whitelist: false,
-                exclude_ru_zones: true,
                 template_domains: false,
                 direct_domains: vec!["example.com".to_string()].into(),
                 ip_routing_enabled: false,
@@ -1490,7 +1485,6 @@ mod tests {
             crate::dispatcher::DomainRoutingConfig {
                 enabled: true,
                 is_whitelist: false,
-                exclude_ru_zones: true,
                 template_domains: false,
                 direct_domains: vec![].into(),
                 ip_routing_enabled: false,

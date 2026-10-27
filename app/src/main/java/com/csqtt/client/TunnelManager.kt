@@ -1137,14 +1137,11 @@ object TunnelManager {
         }
         cmd.add("-captcha-mode")
         cmd.add(params.captchaMode)
-        val isDomainRoutingActive = params.domainRoutingEnabled || params.excludeRuZones || params.templateDomains || params.directDomains.isNotBlank()
+        val isDomainRoutingActive = params.domainRoutingEnabled || params.templateDomains || params.directDomains.isNotBlank()
         if (isDomainRoutingActive) {
             cmd.add("--domain-routing")
             if (params.domainIsWhitelist) {
                 cmd.add("--domain-whitelist")
-            }
-            if (params.excludeRuZones && !params.domainIsWhitelist) {
-                cmd.add("--exclude-ru-zones")
             }
             if (params.templateDomains && !params.domainIsWhitelist) {
                 cmd.add("--template-domains")
@@ -2069,7 +2066,6 @@ object TunnelManager {
             if (newServerRule != null) {
                 updateDomainRouting(
                     enabled = newServerRule.templateDomains || newServerRule.domains.isNotEmpty(),
-                    excludeRuZones = false,
                     templateDomains = newServerRule.templateDomains,
                     directDomains = newServerRule.domains.joinToString(","),
                     isWhitelist = newServerRule.domainsIsWhite,
@@ -2094,17 +2090,15 @@ object TunnelManager {
                     val settingsStore = SettingsStore(ctx)
                     val domainWhite = settingsStore.domainIsWhitelist.first()
                     val domainEnabled = settingsStore.domainRoutingEnabled.first()
-                    val excludeRu = settingsStore.excludeRuZonesEnabled.first()
                     val templateEnabled = settingsStore.templateDomainsEnabled.first()
                     val domains = if (domainWhite) settingsStore.directDomainsWhite.first() else settingsStore.directDomainsBlack.first()
                     val ipWhite = settingsStore.ipIsWhitelist.first()
                     val ips = if (ipWhite) settingsStore.directIpsWhite.first() else settingsStore.directIpsBlack.first()
-                    val hasDomains = if (domainWhite) domains.isNotBlank() else (domains.isNotBlank() || templateEnabled || excludeRu)
+                    val hasDomains = if (domainWhite) domains.isNotBlank() else (domains.isNotBlank() || templateEnabled)
                     val effectiveDomainEnabled = domainEnabled && hasDomains
                     val effectiveIpEnabled = IpRoutingPolicy.isEnabled(ips)   // список и есть переключатель
                     updateDomainRouting(
                         enabled = effectiveDomainEnabled,
-                        excludeRuZones = if (domainWhite) false else excludeRu,
                         templateDomains = if (domainWhite) false else templateEnabled,
                         directDomains = domains,
                         isWhitelist = domainWhite,
@@ -2128,7 +2122,6 @@ object TunnelManager {
 
     fun updateDomainRouting(
         enabled: Boolean,
-        excludeRuZones: Boolean,
         templateDomains: Boolean,
         directDomains: String,
         isWhitelist: Boolean = false,
@@ -2137,7 +2130,7 @@ object TunnelManager {
         directIps: String = "",
     ) {
         val identity = processIdentity ?: return
-        val command = "UPDATE_DOMAINS|enabled=${if (enabled) 1 else 0};ru=${if (excludeRuZones) 1 else 0};template=${if (templateDomains) 1 else 0};whitelist=${if (isWhitelist) 1 else 0};domains=$directDomains;ip_enabled=${if (ipRoutingEnabled) 1 else 0};ip_whitelist=${if (ipIsWhitelist) 1 else 0};ips=$directIps"
+        val command = "UPDATE_DOMAINS|enabled=${if (enabled) 1 else 0};template=${if (templateDomains) 1 else 0};whitelist=${if (isWhitelist) 1 else 0};domains=$directDomains;ip_enabled=${if (ipRoutingEnabled) 1 else 0};ip_whitelist=${if (ipIsWhitelist) 1 else 0};ips=$directIps"
         writeProcessCommand(identity, command, "domain_routing_err")
     }
 
@@ -2147,17 +2140,15 @@ object TunnelManager {
             val settingsStore = SettingsStore(ctx)
             val domainWhite = settingsStore.domainIsWhitelist.first()
             val domainEnabled = settingsStore.domainRoutingEnabled.first()
-            val excludeRu = settingsStore.excludeRuZonesEnabled.first()
             val templateEnabled = settingsStore.templateDomainsEnabled.first()
             val domains = if (domainWhite) settingsStore.directDomainsWhite.first() else settingsStore.directDomainsBlack.first()
             val ipWhite = settingsStore.ipIsWhitelist.first()
             val ips = if (ipWhite) settingsStore.directIpsWhite.first() else settingsStore.directIpsBlack.first()
-            val hasDomains = if (domainWhite) domains.isNotBlank() else (domains.isNotBlank() || templateEnabled || excludeRu)
+            val hasDomains = if (domainWhite) domains.isNotBlank() else (domains.isNotBlank() || templateEnabled)
             val effectiveDomainEnabled = domainEnabled && hasDomains
             val effectiveIpEnabled = IpRoutingPolicy.isEnabled(ips)   // список и есть переключатель
             updateDomainRouting(
                 enabled = effectiveDomainEnabled,
-                excludeRuZones = if (domainWhite) false else excludeRu,
                 templateDomains = if (domainWhite) false else templateEnabled,
                 directDomains = domains,
                 isWhitelist = domainWhite,
@@ -2243,7 +2234,6 @@ data class TunnelParams(
     val customTurnIps: String = "",
     val domainRoutingEnabled: Boolean = false,
     val domainIsWhitelist: Boolean = false,
-    val excludeRuZones: Boolean = false,
     val templateDomains: Boolean = false,
     val directDomains: String = "",
     val ipRoutingEnabled: Boolean = false,

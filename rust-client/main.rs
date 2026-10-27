@@ -123,8 +123,6 @@ struct Arguments {
     validate_vk_hashes: bool,
     #[arg(long = "domain-routing", default_value_t = false)]
     domain_routing: bool,
-    #[arg(long = "exclude-ru-zones", default_value_t = false)]
-    exclude_ru_zones: bool,
     #[arg(long = "template-domains", default_value_t = false)]
     template_domains: bool,
     #[arg(long = "domain-whitelist", default_value_t = false)]
@@ -312,7 +310,6 @@ async fn run(arguments: Arguments) -> Result<i32> {
     let ip_rules = crate::sni::parse_ip_rules(&arguments.direct_ips);
     let domain_routing = dispatcher::DomainRoutingConfig {
         enabled: arguments.domain_routing,
-        exclude_ru_zones: arguments.exclude_ru_zones,
         template_domains: arguments.template_domains,
         direct_domains: Arc::new(direct_domains),
         is_whitelist: arguments.domain_whitelist,
@@ -580,7 +577,6 @@ fn normalize_cli_argument(argument: String) -> String {
         "tun-uds",
         "validate-vk-hashes",
         "domain-routing",
-        "exclude-ru-zones",
         "template-domains",
         "domain-whitelist",
         "direct-domains",
@@ -870,12 +866,7 @@ fn print_configuration(
     crate::log_error!("[КЛИЕНТ] Captcha: {captcha}");
     if arguments.domain_routing {
         crate::log_error!(
-            "[КЛИЕНТ] Доменная маршрутизация: ВКЛ (RU/SU/РФ: {}, кастомных доменов: {})",
-            if arguments.exclude_ru_zones {
-                "ДА"
-            } else {
-                "НЕТ"
-            },
+            "[КЛИЕНТ] Доменная маршрутизация: ВКЛ (кастомных доменов: {})",
             arguments
                 .direct_domains
                 .split(',')

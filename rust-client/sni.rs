@@ -210,50 +210,6 @@ pub fn extract_dns_info(payload: &[u8]) -> Option<(String, bool, Vec<IpAddr>)> {
     }
 }
 
-pub fn is_ru_zone(host: &str) -> bool {
-    const ASCII_SUFFIXES: &[&[u8]] = &[
-        b".ru",
-        b".su",
-        b".xn--p1ai",
-        b".xn--80adxhks",
-        b".xn--d1acj3b",
-        b".by",
-        b".xn--90ais",
-        b".kz",
-        b".xn--54b7fta0cc",
-    ];
-    const UTF8_SUFFIXES: &[&str] = &[
-        ".\u{440}\u{444}",
-        ".\u{43c}\u{43e}\u{441}\u{43a}\u{432}\u{430}",
-        ".\u{434}\u{435}\u{442}\u{438}",
-        ".\u{431}\u{435}\u{43b}",
-    ];
-    if host.eq_ignore_ascii_case("ru")
-        || host.eq_ignore_ascii_case("su")
-        || host.eq_ignore_ascii_case("xn--p1ai")
-        || host == "\u{440}\u{444}"
-        || host == "\u{43c}\u{43e}\u{441}\u{43a}\u{432}\u{430}"
-        || host == "\u{434}\u{435}\u{442}\u{438}"
-        || host == "\u{431}\u{435}\u{43b}"
-    {
-        return true;
-    }
-    let host_bytes = host.as_bytes();
-    for suffix in ASCII_SUFFIXES {
-        if host_bytes.len() >= suffix.len()
-            && host_bytes[host_bytes.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
-        {
-            return true;
-        }
-    }
-    for suffix in UTF8_SUFFIXES {
-        if host.ends_with(suffix) {
-            return true;
-        }
-    }
-    false
-}
-
 pub static TEMPLATE_DOMAINS_RAW: &str = include_str!("../domains.txt");
 
 pub static TEMPLATE_DOMAINS_SET: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
@@ -307,14 +263,10 @@ pub fn is_domain_in_list(sni: &str, direct_domains: &[String]) -> bool {
 
 pub fn is_direct_domain(
     sni: &str,
-    exclude_ru_zones: bool,
     template_domains: bool,
     direct_domains: &[String],
 ) -> bool {
     let sni_trimmed = sni.trim_end_matches('.');
-    if exclude_ru_zones && is_ru_zone(sni_trimmed) {
-        return true;
-    }
     if template_domains && is_template_domain(sni_trimmed) {
         return true;
     }
@@ -324,7 +276,6 @@ pub fn is_direct_domain(
 pub fn is_direct_domain_mode(
     sni: &str,
     is_whitelist: bool,
-    exclude_ru_zones: bool,
     template_domains: bool,
     direct_domains: &[String],
 ) -> bool {
@@ -332,12 +283,7 @@ pub fn is_direct_domain_mode(
     if is_whitelist {
         !is_domain_in_list(sni_trimmed, direct_domains)
     } else {
-        is_direct_domain(
-            sni_trimmed,
-            exclude_ru_zones,
-            template_domains,
-            direct_domains,
-        )
+        is_direct_domain(sni_trimmed, template_domains, direct_domains)
     }
 }
 
@@ -425,7 +371,6 @@ pub fn evaluate_route(
     domain: Option<&str>,
     domain_routing_enabled: bool,
     domain_is_whitelist: bool,
-    exclude_ru_zones: bool,
     template_domains: bool,
     direct_domains: &[String],
     ip_routing_enabled: bool,
@@ -439,7 +384,7 @@ pub fn evaluate_route(
     if domain_routing_enabled
         && !domain_is_whitelist
         && let Some(d) = domain
-        && is_direct_domain(d, exclude_ru_zones, template_domains, direct_domains)
+        && is_direct_domain(d, template_domains, direct_domains)
     {
         return RouteVerdict::Direct;
     }
@@ -749,42 +694,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_ru_zone_detection() {
-        assert!(is_ru_zone("yandex.ru"));
-        assert!(is_ru_zone("mail.ru"));
-        assert!(is_ru_zone("gosuslugi.ru"));
-        assert!(is_ru_zone("sub.domain.ru"));
-        assert!(is_ru_zone("test.su"));
-        assert!(is_ru_zone("test.рф"));
-        assert!(is_ru_zone("test.xn--p1ai"));
-        assert!(is_ru_zone("site.xn--80adxhks"));
-        assert!(is_ru_zone("portal.xn--d1acj3b"));
-        assert!(is_ru_zone("gov.by"));
-        assert!(is_ru_zone("site.бел"));
-        assert!(is_ru_zone("kaspi.kz"));
-        assert!(is_ru_zone("ru"));
-        assert!(is_ru_zone("su"));
-
-        assert!(!is_ru_zone("google.com"));
-        assert!(!is_ru_zone("youtube.com"));
-        assert!(!is_ru_zone("discord.gg"));
-        assert!(!is_ru_zone("github.com"));
-        assert!(!is_ru_zone("rust-lang.org"));
-        assert!(!is_ru_zone("notru.com"));
-    }
-
-    #[test]
     fn test_direct_domain_matching() {
         let custom = vec!["discord.com".to_string(), "telegram.org".to_string()];
-        assert!(is_direct_domain("yandex.ru", true, false, &custom));
-        assert!(is_direct_domain("discord.com", false, false, &custom));
-        assert!(is_direct_domain("cdn.discord.com", false, false, &custom));
-        assert!(is_direct_domain("telegram.org", false, false, &custom));
-        assert!(is_direct_domain("api.telegram.org", false, false, &custom));
-        assert!(!is_direct_domain("google.com", true, false, &custom));
-        assert!(!is_direct_domain("yandex.ru", false, false, &custom));
-        assert!(is_direct_domain("yandex.net", false, true, &custom));
-        assert!(!is_direct_domain("yandex.net", false, false, &custom));
+        assert!(is_direct_domain("discord.com", false, &custom));
+        assert!(is_direct_domain("cdn.discord.com", false, &custom));
+        assert!(is_direct_domain("telegram.org", false, &custom));
+        assert!(is_direct_domain("api.telegram.org", false, &custom));
+        assert!(!is_direct_domain("google.com", false, &custom));
+        assert!(!is_direct_domain("yandex.ru", false, &custom));
+        assert!(is_direct_domain("yandex.net", true, &custom));
+        assert!(!is_direct_domain("yandex.net", false, &custom));
     }
 
     #[test]
@@ -1022,13 +941,11 @@ mod tests {
             "special.com",
             true,
             false,
-            false,
             &white_domains
         ));
         assert!(!is_direct_domain_mode(
             "sub.special.com",
             true,
-            false,
             false,
             &white_domains
         ));
@@ -1036,20 +953,17 @@ mod tests {
             "vpn-only.org",
             true,
             false,
-            false,
             &white_domains
         ));
         assert!(is_direct_domain_mode(
             "google.com",
             true,
             false,
-            false,
             &white_domains
         ));
         assert!(is_direct_domain_mode(
             "yandex.ru",
             true,
-            false,
             false,
             &white_domains
         ));
@@ -1062,19 +976,16 @@ mod tests {
             "blocked.com",
             false,
             false,
-            false,
             &black_domains
         ));
         assert!(is_direct_domain_mode(
             "sub.blocked.com",
             false,
             false,
-            false,
             &black_domains
         ));
         assert!(!is_direct_domain_mode(
             "normal.com",
-            false,
             false,
             false,
             &black_domains
@@ -1101,7 +1012,6 @@ mod tests {
         evaluate_route(
             ip,
             None,
-            false,
             false,
             false,
             false,
@@ -1225,7 +1135,6 @@ mod tests {
                 false,
                 false,
                 false,
-                false,
                 &[],
                 false,
                 false,
@@ -1240,7 +1149,6 @@ mod tests {
                 Some("vk.com"),
                 true,
                 false,
-                true,
                 false,
                 &direct_domains,
                 true,
@@ -1255,7 +1163,6 @@ mod tests {
                 Some("gosuslugi.ru"),
                 true,
                 false,
-                true,
                 false,
                 &direct_domains,
                 true,
@@ -1270,7 +1177,6 @@ mod tests {
                 Some("google.com"),
                 true,
                 false,
-                true,
                 false,
                 &direct_domains,
                 true,
@@ -1285,7 +1191,6 @@ mod tests {
                 None,
                 true,
                 false,
-                true,
                 false,
                 &direct_domains,
                 true,
@@ -1300,7 +1205,6 @@ mod tests {
                 Some("cloudflare.com"),
                 true,
                 false,
-                true,
                 false,
                 &direct_domains,
                 true,
@@ -1315,7 +1219,6 @@ mod tests {
                 None,
                 true,
                 false,
-                true,
                 false,
                 &direct_domains,
                 true,
@@ -1330,7 +1233,6 @@ mod tests {
                 Some("vk.com"),
                 true,
                 false,
-                true,
                 false,
                 &direct_domains,
                 true,
@@ -1345,7 +1247,6 @@ mod tests {
                 &ip_8_8_8_8,
                 Some("vk.com"),
                 true,
-                false,
                 false,
                 false,
                 &direct_domains,
@@ -1362,7 +1263,6 @@ mod tests {
                 true,
                 false,
                 false,
-                false,
                 &direct_domains,
                 true,
                 false,
@@ -1377,7 +1277,6 @@ mod tests {
                 true,
                 false,
                 false,
-                false,
                 &direct_domains,
                 true,
                 false,
@@ -1393,7 +1292,6 @@ mod tests {
                 true,
                 true,
                 false,
-                false,
                 &direct_domains,
                 true,
                 true,
@@ -1408,7 +1306,6 @@ mod tests {
                 true,
                 true,
                 false,
-                false,
                 &direct_domains,
                 true,
                 true,
@@ -1422,7 +1319,6 @@ mod tests {
                 Some("unlisted.com"),
                 true,
                 true,
-                false,
                 false,
                 &direct_domains,
                 true,
@@ -1439,7 +1335,6 @@ mod tests {
                 true,
                 true,
                 false,
-                false,
                 &direct_domains,
                 true,
                 false,
@@ -1454,7 +1349,6 @@ mod tests {
                 true,
                 true,
                 false,
-                false,
                 &direct_domains,
                 true,
                 false,
@@ -1468,7 +1362,6 @@ mod tests {
                 Some("unlisted.com"),
                 true,
                 true,
-                false,
                 false,
                 &direct_domains,
                 true,
@@ -1495,7 +1388,6 @@ mod tests {
                 true,
                 true,
                 false,
-                false,
                 &direct_domains,
                 true,
                 true,
@@ -1510,7 +1402,6 @@ mod tests {
                 None,
                 true,
                 true,
-                false,
                 false,
                 &direct_domains,
                 true,
@@ -1528,7 +1419,6 @@ mod tests {
                 true,
                 true,
                 false,
-                false,
                 &direct_domains,
                 true,
                 true,
@@ -1545,7 +1435,6 @@ mod tests {
                 true,
                 true,
                 false,
-                false,
                 &direct_domains,
                 true,
                 true,
@@ -1560,7 +1449,6 @@ mod tests {
                 None,
                 true,
                 true,
-                false,
                 false,
                 &direct_domains,
                 true,
