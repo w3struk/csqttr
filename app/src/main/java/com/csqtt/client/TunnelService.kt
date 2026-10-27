@@ -88,6 +88,8 @@ class TunnelService : Service() {
     private lateinit var connectivityManager: ConnectivityManager
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var airplaneModeReceiver: BroadcastReceiver? = null
+    private var packageChangeReceiver: BroadcastReceiver? = null
+    private var packageChangeReloadJob: Job? = null
     private var networkSwapJob: Job? = null
     private var networkLossJob: Job? = null
     private val physicalNetworks = PhysicalNetworkTracker<Network>()
@@ -116,6 +118,7 @@ class TunnelService : Service() {
         acquireWakeLock()
         connectivityManager = getSystemService(ConnectivityManager::class.java)
         registerAirplaneModeReceiver()
+        registerPackageChangeReceiver()
         registerPhysicalNetworkCallback()
         observeAutoPauseOnWifi()
         observeDomainRoutingSettings()
@@ -948,6 +951,81 @@ class TunnelService : Service() {
         if (registered) airplaneModeReceiver = receiver
     }
 
+    private fun registerPackageChangeReceiver() {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                when (intent.action) {
+                    Intent.ACTION_PACKAGE_ADDED,
+                    Intent.ACTION_PACKAGE_REMOVED,
+                    Intent.ACTION_PACKAGE_REPLACED -> onPackageChanged(intent)
+                }
+            }
+        }
+        // Схема "package" обязательна: без неё пакетные broadcast'ы не придут.
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_PACKAGE_ADDED)
+            addAction(Intent.ACTION_PACKAGE_REMOVED)
+            addAction(Intent.ACTION_PACKAGE_REPLACED)
+            addDataScheme("package")
+        }
+        val registered = runCatching {
+            ContextCompat.registerReceiver(
+                this,
+                receiver,
+                filter,
+                ContextCompat.RECEIVER_EXPORTED,
+            )
+        }.isSuccess
+        if (registered) packageChangeReceiver = receiver
+    }
+
+    private fun onPackageChanged(intent: Intent) {
+        if (!TunnelManager.running.value) return
+        // Локальный режим (серверного правила нет) сознательно не покрыт. В
+        // локальном чёрном списке план — `Disallow(список из SettingsStore)`,
+        // поэтому переустановка уже перечисленного приложения оставит его новый
+        // UID внутри тоннеля — тот же дефект, который чинится здесь. Списки
+        // пользователя живут своей жизнью (он отмечает уже установленные
+        // приложения), это отдельная задача.
+        val rule = TunnelManager.activeServerRoutingRule.value ?: return
+        val changedPackage = intent.data?.schemeSpecificPart?.takeIf { it.isNotEmpty() } ?: return
+        val transportPackages = CsqttConstants.General.VK_TRANSPORT_PACKAGES +
+            applicationContext.packageName
+        // Снимок пользовательского списка оранжевых: в обычном белом списке они
+        // входят в allow-набор, поэтому их переустановка тоже меняет покрытие.
+        val orangeEnabled = SettingsStore.cachedOrangeTunnelEnabled
+            ?.split(",")
+            ?.filter { it.isNotEmpty() }
+            ?.toSet()
+            .orEmpty()
+        if (!PackageChangePolicy.needsVpnRebuild(rule, changedPackage, transportPackages, orangeEnabled)) {
+            return
+        }
+
+        // Обновление приложения присылает несколько событий подряд, а пересборка
+        // рвёт TCP у UID с изменившимся покрытием: ждём, пока пачка уляжется.
+        //
+        // Поле дебаунса принадлежит главному потоку: `onReceive` и `onDestroy`
+        // приходят на нём, а обработчик завершения естественно завершившейся
+        // задачи выполняется на `Dispatchers.Default`. Поэтому и отмена, и запуск,
+        // и очистка идут через главный поток: иначе обработчик, прочитав
+        // устаревшее поле, обнулил бы ссылку на более новую задачу, и следующая
+        // пачка событий уже не смогла бы её отменить.
+        serviceScope.launch(Dispatchers.Main.immediate) {
+            packageChangeReloadJob?.cancel()
+            val job = serviceScope.launch {
+                delay(PackageChangePolicy.REBUILD_DEBOUNCE_MS)
+                TunnelManager.reloadVpn()
+            }
+            packageChangeReloadJob = job
+            job.invokeOnCompletion {
+                serviceScope.launch(Dispatchers.Main.immediate) {
+                    if (packageChangeReloadJob === job) packageChangeReloadJob = null
+                }
+            }
+        }
+    }
+
     private fun hasPhysicalInternetCapability(capabilities: NetworkCapabilities): Boolean =
         isEligiblePhysicalNetwork(
             hasInternet = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET),
@@ -1434,6 +1512,12 @@ class TunnelService : Service() {
             runCatching { unregisterReceiver(receiver) }
         }
         airplaneModeReceiver = null
+        packageChangeReloadJob?.cancel()
+        packageChangeReloadJob = null
+        packageChangeReceiver?.let { receiver ->
+            runCatching { unregisterReceiver(receiver) }
+        }
+        packageChangeReceiver = null
         physicalNetworks.clear()
         synchronized(wifiNetworkLock) {
             physicalWifiNetworks.clear()

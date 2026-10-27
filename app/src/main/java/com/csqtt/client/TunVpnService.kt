@@ -191,11 +191,8 @@ class TunVpnService : VpnService() {
                 preset = PresetApps(red = emptySet(), orange = emptySet())
                 orangeEnabled = emptySet()
             }
-            val transportPackages = setOf(
-                applicationContext.packageName,
-                CsqttConstants.General.PACKAGE_VK,
-                CsqttConstants.General.PACKAGE_VK_CALLS
-            )
+            val transportPackages = CsqttConstants.General.VK_TRANSPORT_PACKAGES +
+                applicationContext.packageName
 
             val existing = synchronized(interfaceLock) {
                 vpnInterface?.takeIf {

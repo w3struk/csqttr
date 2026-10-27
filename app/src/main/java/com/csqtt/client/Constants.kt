@@ -5,6 +5,9 @@ object CsqttConstants {
         const val APP_NAME = "CSQTT"
         const val PACKAGE_VK = "com.vkontakte.android"
         const val PACKAGE_VK_CALLS = "com.vk.calls"
+
+        /** Пакеты VK, которые VPN держит мимо тоннеля во всех режимах. */
+        val VK_TRANSPORT_PACKAGES: Set<String> = setOf(PACKAGE_VK, PACKAGE_VK_CALLS)
         const val CSQTT_EVENT_PREFIX = "__CSQTT_EVENT__|"
         const val ACTION_RESTART_WHEN_VK_REACHABLE = "com.csqtt.client.RESTART_WHEN_VK_REACHABLE"
         const val ACTION_VERIFY_VK_REACHABILITY = "com.csqtt.client.VERIFY_VK_REACHABILITY"
