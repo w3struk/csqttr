@@ -1,5 +1,7 @@
 package com.csqtt.client
 
+import org.json.JSONArray
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -108,6 +110,21 @@ class TunnelEventParserTest {
         assertEquals("dead-hash", event.hash)
         assertEquals(951, event.code)
         assertNull(TunnelEventParser.parse("__CSQTT_EVENT__|CALL_UNAVAILABLE|{\"code\":951}"))
+    }
+
+    @Test
+    fun truncatedRoutingEventIsNotParsedAsRouting() {
+        val routing = JSONObject()
+            .put("preset_red", JSONArray((0 until 240).map { "ru.example.client$it" }))
+            .toString()
+        val line = "__CSQTT_EVENT__|ROUTING|${JSONObject().put("routing", routing)}"
+        assertTrue(line.length > 4096 + 256)
+
+        // The protocol writer used to cut stdout lines at 4096 bytes, right inside the preset JSON.
+        val cut = line.substring(0, 4096)
+        assertTrue(cut.startsWith(CsqttConstants.General.CSQTT_EVENT_PREFIX))
+        assertNull(TunnelEventParser.parse(cut))
+        assertTrue(TunnelEventParser.parse(line) is TunnelEventParser.Event.Routing)
     }
 
     @Test

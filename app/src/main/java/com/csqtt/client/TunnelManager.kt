@@ -158,6 +158,8 @@ object TunnelManager {
 
     @Volatile
     private var wrapAuthTimeoutCount = 0
+    @Volatile
+    private var lastReportedDroppedProtocol = 0L
     private var lastVpnStartAttemptMs = 0L
     @Volatile
     private var lastTunLossMs = 0L
@@ -409,6 +411,16 @@ object TunnelManager {
                 val msg = "Активных: ${event.active} | Трафик: %.2f МБ".format(totalMB)
                 stats.value = msg
                 updateProcessLog(identity, "stats", "[СЕТЬ] $msg", 25, false, LogLevel.NET)
+                if (event.droppedProtocol > lastReportedDroppedProtocol) {
+                    lastReportedDroppedProtocol = event.droppedProtocol
+                    updateProcessLog(
+                        identity,
+                        "protocol_lines_dropped",
+                        "[СЕТЬ] Потеряно строк протокола: ${event.droppedProtocol} — события сервера могли пропасть",
+                        98,
+                        true
+                    )
+                }
             }
             is TunnelEventParser.Event.ActiveZero -> {
                 activeWorkers.value = 0
@@ -1231,6 +1243,7 @@ object TunnelManager {
         running.value = true
         startUptimeTimer()
         wrapAuthTimeoutCount = 0
+        lastReportedDroppedProtocol = 0L
         activeWorkers.value = 0
         resetWorkerRecoveryState()
         startLogReader(identity)
@@ -1429,6 +1442,14 @@ object TunnelManager {
             val event = TunnelEventParser.parse(eventPart)
             if (event != null) {
                 handleTunnelEvent(event, identity)
+            } else {
+                updateProcessLog(
+                    identity,
+                    "event_parse_failed",
+                    "[СЕТЬ] Событие от сервера не разобрано (строка обрезана?): ${eventPart.take(80)}…",
+                    99,
+                    true
+                )
             }
             if (lineTrim.isEmpty()) {
                 return
@@ -1688,7 +1709,7 @@ object TunnelManager {
         if (!BuildConfig.DEBUG) return
         val tag = RustLogSinkPolicy.tag(stream)
         val severity = RustLogSinkPolicy.severity(stream, line)
-        for (chunk in RustLogSinkPolicy.chunks(line)) {
+        for (chunk in RustLogSinkPolicy.chunksForLogcat(line)) {
             when (severity) {
                 RustLogSeverity.DEBUG -> Log.d(tag, chunk)
                 RustLogSeverity.INFO -> Log.i(tag, chunk)

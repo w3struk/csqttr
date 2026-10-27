@@ -199,6 +199,12 @@ struct WriterRuntime {
 }
 
 pub const MAX_ROUTING_CHUNKS: usize = 8192;
+/// Upper bound for a routing rule once reassembled (decompressed) in memory.
+///
+/// The inbound base64 budget alone is ~5.3 MB, and the routing payload is gzip, so without this
+/// bound a mutated server could deliver a decompression bomb over the control channel. A rule
+/// with the full bundled RU preset is ~3.8 KB, so 256 KiB leaves a wide margin.
+pub const MAX_ROUTING_PAYLOAD_BYTES: usize = 262_144;
 
 #[derive(Default)]
 pub struct RoutingReassembler {
@@ -287,14 +293,35 @@ impl RoutingReassembler {
         if decoded.len() >= 2 && decoded[0] == 0x1f && decoded[1] == 0x8b {
             use flate2::read::GzDecoder;
             use std::io::Read;
-            let mut gz = GzDecoder::new(&decoded[..]);
-            let mut decompressed = String::new();
-            if gz.read_to_string(&mut decompressed).is_ok() {
-                return Some(decompressed);
+            // Read one byte past the limit so an oversized result is detectable without ever
+            // materialising the whole bomb in memory.
+            let mut decompressed = Vec::new();
+            let read = GzDecoder::new(&decoded[..])
+                .take(MAX_ROUTING_PAYLOAD_BYTES as u64 + 1)
+                .read_to_end(&mut decompressed);
+            if read.is_ok() {
+                if decompressed.len() > MAX_ROUTING_PAYLOAD_BYTES {
+                    report_routing_payload_too_large(decompressed.len());
+                    return None;
+                }
+                // A gzip header can never be valid UTF-8, so a bad inner stream is a hard reject.
+                return String::from_utf8(decompressed).ok();
             }
+        }
+        if decoded.len() > MAX_ROUTING_PAYLOAD_BYTES {
+            report_routing_payload_too_large(decoded.len());
+            return None;
         }
         String::from_utf8(decoded).ok()
     }
+}
+
+fn report_routing_payload_too_large(size: usize) {
+    crate::log_error!(
+        "[СЕССИЯ] Правило маршрутизации слишком велико (>{} байт, получено {}), событие отброшено",
+        MAX_ROUTING_PAYLOAD_BYTES,
+        size
+    );
 }
 
 struct ReaderRuntime {
@@ -2364,6 +2391,58 @@ mod tests {
         assert_eq!(reassembler.feed(b"ROUTING:START:1"), None);
         assert_eq!(reassembler.feed(b"ROUTING:1:1:not-valid-base64-!!!"), None);
         assert_eq!(reassembler.feed(b"ROUTING:FINISH:1"), None);
+    }
+
+    #[test]
+    fn test_routing_reassembler_rejects_gzip_bomb() {
+        use base64::Engine;
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+
+        let bomb = "a".repeat(MAX_ROUTING_PAYLOAD_BYTES + 1024);
+        let mut enc = GzEncoder::new(Vec::new(), Compression::best());
+        enc.write_all(bomb.as_bytes()).unwrap();
+        let compressed = enc.finish().unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&compressed);
+
+        let mut reassembler = RoutingReassembler::new();
+        assert_eq!(reassembler.feed(b"ROUTING:START:1"), None);
+        assert_eq!(
+            reassembler.feed(format!("ROUTING:1:1:{b64}").as_bytes()),
+            None
+        );
+        assert_eq!(reassembler.feed(b"ROUTING:FINISH:1"), None);
+    }
+
+    #[test]
+    fn test_routing_reassembler_rejects_oversized_plain_payload() {
+        use base64::Engine;
+
+        let oversized = "x".repeat(MAX_ROUTING_PAYLOAD_BYTES + 1);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(oversized.as_bytes());
+
+        let mut reassembler = RoutingReassembler::new();
+        assert_eq!(reassembler.feed(b"ROUTING:START:1"), None);
+        assert_eq!(
+            reassembler.feed(format!("ROUTING:1:1:{b64}").as_bytes()),
+            None
+        );
+        assert_eq!(reassembler.feed(b"ROUTING:FINISH:1"), None);
+    }
+
+    #[test]
+    fn test_routing_reassembler_accepts_payload_at_the_limit() {
+        use base64::Engine;
+
+        let at_limit = "x".repeat(MAX_ROUTING_PAYLOAD_BYTES);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(at_limit.as_bytes());
+
+        let mut reassembler = RoutingReassembler::new();
+        assert_eq!(reassembler.feed(b"ROUTING:START:1"), None);
+        assert_eq!(reassembler.feed(b"ROUTING:FINISH:1"), None);
+        let res = reassembler.feed(format!("ROUTING:1:1:{b64}").as_bytes());
+        assert_eq!(res, Some(at_limit));
     }
 
     #[test]

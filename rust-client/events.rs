@@ -45,7 +45,7 @@ impl Events {
         if !self.enabled {
             return;
         }
-        if let Some(line) = encode_event(kind, &payload()) {
+        if let Some(line) = encode_event_line(kind, &payload()) {
             crate::log_output!("{line}");
         }
     }
@@ -86,7 +86,8 @@ impl Events {
             serde_json::json!({
                 "active": active,
                 "bytes_up": bytes_up,
-                "bytes_down": bytes_down
+                "bytes_down": bytes_down,
+                "dropped_protocol": crate::logging::dropped_protocol_lines()
             })
         });
     }
@@ -175,6 +176,27 @@ fn encode_event<T: Serialize>(kind: &str, payload: &T) -> Option<String> {
     Some(format!("{EVENT_PREFIX}{kind}|{json}"))
 }
 
+/// Encodes one protocol event, refusing to emit a line the transport would have to cut.
+///
+/// The protocol writer truncates lines at [`crate::logging::MAX_PROTOCOL_LINE_BYTES`], and the
+/// app drops any event it cannot parse — a truncated `ROUTING` payload would silently leave the
+/// app on local routing forever. When a payload does not fit, an ordinary non-fatal `ERROR`
+/// event is emitted instead, so the loss is visible on both sides.
+fn encode_event_line<T: Serialize>(kind: &str, payload: &T) -> Option<String> {
+    let line = encode_event(kind, payload)?;
+    if line.len() <= crate::logging::MAX_PROTOCOL_LINE_BYTES {
+        return Some(line);
+    }
+    encode_event(
+        "ERROR",
+        &serde_json::json!({
+            "code": "event_payload_too_large",
+            "fatal": false,
+            "message": format!("{kind}: {} байт", line.len())
+        }),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,6 +237,40 @@ mod tests {
                 "__CSQTT_EVENT__|ERROR|{\"code\":\"authentication_rejected\",\"fatal\":true,\"message\":\"FATAL_AUTH: invalid password\"}"
             )
         );
+    }
+
+    #[test]
+    fn oversized_payload_becomes_a_visible_error_event_instead_of_a_cut_line() {
+        let oversize = "x".repeat(crate::logging::MAX_PROTOCOL_LINE_BYTES);
+        let raw = encode_event("ROUTING", &serde_json::json!({"routing": oversize}))
+            .expect("the payload must encode");
+        assert!(raw.len() > crate::logging::MAX_PROTOCOL_LINE_BYTES);
+
+        let line = encode_event_line(
+            "ROUTING",
+            &serde_json::json!({"routing": "x".repeat(crate::logging::MAX_PROTOCOL_LINE_BYTES)}),
+        )
+        .expect("an oversized payload still has to produce an event");
+
+        assert!(line.starts_with("__CSQTT_EVENT__|ERROR|"), "{line}");
+        assert!(line.contains("\"code\":\"event_payload_too_large\""));
+        assert!(line.contains("\"fatal\":false"));
+        assert!(line.contains(&format!("\"message\":\"ROUTING: {} байт\"", raw.len())));
+        assert!(!line.contains("\"routing\""));
+        assert!(line.len() < 512);
+    }
+
+    #[test]
+    fn events_within_the_protocol_limit_are_emitted_verbatim() {
+        assert_eq!(
+            encode_event_line("READY", &serde_json::json!({})).as_deref(),
+            Some("__CSQTT_EVENT__|READY|{}")
+        );
+        let routing = "x".repeat(8_192);
+        let line = encode_event_line("ROUTING", &serde_json::json!({"routing": routing}))
+            .expect("a routing rule above the old 4 KiB limit must still fit");
+        assert!(line.starts_with("__CSQTT_EVENT__|ROUTING|{"));
+        assert!(!line.contains("event_payload_too_large"));
     }
 
     #[test]

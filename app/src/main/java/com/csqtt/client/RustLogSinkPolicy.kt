@@ -33,8 +33,20 @@ internal object RustLogSinkPolicy {
      * in UTF-8 *bytes*, not characters: a Russian line costs two bytes per character,
      * so a character-based limit still produced records twice as long as logcat
      * accepts. 4000 leaves room for the longest tag plus logd's own framing.
+     *
+     * The chunk itself is smaller than the logd limit, because a chunk that is
+     * split gets a `[часть N/M]` marker appended: with the budget equal to the
+     * limit, the marker pushed the record over the edge and logd cut the tail of
+     * the message — the split then looked exactly like a payload cut by the Rust
+     * client.
      */
-    const val MAX_CHUNK_BYTES = 4000
+    const val MAX_CHUNK_BYTES = 3900
+
+    /** Android cuts a single logcat record at this many bytes of message. */
+    const val LOG_MESSAGE_LIMIT_BYTES = 4000
+
+    /** Room reserved in a logcat record for the `[часть N/M]` marker. */
+    private const val PART_MARKER_MAX_BYTES = 32
 
     private val ERROR_MARKERS = listOf(
         "ошибка",
@@ -103,5 +115,24 @@ internal object RustLogSinkPolicy {
         }
         if (current.isNotEmpty()) chunks += current.toString()
         return chunks
+    }
+
+    /**
+     * Chunks ready to be written to logcat.
+     *
+     * A line longer than logcat's payload budget has to be split, and the split is
+     * marked: in the log a split line looks exactly like a payload cut by the Rust
+     * client, and the two are indistinguishable without a marker. The marker is
+     * appended only when the line really was split.
+     *
+     * The budget leaves room for the marker, so that logd does not cut the tail of
+     * the record itself — that would hide exactly the tail we want to read.
+     */
+    fun chunksForLogcat(line: String, limitBytes: Int = MAX_CHUNK_BYTES): List<String> {
+        val budget = minOf(limitBytes, LOG_MESSAGE_LIMIT_BYTES - PART_MARKER_MAX_BYTES)
+        val chunks = chunks(line, budget)
+        if (chunks.size <= 1) return chunks
+        val total = chunks.size
+        return chunks.mapIndexed { index, chunk -> "$chunk [часть ${index + 1}/$total]" }
     }
 }

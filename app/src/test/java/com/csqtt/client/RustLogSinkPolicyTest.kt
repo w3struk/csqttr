@@ -116,6 +116,42 @@ class RustLogSinkPolicyTest {
         RustLogSinkPolicy.chunks("🔒", limitBytes = 3)
     }
 
+    @Test
+    fun `a line that fits is logged as is`() {
+        assertEquals(listOf("abc"), RustLogSinkPolicy.chunksForLogcat("abc"))
+    }
+
+    @Test
+    fun `a split line is marked so it cannot be read as a cut payload`() {
+        val line = "ошибка подключения ".repeat(600)
+        val chunks = RustLogSinkPolicy.chunksForLogcat(line)
+        assertTrue("expected several chunks", chunks.size > 1)
+        val total = chunks.size
+        chunks.forEachIndexed { index, chunk ->
+            assertTrue(
+                "chunk $index must carry its part marker: $chunk",
+                chunk.endsWith("[часть ${index + 1}/$total]"),
+            )
+            assertTrue(
+                "chunk of ${chunk.toByteArray(Charsets.UTF_8).size} bytes exceeds the logcat limit",
+                chunk.toByteArray(Charsets.UTF_8).size <= RustLogSinkPolicy.LOG_MESSAGE_LIMIT_BYTES,
+            )
+        }
+    }
+
+    @Test
+    fun `the marker survives even when a caller asks for the full log budget`() {
+        val line = "я".repeat(6000)
+        val chunks = RustLogSinkPolicy.chunksForLogcat(line, limitBytes = RustLogSinkPolicy.LOG_MESSAGE_LIMIT_BYTES)
+        assertTrue("expected several chunks", chunks.size > 1)
+        for (chunk in chunks) {
+            assertTrue(
+                "chunk of ${chunk.toByteArray(Charsets.UTF_8).size} bytes exceeds the logcat limit",
+                chunk.toByteArray(Charsets.UTF_8).size <= RustLogSinkPolicy.LOG_MESSAGE_LIMIT_BYTES,
+            )
+        }
+    }
+
     private fun String.hasLoneSurrogate(): Boolean {
         var i = 0
         while (i < length) {

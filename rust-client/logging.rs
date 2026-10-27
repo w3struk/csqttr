@@ -13,19 +13,27 @@ use std::{
 
 const PROTOCOL_CAPACITY: usize = 128;
 const DIAGNOSTIC_CAPACITY: usize = 512;
+/// Bound for human-readable diagnostic lines (`stderr`).
 const MAX_LINE_BYTES: usize = 4096;
+/// Bound for machine-readable protocol lines (`stdout`, `__CSQTT_EVENT__|KIND|{json}`).
+/// A routing rule with the bundled RU app preset is ~4.2 KB, so the protocol stream needs
+/// much more room than a diagnostic line; the app parses these lines as whole JSON payloads
+/// and silently drops anything it cannot parse.
+pub const MAX_PROTOCOL_LINE_BYTES: usize = 65_536;
 const PROTOCOL_BURST: usize = 32;
 const COALESCE_BATCH: usize = 64;
 
 struct BoundedLine {
     value: String,
+    limit: usize,
     full: bool,
 }
 
 impl BoundedLine {
-    fn new() -> Self {
+    fn new(limit: usize) -> Self {
         Self {
             value: String::with_capacity(256),
+            limit,
             full: false,
         }
     }
@@ -36,7 +44,7 @@ impl fmt::Write for BoundedLine {
         if self.full {
             return Ok(());
         }
-        let remaining = MAX_LINE_BYTES.saturating_sub(self.value.len());
+        let remaining = self.limit.saturating_sub(self.value.len());
         if value.len() <= remaining {
             self.value.push_str(value);
             return Ok(());
@@ -296,7 +304,7 @@ impl Logger {
         if !self.shared.begin_producer() {
             return;
         }
-        if let Some(line) = format_line(arguments) {
+        if let Some(line) = format_line(arguments, MAX_PROTOCOL_LINE_BYTES) {
             self.shared.push_protocol(line);
         }
         self.shared.finish_producer();
@@ -306,7 +314,7 @@ impl Logger {
         if !self.shared.begin_producer() {
             return;
         }
-        if let Some(line) = format_line(arguments) {
+        if let Some(line) = format_line(arguments, MAX_LINE_BYTES) {
             self.shared.push_diagnostic(line);
         }
         self.shared.finish_producer();
@@ -390,9 +398,9 @@ impl Drop for Logger {
     }
 }
 
-fn format_line(arguments: fmt::Arguments<'_>) -> Option<LogLine> {
+fn format_line(arguments: fmt::Arguments<'_>, limit: usize) -> Option<LogLine> {
     catch_unwind(AssertUnwindSafe(|| {
-        let mut line = BoundedLine::new();
+        let mut line = BoundedLine::new(limit);
         fmt::write(&mut line, arguments).ok()?;
         Some(LogLine {
             value: line.value.into_boxed_str(),
@@ -496,6 +504,13 @@ pub fn stdout(arguments: fmt::Arguments<'_>) {
 
 pub fn stderr(arguments: fmt::Arguments<'_>) {
     LOGGER.enqueue_diagnostic(arguments);
+}
+
+/// Number of protocol (`stdout`) lines evicted from the bounded queue because the writer
+/// could not keep up. Any protocol loss means the app may have missed whole events, so the
+/// counter is surfaced through the `STATS` event.
+pub fn dropped_protocol_lines() -> u64 {
+    LOGGER.shared.dropped_protocol.load(Ordering::Acquire)
 }
 
 pub fn shutdown(timeout: Duration) -> bool {
@@ -854,5 +869,29 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert!(lines[0].1.len() <= MAX_LINE_BYTES);
         assert!(std::str::from_utf8(lines[0].1.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn protocol_lines_keep_the_full_protocol_limit_instead_of_the_diagnostic_limit() {
+        let records = Records::new();
+        let logger = Logger::with_writers(
+            RecordingWriter::new(0, records.clone()),
+            RecordingWriter::new(1, records.clone()),
+            4,
+            4,
+        );
+        let value = "a".repeat(MAX_PROTOCOL_LINE_BYTES);
+        assert_eq!(value.len(), 64 * 1024);
+        logger.enqueue_protocol(format_args!("{value}"));
+        assert!(logger.shutdown(Duration::from_secs(2)));
+        let lines = records.snapshot();
+        assert_eq!(lines.len(), 1, "the payload must stay one whole line");
+        assert_eq!(lines[0].0, 0);
+        assert!(
+            lines[0].1.len() > MAX_LINE_BYTES,
+            "protocol lines must not be cut at the diagnostic limit"
+        );
+        assert_eq!(lines[0].1.len(), MAX_PROTOCOL_LINE_BYTES);
+        assert_eq!(lines[0].1, value);
     }
 }

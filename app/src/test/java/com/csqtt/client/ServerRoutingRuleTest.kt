@@ -87,6 +87,15 @@ class ServerRoutingRuleTest {
         assertEquals(4096, rule.presetRed.size)
     }
 
+    @Test fun largePresetWithTwoHundredPackagesIsFullyParsed() {
+        val packages = (0 until 200).map { "ru.example.client$it" }
+        val rule = requireNotNull(
+            parseServerRoutingRule(JSONObject().put("preset_red", org.json.JSONArray(packages)).toString()),
+        )
+        assertEquals(200, rule.presetRed.size)
+        assertEquals(packages, rule.presetRed)
+    }
+
     @Test fun nonArrayPresetValueYieldsEmptyListAndValidRule() {
         val red = requireNotNull(parseServerRoutingRule("""{"preset_red":"com.a"}"""))
         assertEquals(emptyList<String>(), red.presetRed)
