@@ -1,3 +1,4 @@
+import com.android.build.api.variant.FilterConfiguration
 import java.io.File
 import java.util.Properties
 import org.gradle.process.CommandLineArgumentProvider
@@ -229,6 +230,15 @@ android {
             jniLibs.directories.add("src/main/jniLibs")
         }
     }
+}
+
+// The app version as it appears in the APK file names.
+//
+// It is the defaultConfig versionName without the build-type suffix: the
+// variant name in the file name already says debug or release, so
+// "2.5.1-arm64-v8a-debug.apk" reads better than "2.5.1-debug-arm64-v8a-debug.apk".
+val apkVersionName: String = requireNotNull(android.defaultConfig.versionName) {
+    "defaultConfig.versionName is not set, the APK file names are built from it"
 }
 
 tasks.configureEach {
@@ -555,6 +565,24 @@ tasks.configureEach {
 // them on its own.
 androidComponents {
     onVariants { variant ->
+        // Every APK carries the app version in its name:
+        //
+        //   app-<version>-<abi>-<variant>.apk
+        //   app-<version>-universal-<variant>.apk
+        //
+        // AGP's own name (app-arm64-v8a-release.apk) says nothing about which
+        // build it is, so a folder full of such files is a guessing game. The
+        // scripts look the files up by this pattern:
+        // scripts/install_apk.sh finds the split for the device,
+        // scripts/build_apk.sh copies the release APKs into app/release/.
+        variant.outputs.forEach { output ->
+            val abi = output.filters
+                .firstOrNull { it.filterType == FilterConfiguration.FilterType.ABI }
+                ?.identifier
+                ?: "universal"
+            output.outputFileName.set("app-$apkVersionName-$abi-${variant.name}.apk")
+        }
+
         val variantName = variant.name
         val capitalisedVariant = capitalised(variantName)
         if (capitalisedVariant !in setOf("Debug", "Release")) return@onVariants

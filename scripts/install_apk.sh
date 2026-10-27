@@ -81,6 +81,18 @@ die() {
     exit 1
 }
 
+# The app version, as it appears in the APK file names.
+#
+# app/build.gradle.kts is the single place the version is defined, and the
+# scripts read it from there instead of keeping a second copy of the number:
+# the APK names are built from this value and from the ABI.
+apk_version() {
+    local versions
+    versions="$(sed -n 's/^[[:space:]]*versionName[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
+        "$ROOT/app/build.gradle.kts")"
+    printf '%s' "${versions%%$'\n'*}"
+}
+
 VARIANT=""
 APPLICATION_ID=""
 SERIAL="${ANDROID_SERIAL:-}"
@@ -207,8 +219,17 @@ device_abi="$("$ADB" -s "$SERIAL" shell getprop ro.product.cpu.abi 2>/dev/null |
 # Prefer the split built for this device: it is smaller than the universal APK
 # and matches what AGP used to install. The universal APK only exists when more
 # than one ABI was selected, so it is the fallback, not the primary choice.
+#
+# The APKs carry the app version in their names
+# (app-<version>-<abi>-<variant>.apk), so the name is built from the version,
+# the ABI and the variant.
+APK_VERSION="$(apk_version)"
+[[ -n "$APK_VERSION" ]] || die "could not read versionName from app/build.gradle.kts"
+ABI_APK="app-$APK_VERSION-$device_abi-$VARIANT.apk"
+UNIVERSAL_APK="app-$APK_VERSION-universal-$VARIANT.apk"
+
 APK=""
-for candidate in "$APK_DIR/app-$device_abi-$VARIANT.apk" "$APK_DIR/app-universal-$VARIANT.apk"; do
+for candidate in "$APK_DIR/$ABI_APK" "$APK_DIR/$UNIVERSAL_APK"; do
     if [[ -f "$candidate" ]]; then
         APK="$candidate"
         break
@@ -218,7 +239,7 @@ done
 if [[ -z "$APK" ]]; then
     echo >&2
     echo "ERROR: no APK for $VARIANT matches this device ($device_abi)." >&2
-    echo "       Looked for app-$device_abi-$VARIANT.apk and app-universal-$VARIANT.apk" >&2
+    echo "       Looked for $ABI_APK and $UNIVERSAL_APK" >&2
     echo "       in $APK_DIR. Present:" >&2
     shopt -s nullglob
     for candidate in "$APK_DIR"/*.apk; do
@@ -227,11 +248,13 @@ if [[ -z "$APK" ]]; then
     shopt -u nullglob
     # A split for another ABI means the build was configured for another
     # device: Gradle keeps the ABI it detected in the configuration cache and
-    # a device that changed afterwards is not noticed there.
+    # a device that changed afterwards is not noticed there. An APK of another
+    # version is not a sign of that, so the ABI is matched, not parsed: it is
+    # the token before the variant, and "arm64-v8a" carries a dash of its own.
     shopt -s nullglob
-    for candidate in "$APK_DIR"/app-*-"$VARIANT".apk; do
+    for candidate in "$APK_DIR"/app-*-"$VARIANT.apk"; do
         name="$(basename -- "$candidate")"
-        if [[ "$name" != "app-$device_abi-$VARIANT.apk" && "$name" != "app-universal-$VARIANT.apk" ]]; then
+        if [[ "$name" != app-*-"$device_abi-$VARIANT.apk" && "$name" != app-*-"universal-$VARIANT.apk" ]]; then
             echo >&2
             echo "       The build was made for another ABI: Gradle keeps the device ABI it" >&2
             echo "       detected in the configuration cache. Re-run with" >&2

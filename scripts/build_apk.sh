@@ -8,7 +8,7 @@
 #
 # Verifies the provenance of the native server asset and the Rust JNI
 # libraries, builds the release APKs with Gradle and copies the split APKs
-# into app/release/ with stable names.
+# into app/release/ with the app version in the name.
 
 set -euo pipefail
 
@@ -38,6 +38,18 @@ case "${1:-}" in
 esac
 
 cd "$ROOT"
+
+# The app version, as it appears in the APK file names.
+#
+# app/build.gradle.kts is the single place the version is defined, and the
+# scripts read it from there instead of keeping a second copy of the number:
+# the APK names are built from this value and from the ABI.
+apk_version() {
+    local versions
+    versions="$(sed -n 's/^[[:space:]]*versionName[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
+        "$ROOT/app/build.gradle.kts")"
+    printf '%s' "${versions%%$'\n'*}"
+}
 
 echo "=== CSQTT APK Build Script ==="
 echo "=== Output: 4 APKs (universal, arm64-v8a, armeabi-v7a, x86_64) ==="
@@ -106,8 +118,14 @@ APK_DIR="$ROOT/app/build/outputs/apk/release"
 RELEASE_DIR="$ROOT/app/release"
 mkdir -p "$RELEASE_DIR"
 
+APK_VERSION="$(apk_version)"
+if [[ -z "$APK_VERSION" ]]; then
+    echo "ERROR: could not read versionName from app/build.gradle.kts" >&2
+    exit 1
+fi
+
 # Stale split from the x86 era is never produced anymore.
-rm -f "$APK_DIR/app-x86-release.apk" "$RELEASE_DIR/CSQTT-x86.apk"
+rm -f "$APK_DIR/app-x86-release.apk" "$APK_DIR"/app-*-x86-release.apk "$RELEASE_DIR/CSQTT-x86.apk"
 
 human_size() {
     awk -v bytes="$1" 'BEGIN {
@@ -123,41 +141,42 @@ human_size() {
 }
 
 copy_apk() {
-    local src="$1" dst="$2" name="$3" bytes
+    local abi="$1" src dst bytes
+    src="$APK_DIR/app-$APK_VERSION-$abi-release.apk"
+    dst="$RELEASE_DIR/CSQTT-$APK_VERSION-$abi.apk"
     if [[ -f "$src" ]]; then
         cp -f "$src" "$dst"
         bytes="$(stat -c %s "$dst")"
-        printf '  [OK] %-24s [%s bytes, %s]\n' "$name" "$bytes" "$(human_size "$bytes")"
+        printf '  [OK] %-28s [%s bytes, %s]\n' "$(basename -- "$dst")" "$bytes" "$(human_size "$bytes")"
     else
-        printf '  [!!] %-24s not found: %s\n' "$name" "$src" >&2
+        printf '  [!!] %-28s not found: %s\n' "$(basename -- "$dst")" "$src" >&2
         MISSING=$((MISSING + 1))
     fi
 }
 
 # Clear the targets first: copying over them would leave a mix of fresh and stale
-# APKs behind if one of the splits turns out to be missing.
-rm -f \
-    "$RELEASE_DIR/CSQTT-universal.apk" \
-    "$RELEASE_DIR/CSQTT-arm64-v8a.apk" \
-    "$RELEASE_DIR/CSQTT-armeabi-v7a.apk" \
-    "$RELEASE_DIR/CSQTT-x86_64.apk"
+# APKs behind if one of the splits turns out to be missing. Every version goes,
+# not just the current one, so an older release never lingers next to a newer one.
+for abi in universal arm64-v8a armeabi-v7a x86_64; do
+    rm -f "$RELEASE_DIR/CSQTT-$abi.apk" "$RELEASE_DIR"/CSQTT-*"-$abi.apk"
+done
 
 MISSING=0
 echo
 echo "Copying APKs to release folder..."
-copy_apk "$APK_DIR/app-universal-release.apk" "$RELEASE_DIR/CSQTT-universal.apk" "CSQTT-universal.apk"
-copy_apk "$APK_DIR/app-arm64-v8a-release.apk" "$RELEASE_DIR/CSQTT-arm64-v8a.apk" "CSQTT-arm64-v8a.apk"
-copy_apk "$APK_DIR/app-armeabi-v7a-release.apk" "$RELEASE_DIR/CSQTT-armeabi-v7a.apk" "CSQTT-armeabi-v7a.apk"
-copy_apk "$APK_DIR/app-x86_64-release.apk" "$RELEASE_DIR/CSQTT-x86_64.apk" "CSQTT-x86_64.apk"
+copy_apk universal
+copy_apk arm64-v8a
+copy_apk armeabi-v7a
+copy_apk x86_64
 
 echo
 echo "=== DONE ==="
 echo "Output directory: app/release/"
 echo
-echo "  CSQTT-universal.apk    - all architectures in one APK"
-echo "  CSQTT-arm64-v8a.apk    - 64-bit ARM only"
-echo "  CSQTT-armeabi-v7a.apk  - 32-bit ARM only"
-echo "  CSQTT-x86_64.apk       - 64-bit x86 only"
+echo "  CSQTT-$APK_VERSION-universal.apk    - all architectures in one APK"
+echo "  CSQTT-$APK_VERSION-arm64-v8a.apk    - 64-bit ARM only"
+echo "  CSQTT-$APK_VERSION-armeabi-v7a.apk  - 32-bit ARM only"
+echo "  CSQTT-$APK_VERSION-x86_64.apk       - 64-bit x86 only"
 echo
 
 if ((MISSING > 0)); then
