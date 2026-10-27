@@ -173,6 +173,24 @@ class TunVpnService : VpnService() {
                 }
                 userSelected = savedApps.split(",").filter { it.isNotEmpty() }.toSet()
             }
+            // Пресет существует только вместе с серверным правилом: в локальном режиме
+            // его нет, и поведение остаётся прежним.
+            val preset: PresetApps
+            val orangeEnabled: Set<String>
+            if (serverRule != null) {
+                preset = PresetApps(
+                    red = serverRule.presetRed.toSet(),
+                    orange = serverRule.presetOrange.toSet(),
+                )
+                orangeEnabled = SettingsStore(applicationContext)
+                    .orangeTunnelEnabled.first()
+                    .split(",")
+                    .filter { it.isNotEmpty() }
+                    .toSet()
+            } else {
+                preset = PresetApps(red = emptySet(), orange = emptySet())
+                orangeEnabled = emptySet()
+            }
             val transportPackages = setOf(
                 applicationContext.packageName,
                 CsqttConstants.General.PACKAGE_VK,
@@ -289,36 +307,24 @@ class TunVpnService : VpnService() {
                 }
             }
 
-            if (isWhitelist) {
-                val installedIncluded = userSelected
-                    .filter { pkg -> 
-                        pkg !in transportPackages && isPackageInstalled(pkg) 
-                    }
-                    .toSet()
-                if (installedIncluded.isEmpty()) {
-                    if (serverRule == null || userSelected.isNotEmpty()) {
-                        failVpn("Whitelist пуст: выберите хотя бы одно установленное приложение")
-                        return
-                    } else {
-                        // An empty server package list means a device-wide domain/IP rule.
-                        // A nonempty list with no installed matches must never broaden to all apps.
-                        Log.i(TAG, "Server rule applies to all applications (no package filter)")
-                        try {
-                            builder.addDisallowedApplication(applicationContext.packageName)
-                        } catch (e: Exception) {
-                            Log.e(TAG, "Unable to exclude CSQTT UID from its VPN", e)
-                            failVpn("Android не разрешил исключить CSQTT из собственного VPN")
-                            return
-                        }
-                        transportPackages
-                            .filter { it != applicationContext.packageName && isPackageInstalled(it) }
-                            .forEach { pkg ->
-                                try { builder.addDisallowedApplication(pkg) } catch (_: Exception) {}
-                            }
-                    }
-                } else {
+            val appsPlan = VpnAppRouting.build(
+                hasServerRule = serverRule != null,
+                isWhite = isWhitelist,
+                rulePackages = userSelected,
+                preset = preset,
+                userEnabled = orangeEnabled,
+                transportPackages = transportPackages,
+                selfPackage = applicationContext.packageName,
+                isInstalled = ::isPackageInstalled,
+            )
+            when (appsPlan) {
+                is VpnAppsPlan.Failure -> {
+                    failVpn(appsPlan.message)
+                    return
+                }
+                is VpnAppsPlan.Allow -> {
                     var includedCount = 0
-                    installedIncluded.forEach { pkg ->
+                    appsPlan.packages.forEach { pkg ->
                         try {
                             builder.addAllowedApplication(pkg)
                             includedCount++
@@ -331,20 +337,20 @@ class TunVpnService : VpnService() {
                         return
                     }
                 }
-            } else {
-                try {
-                    builder.addDisallowedApplication(applicationContext.packageName)
-                } catch (e: Exception) {
-                    Log.e(TAG, "Unable to exclude CSQTT UID from its VPN", e)
-                    failVpn("Android не разрешил исключить CSQTT из собственного VPN")
-                    return
-                }
-                val excluded = transportPackages.toMutableSet()
-                excluded.addAll(userSelected)
-                excluded
-                    .filter { it != applicationContext.packageName && isPackageInstalled(it) }
-                    .forEach { pkg ->
-                    try { builder.addDisallowedApplication(pkg) } catch (_: Exception) {}
+                is VpnAppsPlan.Disallow -> {
+                    try {
+                        builder.addDisallowedApplication(applicationContext.packageName)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Unable to exclude CSQTT UID from its VPN", e)
+                        failVpn("Android не разрешил исключить CSQTT из собственного VPN")
+                        return
+                    }
+                    if (appsPlan.deviceWide) {
+                        Log.i(TAG, "Server rule applies to all applications (no package filter)")
+                    }
+                    appsPlan.packages.forEach { pkg ->
+                        try { builder.addDisallowedApplication(pkg) } catch (_: Exception) {}
+                    }
                 }
             }
 

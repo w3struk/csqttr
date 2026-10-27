@@ -19,11 +19,17 @@ internal object IpRoutingPolicy {
      *
      * В режиме белого списка (`ipIsWhite`) IP маршрутов не создают, поэтому
      * смена именно этого списка пересборки не требует.
+     *
+     * Пресет российских приложений сервер присылает в том же правиле, и он тоже
+     * задаёт маршруты, поэтому его смена (как и смена встроенного списка)
+     * пересборки требует.
      */
     fun needsVpnRebuild(previous: ServerRoutingRule?, next: ServerRoutingRule): Boolean =
         previous == null ||
             previous.isWhite != next.isWhite ||
             previous.packages.toSet() != next.packages.toSet() ||
+            previous.presetRed.toSet() != next.presetRed.toSet() ||
+            previous.presetOrange.toSet() != next.presetOrange.toSet() ||
             previous.ipIsWhite != next.ipIsWhite ||
             (!next.ipIsWhite && previous.ips.toSet() != next.ips.toSet())
 }

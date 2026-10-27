@@ -10,6 +10,8 @@ data class ServerRoutingRule(
     val ipIsWhite: Boolean = false,
     val ips: List<String> = emptyList(),
     val domainsIsWhite: Boolean = isWhite,
+    val presetRed: List<String> = emptyList(),
+    val presetOrange: List<String> = emptyList(),
 )
 
 internal fun isRoutingPackageName(value: String): Boolean =
@@ -18,6 +20,22 @@ internal fun isRoutingPackageName(value: String): Boolean =
             part.isNotEmpty() && (part[0] in 'A'..'Z' || part[0] in 'a'..'z' || part[0] == '_') &&
                 part.all { it in 'A'..'Z' || it in 'a'..'z' || it in '0'..'9' || it == '_' }
         }
+
+internal fun lenientPresetPackages(json: JSONObject, key: String): List<String> {
+    val array = json.optJSONArray(key) ?: return emptyList()
+    val entries = mutableListOf<String>()
+    for (index in 0 until minOf(array.length(), 4096)) {
+        val entry = array.opt(index) as? String ?: continue
+        val trimmed = entry.trim()
+        if (trimmed.isEmpty()) continue
+        if (!isRoutingPackageName(trimmed)) {
+            System.err.println("[ServerRoutingRule] отброшена запись пресета $key: $entry")
+            continue
+        }
+        entries += trimmed
+    }
+    return entries.distinct()
+}
 
 internal fun parseServerRoutingRule(value: String): ServerRoutingRule? = runCatching {
     val json = JSONObject(value)
@@ -37,6 +55,8 @@ internal fun parseServerRoutingRule(value: String): ServerRoutingRule? = runCatc
     )
     val packages = strings("packages")
     require(packages.all(::isRoutingPackageName)) { "invalid routing package name" }
+    val presetRed = lenientPresetPackages(json, "preset_red")
+    val presetOrange = lenientPresetPackages(json, "preset_orange")
     ServerRoutingRule(
         isWhite = appsWhite,
         packages = packages,
@@ -45,5 +65,7 @@ internal fun parseServerRoutingRule(value: String): ServerRoutingRule? = runCatc
         ipIsWhite = json.optBoolean("ip_is_whitelist", json.optString("ip_mode", "blacklist") == "whitelist"),
         ips = strings("ips"),
         domainsIsWhite = domainsWhite,
+        presetRed = presetRed,
+        presetOrange = presetOrange,
     )
 }.getOrNull()

@@ -16,6 +16,8 @@ class IpRoutingPolicyTest {
         packages: List<String> = emptyList(),
         ipIsWhite: Boolean = false,
         ips: List<String> = emptyList(),
+        presetRed: List<String> = emptyList(),
+        presetOrange: List<String> = emptyList(),
     ) = ServerRoutingRule(
         isWhite = isWhite,
         packages = packages,
@@ -23,6 +25,8 @@ class IpRoutingPolicyTest {
         templateDomains = false,
         ipIsWhite = ipIsWhite,
         ips = ips,
+        presetRed = presetRed,
+        presetOrange = presetOrange,
     )
 
     @Test
@@ -74,6 +78,42 @@ class IpRoutingPolicyTest {
         assertTrue(
             "смена режима списка IP требует пересборки",
             IpRoutingPolicy.needsVpnRebuild(previous, rule(ipIsWhite = false, ips = listOf("10.0.0.1"))),
+        )
+    }
+
+    @Test
+    fun `a change of the preset lists needs a rebuild`() {
+        assertTrue(
+            "смена красного пресета требует пересборки",
+            IpRoutingPolicy.needsVpnRebuild(
+                rule(presetRed = listOf("a")),
+                rule(presetRed = listOf("b")),
+            ),
+        )
+        assertTrue(
+            "очистка оранжевого пресета требует пересборки",
+            IpRoutingPolicy.needsVpnRebuild(
+                rule(presetOrange = listOf("x")),
+                rule(presetOrange = emptyList()),
+            ),
+        )
+        assertTrue(
+            "смена оранжевого пресета при неизменном красном требует пересборки",
+            IpRoutingPolicy.needsVpnRebuild(
+                rule(presetRed = listOf("a"), presetOrange = listOf("x")),
+                rule(presetRed = listOf("a"), presetOrange = listOf("y")),
+            ),
+        )
+    }
+
+    @Test
+    fun `an unchanged preset does not force a rebuild`() {
+        assertFalse(
+            "неизменный пресет пересборки не требует",
+            IpRoutingPolicy.needsVpnRebuild(
+                rule(presetRed = listOf("a")),
+                rule(presetRed = listOf("a")),
+            ),
         )
     }
 

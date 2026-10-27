@@ -5,7 +5,6 @@ import android.content.pm.PackageManager
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -61,13 +60,14 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.core.graphics.drawable.toBitmap
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.csqtt.client.AppRoutingPolicy
+import com.csqtt.client.PresetApps
 import com.csqtt.client.R
 import com.csqtt.client.SettingsStore
 import com.csqtt.client.TunnelManager
@@ -462,6 +462,22 @@ fun ExceptionsTab(
     val routingMode = if (isWhitelist) RoutingMode.IncludeSelected else RoutingMode.ExcludeSelected
     val activeAppSelection = if (isWhitelist) whitelistSelection else blacklistSelection
 
+    // Values the server rule actually applies. They are shown read-only: the
+    // local lists stay on disk but do not take part while the rule is active.
+    val serverRule = activeServerRule
+    val preset = PresetApps(
+        red = serverRule?.presetRed?.toSet() ?: emptySet(),
+        orange = serverRule?.presetOrange?.toSet() ?: emptySet(),
+    )
+    // Collected unconditionally: a conditional subscription would be torn down
+    // and rebuilt every time the server rule appears or disappears.
+    val orangeTunnelEnabledRaw by settingsStore.orangeTunnelEnabled.collectAsStateWithLifecycle(
+        initialValue = SettingsStore.cachedOrangeTunnelEnabled ?: ""
+    )
+    val orangeTunnelEnabled = orangeTunnelEnabledRaw.split(",").filter { it.isNotEmpty() }.toSet()
+    val installedPackages = appsList.map { it.packageName }.toSet()
+    val rulePackages = serverRule?.packages?.toSet() ?: emptySet()
+
     // The system apps that carried a rule when the dialog opened for the
     // current mode stay visible for the whole session: unchecking a rule must
     // not make the row disappear under the finger that just tapped it.
@@ -528,28 +544,12 @@ fun ExceptionsTab(
     }
 
     CsqttScreen {
-        if (isServerRouting) {
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(24.dp),
-                contentAlignment = Alignment.Center,
-            ) {
-                Text(
-                    text = "Маршрутизация синхронизирована с сервером",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold,
-                    color = Color(0xFF2563EB),
-                    textAlign = TextAlign.Center,
-                )
-            }
-        } else {
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(16.dp),
-            ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+        ) {
             AppSectionCard(
                 contentPadding = PaddingValues(16.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
@@ -563,18 +563,52 @@ fun ExceptionsTab(
                         softWrap = false,
                         overflow = TextOverflow.Ellipsis,
                     )
-                    Text(
-                        text = if (isWhitelist) {
+                    val serverRuleActive = serverRule != null
+                    val serverIsWhite = serverRule?.isWhite == true
+                    val serverCounts = AppRoutingPolicy.serverRuleCounts(
+                        hasServerRule = serverRuleActive,
+                        isWhite = serverIsWhite,
+                        rulePackages = rulePackages,
+                        preset = preset,
+                        userEnabled = orangeTunnelEnabled,
+                        installedPackages = installedPackages,
+                    )
+                    // Числа имеют смысл только по загруженному списку: пустой список
+                    // бывает и на первом кадре, и после неудачной загрузки.
+                    val appStatusText = when {
+                        serverCounts == null && isWhitelist ->
                             "Белый список: ${whitelistSelection.size} в туннеле"
-                        } else {
+                        serverCounts == null ->
                             "Чёрный список: ${blacklistSelection.size} исключено"
-                        },
+                        installedPackages.isEmpty() && isAppsLoading ->
+                            "Правило сервера: список приложений загружается…"
+                        installedPackages.isEmpty() ->
+                            "Правило сервера: список приложений недоступен"
+                        serverIsWhite ->
+                            "Правило сервера: белый список, ${serverCounts.inTunnel} в туннеле " +
+                                "(${serverCounts.alwaysExcluded} всегда мимо туннеля, " +
+                                "${serverCounts.optOut} можно отключить)"
+                        else ->
+                            "Правило сервера: чёрный список, ${serverCounts.excluded} исключено " +
+                                "(${serverCounts.alwaysExcluded} всегда мимо туннеля, " +
+                                "${serverCounts.optOut} можно отключить)"
+                    }
+                    Text(
+                        text = appStatusText,
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 1,
-                        softWrap = false,
+                        maxLines = if (serverRuleActive) Int.MAX_VALUE else 1,
+                        softWrap = serverRuleActive,
                         overflow = TextOverflow.Ellipsis,
                     )
+                    if (serverRuleActive) {
+                        Text(
+                            text = "Локальные списки не применяются, пока действует правило сервера. " +
+                                "Оранжевые приложения можно вернуть в туннель",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                 }
 
                 OutlinedButton(
@@ -623,7 +657,22 @@ fun ExceptionsTab(
                         softWrap = false,
                         overflow = TextOverflow.Ellipsis,
                     )
-                    val statusText = if (domainIsWhitelist) {
+                    val domainsStatusText = if (serverRule != null) {
+                        when {
+                            serverRule.domainsIsWhite ->
+                                "Правило сервера: белый список, ${serverRule.domains.size} доменов в туннеле"
+                            serverRule.templateDomains && serverRule.domains.isNotEmpty() ->
+                                "Правило сервера: чёрный список, ${templateDomains.size} готовых + " +
+                                    "${serverRule.domains.size} своих исключено"
+                            serverRule.templateDomains ->
+                                "Правило сервера: чёрный список, ${templateDomains.size} исключено " +
+                                    "(Готовый список RU)"
+                            serverRule.domains.isEmpty() ->
+                                "Правило сервера: чёрный список, 0 доменов исключено"
+                            else ->
+                                "Правило сервера: чёрный список, ${serverRule.domains.size} исключено"
+                        }
+                    } else if (domainIsWhitelist) {
                         "Белый список: ${directDomainsList.size} в туннеле"
                     } else {
                         when {
@@ -640,54 +689,52 @@ fun ExceptionsTab(
                         }
                     }
                     Text(
-                        text = statusText,
+                        text = domainsStatusText,
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = if (serverRule != null) Int.MAX_VALUE else 1,
+                        softWrap = serverRule != null,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+
+                OutlinedButton(
+                    onClick = { showDomainsDialog = true },
+                    enabled = !isServerRouting,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(CsqttSizes.ControlHeight),
+                    shape = CsqttShapes.Pill,
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        containerColor = Color.Transparent,
+                        contentColor = MaterialTheme.colorScheme.onSurface,
+                    ),
+                    border = BorderStroke(
+                        1.dp,
+                        MaterialTheme.colorScheme.outline.copy(alpha = 0.5f),
+                    ),
+                ) {
+                    Icon(
+                        imageVector = Icons.Outlined.Language,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp),
+                        tint = MaterialTheme.colorScheme.onSurface,
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = "Список доменов",
+                        fontWeight = FontWeight.SemiBold,
                         maxLines = 1,
                         softWrap = false,
                         overflow = TextOverflow.Ellipsis,
                     )
                 }
-
                 if (isServerRouting) {
                     Text(
-                        text = "Маршрутизация синхронизирована с сервером",
-                        style = MaterialTheme.typography.bodyMedium,
-                        fontWeight = FontWeight.SemiBold,
-                        color = Color(0xFF2563EB),
+                        text = "Задано правилом сервера",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
-                } else {
-                    OutlinedButton(
-                        onClick = { showDomainsDialog = true },
-                        enabled = true,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(CsqttSizes.ControlHeight),
-                        shape = CsqttShapes.Pill,
-                        colors = ButtonDefaults.outlinedButtonColors(
-                            containerColor = Color.Transparent,
-                            contentColor = MaterialTheme.colorScheme.onSurface,
-                        ),
-                        border = BorderStroke(
-                            1.dp,
-                            MaterialTheme.colorScheme.outline.copy(alpha = 0.5f),
-                        ),
-                    ) {
-                        Icon(
-                            imageVector = Icons.Outlined.Language,
-                            contentDescription = null,
-                            modifier = Modifier.size(18.dp),
-                            tint = MaterialTheme.colorScheme.onSurface,
-                        )
-                        Spacer(Modifier.width(8.dp))
-                        Text(
-                            text = "Список доменов",
-                            fontWeight = FontWeight.SemiBold,
-                            maxLines = 1,
-                            softWrap = false,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
                 }
             }
 
@@ -704,60 +751,64 @@ fun ExceptionsTab(
                         softWrap = false,
                         overflow = TextOverflow.Ellipsis,
                     )
-                    val statusText = if (ipIsWhitelist) {
+                    val ipsStatusText = if (serverRule != null) {
+                        if (serverRule.ipIsWhite) {
+                            "Правило сервера: белый список, ${serverRule.ips.size} в туннеле"
+                        } else {
+                            "Правило сервера: чёрный список, ${serverRule.ips.size} исключено"
+                        }
+                    } else if (ipIsWhitelist) {
                         "Белый список: ${directIpsList.size} в туннеле"
                     } else {
                         "Чёрный список: ${directIpsList.size} исключено"
                     }
                     Text(
-                        text = statusText,
+                        text = ipsStatusText,
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = if (serverRule != null) Int.MAX_VALUE else 1,
+                        softWrap = serverRule != null,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+
+                OutlinedButton(
+                    onClick = { showIpsDialog = true },
+                    enabled = !isServerRouting,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(CsqttSizes.ControlHeight),
+                    shape = CsqttShapes.Pill,
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        containerColor = Color.Transparent,
+                        contentColor = MaterialTheme.colorScheme.onSurface,
+                    ),
+                    border = BorderStroke(
+                        1.dp,
+                        MaterialTheme.colorScheme.outline.copy(alpha = 0.5f),
+                    ),
+                ) {
+                    Icon(
+                        painter = painterResource(R.drawable.ic_ip),
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp),
+                        tint = MaterialTheme.colorScheme.onSurface,
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = "Список адресов",
+                        fontWeight = FontWeight.SemiBold,
                         maxLines = 1,
                         softWrap = false,
                         overflow = TextOverflow.Ellipsis,
                     )
                 }
-
                 if (isServerRouting) {
                     Text(
-                        text = "Маршрутизация синхронизирована с сервером",
-                        style = MaterialTheme.typography.bodyMedium,
-                        fontWeight = FontWeight.SemiBold,
-                        color = Color(0xFF2563EB),
+                        text = "Задано правилом сервера",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
-                } else {
-                    OutlinedButton(
-                        onClick = { showIpsDialog = true },
-                        enabled = true,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(CsqttSizes.ControlHeight),
-                        shape = CsqttShapes.Pill,
-                        colors = ButtonDefaults.outlinedButtonColors(
-                            containerColor = Color.Transparent,
-                            contentColor = MaterialTheme.colorScheme.onSurface,
-                        ),
-                        border = BorderStroke(
-                            1.dp,
-                            MaterialTheme.colorScheme.outline.copy(alpha = 0.5f),
-                        ),
-                    ) {
-                        Icon(
-                            painter = painterResource(R.drawable.ic_ip),
-                            contentDescription = null,
-                            modifier = Modifier.size(18.dp),
-                            tint = MaterialTheme.colorScheme.onSurface,
-                        )
-                        Spacer(Modifier.width(8.dp))
-                        Text(
-                            text = "Список адресов",
-                            fontWeight = FontWeight.SemiBold,
-                            maxLines = 1,
-                            softWrap = false,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
                 }
             }
 
@@ -819,7 +870,6 @@ fun ExceptionsTab(
                 }
             }
         }
-    }
 
         if (showAppsDialog) {
             AppListDialog(

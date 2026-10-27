@@ -103,6 +103,9 @@ class SettingsStore(context: Context) {
         private val SSH_CERTIFICATE_ENCRYPTED = stringPreferencesKey("ssh_certificate_encrypted")
         private val EXCLUDED_APPS = stringPreferencesKey("excluded_apps")
         private val WHITELIST_APPS = stringPreferencesKey("whitelist_apps")
+        // Глобальный, а не профильный ключ: пресет приходит с серверного правила и к профилям
+        // отношения не имеет, поэтому через getProfileKey он не проходит.
+        private val ORANGE_TUNNEL_ENABLED = stringPreferencesKey("orange_tunnel_enabled")
 
         private val DETAILED_LOGS = booleanPreferencesKey("detailed_logs")
 
@@ -226,6 +229,9 @@ class SettingsStore(context: Context) {
         internal var cachedShowSystemApps: Boolean? = null
 
         @Volatile
+        internal var cachedOrangeTunnelEnabled: String? = null
+
+        @Volatile
         internal var cachedDomainRoutingEnabled: Boolean? = null
 
         @Volatile
@@ -288,6 +294,7 @@ class SettingsStore(context: Context) {
         it[TUNNEL_LAST_DIAGNOSTIC] ?: ""
     }
     val showSystemApps: Flow<Boolean> = dataStore.data.map { it[SHOW_SYSTEM_APPS] ?: false }
+    val orangeTunnelEnabled: Flow<String> = dataStore.data.map { it[ORANGE_TUNNEL_ENABLED] ?: "" }
     val loggingEnabled: Flow<Boolean> = dataStore.data.map { it[LOGGING_ENABLED] ?: true }
     val csqttLink: Flow<String> = dataStore.data.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
@@ -680,6 +687,7 @@ class SettingsStore(context: Context) {
                 launch { whitelistApps.collect { cachedWhitelistApps = it } }
                 launch { isWhitelist.collect { cachedIsWhitelist = it } }
                 launch { showSystemApps.collect { cachedShowSystemApps = it } }
+                launch { orangeTunnelEnabled.collect { cachedOrangeTunnelEnabled = it } }
                 launch { domainRoutingEnabled.collect { cachedDomainRoutingEnabled = it } }
                 launch { domainIsWhitelist.collect { cachedDomainIsWhitelist = it } }
                 launch { excludeRuZonesEnabled.collect { cachedExcludeRuZonesEnabled = it } }
@@ -848,6 +856,12 @@ class SettingsStore(context: Context) {
     suspend fun saveShowSystemApps(enabled: Boolean) {
         dataStore.edit { prefs ->
             prefs[SHOW_SYSTEM_APPS] = enabled
+        }
+    }
+
+    suspend fun saveOrangeTunnelEnabled(packages: String) {
+        dataStore.edit { prefs ->
+            prefs[ORANGE_TUNNEL_ENABLED] = packages
         }
     }
 
