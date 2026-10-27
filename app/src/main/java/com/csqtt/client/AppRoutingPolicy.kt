@@ -160,8 +160,15 @@ internal object VpnAppRouting {
             } else {
                 rulePackages
             }
+            // Набор, а не список: пакет, который есть и в правиле оператора, и в
+            // транспорте, должен попасть в disallow-список один раз, чтобы сервис
+            // не звал `addDisallowedApplication` дважды. Порядок обхода — правило,
+            // затем транспорт.
+            val packageSet = LinkedHashSet(excluded)
+            packageSet += transportPackages
+            packageSet -= selfPackage
             return VpnAppsPlan.Disallow(
-                packages = (excluded + transportPackages - selfPackage).filter(isInstalled),
+                packages = packageSet.filter(isInstalled),
             )
         }
 
@@ -205,9 +212,20 @@ internal object VpnAppRouting {
     }
 
     /**
+     * Какой стороной чинится причина отказа. Правило сервера правит оператор, а
+     * возврат оранжевых — только пользователь в приложении, поэтому общий совет
+     * «поправьте правило на сервере» уводил бы его не туда.
+     */
+    private enum class Fix(val advice: String) {
+        SERVER("Поправьте правило на сервере"),
+        USER("Верните оранжевые приложения в туннель в приложении «Маршрут» → «Список приложений»"),
+    }
+
+    /**
      * Текст отказа вместо прежнего «верните оранжевые в туннель», который врал и
      * в локальном режиме (там оранжевых нет), и когда приложения просто не
-     * установлены.
+     * установлены. Совет зависит от причины: если причин несколько, он называет
+     * действие для каждой.
      */
     private fun emptyWhitelistMessage(
         hasServerRule: Boolean,
@@ -230,21 +248,30 @@ internal object VpnAppRouting {
         }
         val reasons = buildList {
             if (installedRule.any { it in preset.red }) {
-                add("есть приложения, которые всегда мимо туннеля")
+                add("есть приложения, которые всегда мимо туннеля" to Fix.SERVER)
             }
             if (installedRule.any { it in preset.orange && it !in preset.red && it !in orangeEnabled }) {
-                add("оранжевые приложения не разрешены пользователем")
+                add("оранжевые приложения не разрешены пользователем" to Fix.USER)
             }
             if (installedRule.all { it in transportPackages }) {
-                add("все выбранные приложения — транспортные пакеты CSQTT")
+                add("все выбранные приложения — транспортные пакеты CSQTT" to Fix.SERVER)
             }
         }
-        val detail = reasons.ifEmpty { listOf("выбранные приложения не могут идти через туннель") }
-            .joinToString("; ")
-        return if (hasServerRule) {
-            "Whitelist пуст: $detail. Поправьте правило на сервере"
-        } else {
+        val effectiveReasons = reasons.ifEmpty {
+            listOf("выбранные приложения не могут идти через туннель" to Fix.SERVER)
+        }
+        val detail = effectiveReasons.joinToString("; ") { it.first }
+        // Локальный режим не лечится правкой серверного правила, поэтому совет
+        // про сервер в нём не появляется вовсе.
+        val advice = effectiveReasons
+            .map { it.second }
+            .filter { hasServerRule || it != Fix.SERVER }
+            .distinct()
+            .joinToString("; ") { it.advice }
+        return if (advice.isEmpty()) {
             "Whitelist пуст: $detail"
+        } else {
+            "Whitelist пуст: $detail. $advice"
         }
     }
 }

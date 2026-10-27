@@ -80,7 +80,10 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 private object AppCache {
@@ -367,15 +370,6 @@ fun ExceptionsTab(
     var showRoutingModeInfoDialog by rememberSaveable { mutableStateOf(false) }
     var showRulesTransferDialog by rememberSaveable { mutableStateOf(false) }
 
-    LaunchedEffect(isServerRouting) {
-        if (isServerRouting) {
-            showAppsDialog = false
-            showDomainsDialog = false
-            showIpsDialog = false
-            showRulesTransferDialog = false
-        }
-    }
-
     var dialogSnapshotBlacklist by remember { mutableStateOf<Set<String>?>(null) }
     var dialogSnapshotWhitelist by remember { mutableStateOf<Set<String>?>(null) }
     var dialogSnapshotIsWhitelist by remember { mutableStateOf<Boolean?>(null) }
@@ -465,6 +459,22 @@ fun ExceptionsTab(
     // Values the server rule actually applies. They are shown read-only: the
     // local lists stay on disk but do not take part while the rule is active.
     val serverRule = activeServerRule
+    // The one flag the whole screen reads: card status, locks and the dialog mode
+    // all use it. The `serverRoutingActive` flag is set in the same place as the
+    // rule itself (TunnelManager.applyServerRoutingRule), so there is nothing to
+    // show while it is on but the rule has not arrived.
+    val serverRuleActive = isServerRouting && serverRule != null
+
+    // The domain and IP cards are edited by dialogs that make no sense under a
+    // server rule: close them when the rule appears.
+    LaunchedEffect(serverRuleActive) {
+        if (serverRuleActive) {
+            showDomainsDialog = false
+            showIpsDialog = false
+            showRulesTransferDialog = false
+        }
+    }
+
     val preset = PresetApps(
         red = serverRule?.presetRed?.toSet() ?: emptySet(),
         orange = serverRule?.presetOrange?.toSet() ?: emptySet(),
@@ -477,6 +487,10 @@ fun ExceptionsTab(
     val orangeTunnelEnabled = orangeTunnelEnabledRaw.split(",").filter { it.isNotEmpty() }.toSet()
     val installedPackages = appsList.map { it.packageName }.toSet()
     val rulePackages = serverRule?.packages?.toSet() ?: emptySet()
+    // The mode that actually applies: the server rule wins while it is active,
+    // the local setting is only a fallback without one. One value feeds both
+    // the card status and the dialog highlight.
+    val serverIsWhite = serverRule?.isWhite == true
 
     // The system apps that carried a rule when the dialog opened for the
     // current mode stay visible for the whole session: unchecking a rule must
@@ -525,6 +539,30 @@ fun ExceptionsTab(
         }
     }
 
+    // Rapid taps arrive faster than DataStore emits, so the toggle is computed
+    // from the saved list inside the coroutine, one write at a time. Basing it on
+    // the composition's `orangeTunnelEnabled` would make the second tap read the
+    // value from before the first write and lose one toggle.
+    val orangeToggleMutex = remember(settingsStore) { Mutex() }
+
+    fun toggleOrangePackage(packageName: String) {
+        appPersistenceScope.launch {
+            orangeToggleMutex.withLock {
+                val current = settingsStore.orangeTunnelEnabled.first()
+                    .split(",")
+                    .filter { it.isNotEmpty() }
+                    .toSet()
+                val next = AppRoutingPolicy.toggleOrange(current, packageName)
+                settingsStore.saveOrangeTunnelEnabled(next.sorted().joinToString(","))
+                // The server rule itself does not change here, so nothing else
+                // rebuilds the tunnel. The restart goes after the write: the
+                // service reads the saved key, and an earlier restart could pick
+                // up the old list.
+                TunnelManager.reloadVpn()
+            }
+        }
+    }
+
     DisposableEffect(Unit) {
         onDispose {
             val pendingBlacklist = blacklistSelection
@@ -563,8 +601,6 @@ fun ExceptionsTab(
                         softWrap = false,
                         overflow = TextOverflow.Ellipsis,
                     )
-                    val serverRuleActive = serverRule != null
-                    val serverIsWhite = serverRule?.isWhite == true
                     val serverCounts = AppRoutingPolicy.serverRuleCounts(
                         hasServerRule = serverRuleActive,
                         isWhite = serverIsWhite,
@@ -692,15 +728,15 @@ fun ExceptionsTab(
                         text = domainsStatusText,
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = if (serverRule != null) Int.MAX_VALUE else 1,
-                        softWrap = serverRule != null,
+                        maxLines = if (serverRuleActive) Int.MAX_VALUE else 1,
+                        softWrap = serverRuleActive,
                         overflow = TextOverflow.Ellipsis,
                     )
                 }
 
                 OutlinedButton(
                     onClick = { showDomainsDialog = true },
-                    enabled = !isServerRouting,
+                    enabled = !serverRuleActive,
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(CsqttSizes.ControlHeight),
@@ -729,7 +765,7 @@ fun ExceptionsTab(
                         overflow = TextOverflow.Ellipsis,
                     )
                 }
-                if (isServerRouting) {
+                if (serverRuleActive) {
                     Text(
                         text = "Задано правилом сервера",
                         style = MaterialTheme.typography.bodySmall,
@@ -766,15 +802,15 @@ fun ExceptionsTab(
                         text = ipsStatusText,
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = if (serverRule != null) Int.MAX_VALUE else 1,
-                        softWrap = serverRule != null,
+                        maxLines = if (serverRuleActive) Int.MAX_VALUE else 1,
+                        softWrap = serverRuleActive,
                         overflow = TextOverflow.Ellipsis,
                     )
                 }
 
                 OutlinedButton(
                     onClick = { showIpsDialog = true },
-                    enabled = !isServerRouting,
+                    enabled = !serverRuleActive,
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(CsqttSizes.ControlHeight),
@@ -803,7 +839,7 @@ fun ExceptionsTab(
                         overflow = TextOverflow.Ellipsis,
                     )
                 }
-                if (isServerRouting) {
+                if (serverRuleActive) {
                     Text(
                         text = "Задано правилом сервера",
                         style = MaterialTheme.typography.bodySmall,
@@ -812,7 +848,7 @@ fun ExceptionsTab(
                 }
             }
 
-            if (!isServerRouting) {
+            if (!serverRuleActive) {
                 AppSectionCard(
                     contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
                     verticalArrangement = Arrangement.spacedBy(10.dp),
@@ -880,8 +916,8 @@ fun ExceptionsTab(
                 refreshFailed = refreshFailed,
                 searchQuery = appSearchQuery,
                 onSearchQueryChange = { appSearchQuery = it },
-                activeSelection = activeAppSelection,
-                isWhitelist = isWhitelist,
+                activeSelection = if (serverRuleActive) rulePackages else activeAppSelection,
+                isWhitelist = if (serverRuleActive) serverIsWhite else isWhitelist,
                 showSystemApps = showSystemAppsState,
                 onShowSystemAppsChange = { value ->
                     showSystemAppsState = value
@@ -906,6 +942,11 @@ fun ExceptionsTab(
                     scope.launch { settingsStore.saveIsWhitelist(toWhitelist) }
                 },
                 onClose = closeAppsDialog,
+                serverLocked = serverRuleActive,
+                lockedPackages = rulePackages,
+                preset = preset,
+                orangeTunnelEnabled = orangeTunnelEnabled,
+                onToggleOrange = ::toggleOrangePackage,
             )
         }
 

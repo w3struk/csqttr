@@ -56,6 +56,25 @@ class VpnAppRoutingTest {
     }
 
     @Test
+    fun blacklistDeduplicatesPackagesSharedByRuleAndTransport() {
+        val plan = build(
+            isWhite = false,
+            rulePackages = setOf("com.vkontakte.android", "com.vpn"),
+        ) as VpnAppsPlan.Disallow
+
+        assertEquals(
+            "пакет из правила и транспорта попадает в disallow-список один раз",
+            1,
+            plan.packages.count { it == "com.vkontakte.android" },
+        )
+        assertEquals(
+            "дубликатов в плане нет",
+            plan.packages.distinct(),
+            plan.packages,
+        )
+    }
+
+    @Test
     fun blacklistReturnsTheOrangeTheUserRestored() {
         val plan = build(
             isWhite = false,
@@ -219,6 +238,78 @@ class VpnAppRoutingTest {
         assertTrue(
             "текст называет транспортные пакеты: $message",
             message.contains("транспортные пакеты"),
+        )
+    }
+
+    @Test
+    fun orangeWithoutUserConsentAdvisesTheUserActionNotTheServerRule() {
+        val plan = build(isWhite = true, rulePackages = setOf("ru.sberbankmobile"))
+
+        val message = (plan as VpnAppsPlan.Failure).message
+        assertTrue(
+            "совет называет действие пользователя: $message",
+            message.contains("Верните оранжевые приложения в туннель"),
+        )
+        assertFalse(
+            "пользователь не может поправить правило на сервере: $message",
+            message.contains("Поправьте правило на сервере"),
+        )
+    }
+
+    @Test
+    fun redAppsStillAdviseFixingTheServerRule() {
+        val plan = build(isWhite = true, rulePackages = setOf("com.bank"))
+
+        val message = (plan as VpnAppsPlan.Failure).message
+        assertTrue(
+            "красный уровень чинится правилом сервера: $message",
+            message.contains("Поправьте правило на сервере"),
+        )
+        assertFalse(
+            "оранжевых в причине нет, значит и совета про них нет: $message",
+            message.contains("Верните оранжевые"),
+        )
+    }
+
+    @Test
+    fun mixedReasonsAdviseBothFixes() {
+        val plan = build(
+            isWhite = true,
+            rulePackages = setOf("com.bank", "ru.sberbankmobile"),
+        )
+
+        val message = (plan as VpnAppsPlan.Failure).message
+        assertTrue(
+            "совет по красному уровню — серверный: $message",
+            message.contains("Поправьте правило на сервере"),
+        )
+        assertTrue(
+            "совет по оранжевым — пользовательский: $message",
+            message.contains("Верните оранжевые приложения в туннель"),
+        )
+        assertTrue(
+            "каждая причина названа: $message",
+            message.contains("всегда мимо туннеля") &&
+                message.contains("оранжевые приложения не разрешены пользователем"),
+        )
+    }
+
+    @Test
+    fun localWhitelistNeverAdvisesFixingTheServerRule() {
+        val plan = build(
+            isWhite = true,
+            rulePackages = setOf("ru.sberbankmobile"),
+            hasServerRule = false,
+        )
+
+        val message = (plan as VpnAppsPlan.Failure).message
+        assertTrue(
+            "совет остаётся действием пользователя: $message",
+            message.contains("Верните оранжевые приложения в туннель"),
+        )
+        assertFalse(
+            "локальный режим не лечится правкой серверного правила: $message",
+            message.contains("Поправьте правило на сервере"),
         )
     }
 }

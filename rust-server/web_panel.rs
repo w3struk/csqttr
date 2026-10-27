@@ -12178,17 +12178,34 @@ const PANEL_HTML: &str = r##"
                     const r = await api('/api/preset-apps');
                     if (r.ok) {
                         presetAppsCache = await r.json();
-                    } else {
-                        presetAppsCache = { red: [], orange: [] };
                     }
                 } catch(e) {
-                    presetAppsCache = { red: [], orange: [] };
+                    presetAppsCache = null;
                 }
+            }
+            if (!presetAppsCache) {
+                // Сетевая ошибка — это не пустой и не битый файл пресета: не
+                // отправляем оператора искать ru_apps_preset.json на сервере.
+                renderPresetAppsLoadError(
+                    'Список пресета не загрузился: проверьте соединение с сервером.');
+                return;
             }
             renderPresetAppsGroup('presetRedList', 'presetRedCount', presetAppsCache.red,
                 'Уровень пуст: эти приложения поедут через туннель. Проверьте ru_apps_preset.json на сервере.');
             renderPresetAppsGroup('presetOrangeList', 'presetOrangeCount', presetAppsCache.orange,
                 'Уровень пуст: нечего возвращать в туннель. Проверьте ru_apps_preset.json на сервере.');
+        }
+
+        function renderPresetAppsLoadError(message) {
+            for (const [listId, countId] of [['presetRedList', 'presetRedCount'],
+                                             ['presetOrangeList', 'presetOrangeCount']]) {
+                const countEl = document.getElementById(countId);
+                if (countEl) countEl.textContent = '—';
+                const listEl = document.getElementById(listId);
+                if (listEl) {
+                    listEl.innerHTML = '<div style="color: var(--danger); text-align: center; padding: 10px;">' + esc(message) + '</div>';
+                }
+            }
         }
 
         function renderPresetAppsGroup(listId, countId, entries, emptyWarning) {

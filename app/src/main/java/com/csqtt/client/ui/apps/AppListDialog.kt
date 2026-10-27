@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.text.KeyboardActions
@@ -57,6 +58,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import com.csqtt.client.AppRoutingPolicy
+import com.csqtt.client.PresetApps
+import com.csqtt.client.PresetRisk
 import com.csqtt.client.R
 import com.csqtt.client.ui.components.CsqttBanner
 import com.csqtt.client.ui.components.CsqttEmptyState
@@ -89,10 +93,30 @@ internal fun AppListDialog(
     onRefresh: () -> Unit,
     onSwitchMode: (Boolean) -> Unit,
     onClose: () -> Unit,
+    serverLocked: Boolean = false,
+    lockedPackages: Set<String> = emptySet(),
+    preset: PresetApps = PresetApps(red = emptySet(), orange = emptySet()),
+    orangeTunnelEnabled: Set<String> = emptySet(),
+    onToggleOrange: (String) -> Unit = {},
 ) {
     val focusManager = LocalFocusManager.current
     val appListState = rememberLazyListState()
     var menuExpanded by remember { mutableStateOf(false) }
+
+    // The preset lists only say which packages exist in a level; the sections
+    // show the ones actually installed on the device. `appsList` is already
+    // narrowed by the caller, so the sections must not claim a device-wide
+    // installed count while a filter is on.
+    fun installedPresetApps(pkgs: Set<String>): List<AppItem> =
+        appsList.filter { it.packageName in pkgs }
+
+    val filtersActive = searchQuery.isNotBlank() || !showSystemApps
+
+    // A white rule without packages — «правило на все приложения» — routes every
+    // installed app through the tunnel. The predicate is shared with the routing
+    // card and `TunVpnService` so the checkbox cannot disagree with them.
+    val isDeviceWideRule = serverLocked &&
+        AppRoutingPolicy.isDeviceWideRule(isWhitelist, lockedPackages)
 
     // The viewport resets on mode and query changes so the selected group is
     // visible again.
@@ -170,7 +194,7 @@ internal fun AppListDialog(
                                 containerColor = Color(0xFF1475FD),
                                 contentColor = Color.White,
                             ),
-                            enabled = isMigrationReady,
+                            enabled = isMigrationReady && !serverLocked,
                         ) {
                             Text(
                                 text = "Чёрный список",
@@ -195,7 +219,7 @@ internal fun AppListDialog(
                                 1.dp,
                                 MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f),
                             ),
-                            enabled = isMigrationReady,
+                            enabled = isMigrationReady && !serverLocked,
                         ) {
                             Text(
                                 text = "Чёрный список",
@@ -218,7 +242,7 @@ internal fun AppListDialog(
                                 containerColor = Color(0xFF1475FD),
                                 contentColor = Color.White,
                             ),
-                            enabled = isMigrationReady,
+                            enabled = isMigrationReady && !serverLocked,
                         ) {
                             Text(
                                 text = "Белый список",
@@ -243,7 +267,7 @@ internal fun AppListDialog(
                                 1.dp,
                                 MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f),
                             ),
-                            enabled = isMigrationReady,
+                            enabled = isMigrationReady && !serverLocked,
                         ) {
                             Text(
                                 text = "Белый список",
@@ -377,6 +401,11 @@ internal fun AppListDialog(
                     overflow = TextOverflow.Ellipsis,
                 )
 
+                // The preset sections are rendered as elements of the list below,
+                // not as a fixed column above it: they have to scroll with the
+                // apps and must not take height away from them (the preset holds
+                // 172 red packages, dozens of which can be installed).
+
                 when {
                     !isMigrationReady || isAppsLoading -> {
                         Box(
@@ -413,22 +442,202 @@ internal fun AppListDialog(
                             contentPadding = PaddingValues(bottom = 8.dp),
                             verticalArrangement = Arrangement.spacedBy(CsqttSpacing.Xs),
                         ) {
+                            if (serverLocked && preset.all.isNotEmpty()) {
+                                presetSection(
+                                    title = "Всегда мимо туннеля",
+                                    installed = installedPresetApps(preset.red),
+                                    totalInPreset = preset.red.size,
+                                    risk = PresetRisk.RED,
+                                    isWhitelist = isWhitelist,
+                                    orangeTunnelEnabled = orangeTunnelEnabled,
+                                    filtersActive = filtersActive,
+                                    onToggleOrange = onToggleOrange,
+                                )
+                                presetSection(
+                                    title = "Можно отключить",
+                                    installed = installedPresetApps(preset.orange),
+                                    totalInPreset = preset.orange.size,
+                                    risk = PresetRisk.ORANGE,
+                                    isWhitelist = isWhitelist,
+                                    orangeTunnelEnabled = orangeTunnelEnabled,
+                                    filtersActive = filtersActive,
+                                    onToggleOrange = onToggleOrange,
+                                )
+                            }
+
                             items(
                                 items = appsList,
                                 key = { it.packageName },
                                 contentType = { "application" },
                             ) { app ->
-                                val isSelected = app.packageName in activeSelection
-                                AppRow(
-                                    app = app,
-                                    isSelected = isSelected,
-                                    onClick = { onToggleApp(app.packageName) },
-                                )
+                                val risk = preset.riskOf(app.packageName)
+                                when {
+                                    // Preset rows win over the lock: an orange
+                                    // package stays under user control even
+                                    // when the operator's rule lists it.
+                                    risk != null -> AppRow(
+                                        app = app.copy(presetRisk = risk),
+                                        isSelected = presetRowChecked(
+                                            risk = risk,
+                                            isWhitelist = isWhitelist,
+                                            packageName = app.packageName,
+                                            orangeTunnelEnabled = orangeTunnelEnabled,
+                                        ),
+                                        enabled = risk == PresetRisk.ORANGE,
+                                        onClick = {
+                                            if (risk == PresetRisk.ORANGE) onToggleOrange(app.packageName)
+                                        },
+                                    )
+
+                                    serverLocked && app.packageName in lockedPackages -> AppRow(
+                                        app = app,
+                                        isSelected = true,
+                                        enabled = false,
+                                        onClick = {},
+                                    )
+
+                                    // Reached only under a server rule: the row
+                                    // cannot change routing, so it must not
+                                    // pretend the user can toggle it. Under a
+                                    // device-wide rule every non-preset app goes
+                                    // through the tunnel, hence the checked box.
+                                    serverLocked -> AppRow(
+                                        app = app,
+                                        isSelected = isDeviceWideRule,
+                                        enabled = false,
+                                        onClick = {},
+                                    )
+
+                                    else -> AppRow(
+                                        app = app,
+                                        isSelected = app.packageName in activeSelection,
+                                        onClick = { onToggleApp(app.packageName) },
+                                    )
+                                }
                             }
                         }
                     }
                 }
             }
+        }
+    }
+}
+
+/**
+ * Effective checkbox state of a preset row — "is this app routed the way the
+ * level dictates", not "is the package in the mode's own list".
+ *
+ * In the blacklist mode the checkbox means "excluded from the tunnel", in the
+ * whitelist mode it means "goes through the tunnel".
+ */
+private fun presetRowChecked(
+    risk: PresetRisk,
+    isWhitelist: Boolean,
+    packageName: String,
+    orangeTunnelEnabled: Set<String>,
+): Boolean = when (risk) {
+    PresetRisk.RED -> !isWhitelist                 // чёрный: всегда исключён; белый: никогда в туннеле
+    PresetRisk.ORANGE -> if (isWhitelist) packageName in orangeTunnelEnabled
+                         else packageName !in orangeTunnelEnabled
+}
+
+/**
+ * One preset level, emitted as regular items of the app list so the section
+ * scrolls with the list and never takes a fixed slice of the dialog height.
+ * Red rows are informational only, orange rows stay under user control.
+ *
+ * Keys are prefixed by the level: the same package can appear both here and in
+ * the list below, and the list requires keys to be unique.
+ */
+private fun LazyListScope.presetSection(
+    title: String,
+    installed: List<AppItem>,
+    totalInPreset: Int,
+    risk: PresetRisk,
+    isWhitelist: Boolean,
+    orangeTunnelEnabled: Set<String>,
+    filtersActive: Boolean,
+    onToggleOrange: (String) -> Unit,
+) {
+    item(key = "preset-header-${risk.name}", contentType = "preset-header") {
+        PresetSectionHeader(
+            title = title,
+            shownCount = installed.size,
+            totalInPreset = totalInPreset,
+            risk = risk,
+            filtersActive = filtersActive,
+        )
+    }
+    items(
+        items = installed,
+        key = { "preset-${risk.name}-${it.packageName}" },
+        contentType = { "preset-row" },
+    ) { item ->
+        AppRow(
+            app = item.copy(presetRisk = risk),
+            isSelected = presetRowChecked(risk, isWhitelist, item.packageName, orangeTunnelEnabled),
+            enabled = risk == PresetRisk.ORANGE,
+            // Red rows are informational: the toggle is spelled out per level
+            // instead of relying on the row ignoring clicks.
+            onClick = if (risk == PresetRisk.ORANGE) {
+                { onToggleOrange(item.packageName) }
+            } else {
+                {}
+            },
+        )
+    }
+}
+
+@Composable
+private fun PresetSectionHeader(
+    title: String,
+    shownCount: Int,
+    totalInPreset: Int,
+    risk: PresetRisk,
+    filtersActive: Boolean,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = CsqttSpacing.Xs),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.SemiBold,
+                color = if (risk == PresetRisk.RED) Color(0xFFE5484D) else Color(0xFFF76B15),
+                maxLines = 1,
+                softWrap = false,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            // The list arrives filtered, so the count only describes the device
+            // when no filter is on.
+            Text(
+                text = if (filtersActive) "Показано: $shownCount" else "Установлено: $shownCount",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                softWrap = false,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        if (shownCount == 0) {
+            Text(
+                text = if (filtersActive) {
+                    "нет совпадений с фильтром"
+                } else {
+                    "не установлено ни одного приложения (в пресете $totalInPreset)"
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
     }
 }

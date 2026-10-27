@@ -56,20 +56,24 @@ fn parse_preset(json: &str) -> PresetApps {
         };
     };
     PresetApps {
-        red: parse_entries(object.get("red")),
-        orange: parse_entries(object.get("orange")),
+        red: parse_entries(object.get("red"), "red"),
+        orange: parse_entries(object.get("orange"), "orange"),
     }
 }
 
-fn parse_entries(value: Option<&serde_json::Value>) -> Vec<PresetEntry> {
-    let Some(entries) = value.and_then(serde_json::Value::as_array) else {
+fn parse_entries(value: Option<&serde_json::Value>, level: &str) -> Vec<PresetEntry> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    let Some(entries) = value.as_array() else {
+        eprintln!("[preset] уровень `{level}` не разобран: ожидался массив, получено {value}");
         return Vec::new();
     };
     let mut parsed = Vec::with_capacity(entries.len());
     for entry in entries {
         match parse_entry(entry) {
             Some(parsed_entry) => parsed.push(parsed_entry),
-            None => eprintln!("[preset] пропущена запись: {entry}"),
+            None => eprintln!("[preset] пропущена запись уровня `{level}`: {entry}"),
         }
     }
     parsed
@@ -185,6 +189,19 @@ mod tests {
         assert_eq!(parse_preset(""), empty);
         assert_eq!(parse_preset("{}"), empty.clone());
         assert_eq!(parse_preset(r#"{"red":{}}"#), empty);
+    }
+
+    #[test]
+    fn wrong_shaped_level_does_not_clear_the_other_level() {
+        let preset = parse_preset(r#"{"red":{},"orange":["com.ok"]}"#);
+        assert!(preset.red.is_empty());
+        assert_eq!(
+            preset.orange,
+            vec![PresetEntry {
+                package: "com.ok".into(),
+                name: String::new(),
+            }]
+        );
     }
 
     #[test]

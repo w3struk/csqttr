@@ -25,7 +25,11 @@ internal fun lenientPresetPackages(json: JSONObject, key: String): List<String> 
     val array = json.optJSONArray(key) ?: return emptyList()
     val entries = mutableListOf<String>()
     for (index in 0 until minOf(array.length(), 4096)) {
-        val entry = array.opt(index) as? String ?: continue
+        val entry = array.opt(index)
+        if (entry !is String) {
+            System.err.println("[ServerRoutingRule] отброшена запись пресета $key: не строка ($entry)")
+            continue
+        }
         val trimmed = entry.trim()
         if (trimmed.isEmpty()) continue
         if (!isRoutingPackageName(trimmed)) {

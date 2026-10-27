@@ -1486,7 +1486,7 @@ fn read_database_snapshot(config_dir: &Path) -> Result<Database> {
             let domains_is_whitelist: bool = row.get::<_, i64>(6).unwrap_or(0) != 0;
             let ip_is_whitelist: bool = row.get::<_, i64>(7).unwrap_or(0) != 0;
             let ips_str: String = row.get(8).unwrap_or_default();
-            let preset_apps: bool = row.get::<_, i64>(9).unwrap_or(0) != 0;
+            let preset_apps: bool = row.get::<_, i64>(9).unwrap_or(1) != 0;
             let packages: Vec<String> = serde_json::from_str(&pkgs_str).unwrap_or_default();
             let direct_domains: Vec<String> =
                 serde_json::from_str(&domains_str).unwrap_or_default();

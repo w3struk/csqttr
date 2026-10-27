@@ -88,7 +88,10 @@ class ServerRoutingRuleTest {
     }
 
     @Test fun nonArrayPresetValueYieldsEmptyListAndValidRule() {
-        val rule = requireNotNull(parseServerRoutingRule("""{"preset_red":"com.a"}"""))
-        assertEquals(emptyList<String>(), rule.presetRed)
+        val red = requireNotNull(parseServerRoutingRule("""{"preset_red":"com.a"}"""))
+        assertEquals(emptyList<String>(), red.presetRed)
+        val orange = requireNotNull(parseServerRoutingRule("""{"preset_orange":{"package":"com.a"}}"""))
+        assertEquals(emptyList<String>(), orange.presetOrange)
+        assertEquals(emptyList<String>(), orange.presetRed)
     }
 }

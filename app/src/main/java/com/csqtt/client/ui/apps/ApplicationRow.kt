@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.selection.toggleable
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -24,8 +25,11 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.csqtt.client.PresetRisk
 import com.csqtt.client.ui.design.CsqttShapes
 import com.csqtt.client.ui.design.CsqttSpacing
 import androidx.compose.foundation.BorderStroke
@@ -37,6 +41,7 @@ internal data class AppItem(
     val packageName: String,
     val icon: ImageBitmap?,
     val isSystem: Boolean,
+    val presetRisk: PresetRisk? = null,
 )
 
 @Composable
@@ -45,6 +50,7 @@ internal fun AppRow(
     isSelected: Boolean,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
+    enabled: Boolean = true,
 ) {
     val colors = MaterialTheme.colorScheme
     val isDark = colors.background.luminance() < 0.22f
@@ -61,15 +67,21 @@ internal fun AppRow(
         colors.outlineVariant.copy(alpha = if (isDark) 0.28f else 0.35f)
     }
 
+    val toggleModifier = if (enabled) {
+        Modifier.toggleable(
+            value = isSelected,
+            role = Role.Checkbox,
+            onValueChange = { onClick() },
+        )
+    } else {
+        Modifier
+    }
+
     Surface(
         modifier = modifier
             .fillMaxWidth()
             .heightIn(min = 68.dp)
-            .toggleable(
-                value = isSelected,
-                role = Role.Checkbox,
-                onValueChange = { onClick() },
-            ),
+            .then(toggleModifier),
         shape = CsqttShapes.Card,
         color = surfaceColor,
         contentColor = if (isSelected) colors.onPrimaryContainer else colors.onSurface,
@@ -96,6 +108,19 @@ internal fun AppRow(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
+                    app.presetRisk?.let { risk ->
+                        Box(
+                            modifier = Modifier
+                                .size(8.dp)
+                                .background(
+                                    color = if (risk == PresetRisk.RED) Color(0xFFE5484D) else Color(0xFFF76B15),
+                                    shape = CircleShape,
+                                )
+                                .semantics {
+                                    contentDescription = if (risk == PresetRisk.RED) "Всегда мимо туннеля" else "Можно отключить"
+                                },
+                        )
+                    }
                     Text(
                         text = app.name,
                         style = MaterialTheme.typography.bodyLarge,
@@ -132,6 +157,7 @@ internal fun AppRow(
             Checkbox(
                 checked = isSelected,
                 onCheckedChange = null,
+                enabled = enabled,
                 modifier = Modifier.clearAndSetSemantics { },
             )
         }
