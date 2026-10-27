@@ -27,6 +27,7 @@ mod model;
 mod net_setup;
 mod packet;
 mod path_probe;
+mod preset_apps;
 mod protocol;
 mod proxy_route;
 mod tokio_io;
@@ -1196,6 +1197,28 @@ async fn async_main() -> Result<()> {
         "SYSTEM",
         &format!(" Web: 0.0.0.0:{}", app.web_port),
     );
+
+    // The preset is a safety filter: an empty level means its apps lose the
+    // protection the feature exists for. A broken JSON or a wrong-shaped level
+    // is parsed into an empty list, so say it out loud instead of shipping a
+    // silent empty preset.
+    {
+        let preset = preset_apps::preset_apps();
+        if preset.red.is_empty() || preset.orange.is_empty() {
+            log_event(
+                &app,
+                "ERROR",
+                "PRESET",
+                &format!(
+                    " Встроенный пресет RU-приложений неполон (red: {}, orange: {}): \
+                     приложения из пустого уровня пойдут через туннель. \
+                     Проверьте rust-server/ru_apps_preset.json",
+                    preset.red.len(),
+                    preset.orange.len()
+                ),
+            );
+        }
+    }
 
     let web_app = app.clone();
     let diagnostic_app = app.clone();

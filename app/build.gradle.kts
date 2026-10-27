@@ -383,6 +383,7 @@ val serverNativeInputs = fileTree(rootProject.projectDir) {
     include(
         "rust-server/*.rs",
         "rust-server/*.sh",
+        "rust-server/*.json",
         // Selects the default target and the link flags, so a change here changes
         // the binary while every other declared input stays the same.
         ".cargo/config.toml",

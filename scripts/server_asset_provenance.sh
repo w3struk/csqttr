@@ -180,6 +180,7 @@ build_input_files() {
         rust-server/Cargo.toml \
         rust-server/Cargo.lock \
         rust-server/rust-toolchain.toml \
+        rust-server/ru_apps_preset.json \
         app/src/main/assets/domains.txt \
         scripts/server_asset_provenance.sh
 

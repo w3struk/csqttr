@@ -34,7 +34,7 @@ usage() {
 Usage: build_linux.sh [--tests|--no-tests] [--diagnostics] [--jobs=N] [--sequential]
 
   --tests         run fmt, clippy and the Linux musl test suite before building
-  --no-tests      skip the pre-build checks
+  --no-tests      skip those pre-build checks (the preset file is still validated)
   --diagnostics   build every variant with the `diagnostics` cargo feature
   --jobs=N        maximum number of parallel variant builds (default: nproc / 4)
   --sequential    compile the variants one at a time (low-RAM hosts)
@@ -94,6 +94,96 @@ if [[ "$DIAGNOSTICS" == 1 ]]; then
 fi
 
 section() { printf '\n==> %s\n' "$*"; }
+
+# The preset file is embedded into the server with include_str!, which does not
+# validate JSON: a typo compiles cleanly, the server logs one line and ships an
+# empty preset, and every red app (the ones that block an account when they see
+# a VPN) would be routed through the tunnel. The unit test catches this too, but
+# the shipping paths -- Gradle's buildNativeServer and build_both_parallel.sh --
+# pass --no-tests, so the check lives here and runs on every build. It needs
+# neither network nor cargo: python3 and its stdlib are enough.
+section "Checking the RU apps preset"
+PRESET_FILE="$SERVER_DIR/ru_apps_preset.json"
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "Error: python3 not found; it validates $PRESET_FILE on every build." >&2
+  exit 1
+fi
+if ! python3 - "$PRESET_FILE" <<'PY'
+import json
+import re
+import sys
+
+path = sys.argv[1]
+# Must stay in sync with valid_package_name() in rust-server/preset_apps.rs and
+# isRoutingPackageName() in app/src/main/java/com/csqtt/client/ServerRoutingRule.kt.
+PACKAGE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*")
+LEVELS = ("red", "orange")
+
+
+def fail(message):
+    print(f"  {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+try:
+    with open(path, encoding="utf-8") as handle:
+        preset = json.load(handle)
+except OSError as error:
+    fail(f"cannot read {path}: {error}")
+except json.JSONDecodeError as error:
+    fail(f"{path} is not valid JSON: {error}")
+
+if not isinstance(preset, dict):
+    fail(f"{path} must be a JSON object with `red` and `orange` arrays")
+
+owner = {}
+errors = []
+for level in LEVELS:
+    entries = preset.get(level)
+    if not isinstance(entries, list):
+        fail(f"{path}: `{level}` must be an array")
+    if not entries:
+        print(f"  warning: `{level}` is empty in {path}", file=sys.stderr)
+    for index, entry in enumerate(entries):
+        if isinstance(entry, str):
+            package = entry
+        elif isinstance(entry, dict):
+            package = entry.get("package")
+        else:
+            errors.append(f"`{level}[{index}]` is neither a string nor an object")
+            continue
+        if not isinstance(package, str) or not package:
+            errors.append(f"`{level}[{index}]` has no package name")
+            continue
+        if len(package) > 255 or not PACKAGE.fullmatch(package):
+            errors.append(f"`{level}[{index}]` has an invalid package name: {package}")
+            continue
+        if package in owner:
+            if owner[package] == level:
+                print(
+                    f"  warning: duplicate package {package} in `{level}`",
+                    file=sys.stderr,
+                )
+            else:
+                errors.append(
+                    f"package {package} is in both `{owner[package]}` and `{level}`"
+                )
+            continue
+        owner[package] = level
+
+if errors:
+    for error in errors:
+        print(f"  {error}", file=sys.stderr)
+    fail(
+        f"{path} is invalid: the server would ship an empty or truncated preset "
+        "and route red apps through the tunnel"
+    )
+print(f"  {len(owner)} packages, red and orange levels do not overlap")
+PY
+then
+  echo "Error: fix $PRESET_FILE before building." >&2
+  exit 1
+fi
 
 section "Checking build prerequisites"
 for tool in cargo rustup zig; do
