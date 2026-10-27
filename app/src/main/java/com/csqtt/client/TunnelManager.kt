@@ -1309,6 +1309,7 @@ object TunnelManager {
                     }
                 }
             } finally {
+                var restartScheduled = false
                 startStopMutex.withLock {
                     if (processIdentity === identity && process === targetProcess) {
                         val lifecycleWantsRestart = lifecycleState.processEnded(identity.ticket)
@@ -1354,6 +1355,7 @@ object TunnelManager {
                         }
                         if (shouldRestart && restartParams != null && restartContext != null) {
                             currentParams = restartParams
+                            restartScheduled = true
                             val reason = lastDiagnostic.get()?.let { " Причина: $it" }.orEmpty()
                             updateLog(
                                 "process_restart",
@@ -1384,6 +1386,26 @@ object TunnelManager {
                                 99,
                                 true,
                             )
+                        }
+                    }
+                }
+                // Интерфейс не должен переживать туннель: пока он поднят с маршрутом 0.0.0.0/0,
+                // весь трафик устройства (включая DNS) уходит в мёртвый tun — чёрная дыра без интернета.
+                // stopLocked здесь нельзя (startStopMutex уже захвачен) — только intent службе.
+                if (
+                    VpnLifecyclePolicy.shouldCloseVpnOnProcessExit(
+                        restartScheduled = restartScheduled,
+                        tunnelRunning = running.value,
+                    ) &&
+                    TunVpnService.instance != null
+                ) {
+                    activeContext()?.let { ctx ->
+                        val closeIntent = Intent(ctx, TunVpnService::class.java).apply {
+                            action = "CLOSE_INTERFACE"
+                        }
+                        try {
+                            ctx.startService(closeIntent)
+                        } catch (_: Exception) {
                         }
                     }
                 }
@@ -1901,6 +1923,23 @@ object TunnelManager {
         currentParams = null
         activeSettingsStore = null
         lastAppliedDns = null
+        // Автопауза на Wi-Fi — это пауза, а не остановка: её намерение возобновить туннель
+        // (`saveTunnelWasRunning(true)`) сохраняется ДО паузы, и сбрасывать его здесь нельзя —
+        // иначе автопауза перестанет возобновляться, а флаг автозапуска после перезапуска
+        // службы (START_STICKY) укажет на «туннель не запускался».
+        if (VpnLifecyclePolicy.shouldClearPersistedRunState(preserveWifiAutoPause)) {
+            // Устаревший TUNCONF не должен поднимать VPN после остановки: иначе ретрай из STATS
+            // и reloadVpn() воскрешают интерфейс поверх мёртвого туннеля.
+            config.value = null
+            // Снимаем флаг автостарта, чтобы restoreTunnel() после отзыва VPN пользователем не
+            // поднял туннель заново. stopLocked вызывается без suspend-контекста, поэтому
+            // через activeScope.
+            activeContext()?.let { ctx ->
+                activeScope.launch {
+                    runCatching { SettingsStore(ctx.applicationContext).saveTunnelWasRunning(false) }
+                }
+            }
+        }
         ManlCaptchaWebViewManager.cancelCaptcha()
     }
 

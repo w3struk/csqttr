@@ -42,6 +42,7 @@ class TunVpnService : VpnService() {
 
     companion object {
         private const val TAG = "TunVPN"
+        private const val FD_DELIVERY_MAX_ATTEMPTS = 60
 
         @Volatile
         var instance: TunVpnService? = null
@@ -140,6 +141,18 @@ class TunVpnService : VpnService() {
                     vpnMutex.withLock { stopVpn() }
                     releaseLocks()
                     stopSelf()
+                }
+            }
+            "CLOSE_INTERFACE" -> {
+                // Интерфейс закрывается, служба остаётся живой: stopSelf/releaseLocks здесь нельзя,
+                // иначе следующий START упрётся в фоновые ограничения startService, а туннель уже мёртв.
+                serviceScope.launch {
+                    vpnMutex.withLock {
+                        closeVpnInterface(
+                            logKey = "vpn_close_on_tunnel_exit",
+                            logMessage = "[TUN] VPN-интерфейс закрыт: туннель остановлен",
+                        )
+                    }
                 }
             }
         }
@@ -400,7 +413,15 @@ class TunVpnService : VpnService() {
         sendJob?.cancel()
         sendJob = serviceScope.launch {
             var success = false
-            for (i in 1..60) {
+            var attempt = 1
+            while (
+                VpnLifecyclePolicy.shouldRetryFdDelivery(
+                    tunnelRunning = TunnelManager.running.value,
+                    attempt = attempt,
+                    maxAttempts = FD_DELIVERY_MAX_ATTEMPTS,
+                )
+            ) {
+                attempt++
                 val socket = android.net.LocalSocket()
                 try {
                     socket.connect(android.net.LocalSocketAddress("csqtt_tun_uds", android.net.LocalSocketAddress.Namespace.ABSTRACT))
@@ -433,7 +454,18 @@ class TunVpnService : VpnService() {
                 }
             }
             if (!success) {
-                Log.e(TAG, "Could not send TUN fd to Rust client after 60 retries")
+                if (!VpnLifecyclePolicy.shouldReestablishVpn(TunnelManager.running.value)) {
+                    // Туннеля больше нет: держать интерфейс нельзя — весь трафик уйдёт в мёртвый tun.
+                    Log.e(TAG, "Could not send TUN fd to Rust client: tunnel is not running, closing interface")
+                    vpnMutex.withLock {
+                        closeVpnInterface(
+                            logKey = "vpn_fd_delivery_tunnel_dead",
+                            logMessage = "[TUN] VPN-интерфейс закрыт: туннель остановлен, Rust-клиент не принял TUN fd",
+                        )
+                    }
+                    return@launch
+                }
+                Log.e(TAG, "Could not send TUN fd to Rust client after $FD_DELIVERY_MAX_ATTEMPTS retries")
                 if (!dns.isNullOrBlank()) {
                     TunnelManager.updateLog(
                         "vpn_dns_delivery_error_$dns",
@@ -462,6 +494,15 @@ class TunVpnService : VpnService() {
             }
         } ?: return
         TunnelManager.onVpnInterfaceStopped()
+        if (!VpnLifecyclePolicy.shouldReestablishVpn(TunnelManager.running.value)) {
+            TunnelManager.updateLog(
+                "vpn_interface_closed_tunnel_dead",
+                "[TUN] VPN-интерфейс закрыт: туннель не запущен, восстанавливать нечего",
+                98,
+                true,
+            )
+            return
+        }
         if (recoveryAttempts >= 3) {
             TunnelManager.onVpnRecoverableFailure(
                 "не удалось передать TUN fd Rust-клиенту после повторных попыток",
@@ -488,6 +529,14 @@ class TunVpnService : VpnService() {
     private fun stopVpn() {
         sendJob?.cancel()
         sendJob = null
+        closeVpnInterface(
+            logKey = "vpn_stop",
+            logMessage = "[TUN] VPN-интерфейс закрыт вызовом stopVpn()",
+        )
+    }
+
+    /** Закрывает интерфейс, не трогая службу и её sendJob. */
+    private fun closeVpnInterface(logKey: String, logMessage: String) {
         synchronized(interfaceLock) {
             try {
                 vpnInterface?.close()
@@ -500,7 +549,7 @@ class TunVpnService : VpnService() {
             activeDns = null
         }
         TunnelManager.onVpnInterfaceStopped()
-        TunnelManager.updateLog("vpn_stop", "[TUN] VPN-интерфейс закрыт вызовом stopVpn()", 22)
+        TunnelManager.updateLog(logKey, logMessage, 22)
         Log.d(TAG, "VPN interface closed")
     }
 
