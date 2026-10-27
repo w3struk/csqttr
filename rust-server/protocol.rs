@@ -4633,6 +4633,33 @@ fn purge_replaced_worker_sessions(
     }
 }
 
+fn routing_rule_json(rule: &crate::model::RoutingRule) -> serde_json::Value {
+    serde_json::json!({
+        "version": 3,
+        "name": rule.name,
+        "mode": if rule.is_whitelist { "whitelist" } else { "blacklist" },
+        "is_whitelist": rule.is_whitelist,
+        "packages": &rule.packages,
+        "domains_mode": if rule.domains_is_whitelist { "whitelist" } else { "blacklist" },
+        "domains_is_whitelist": rule.domains_is_whitelist,
+        "domains": &rule.direct_domains,
+        "template_domains": rule.template_domains,
+        "ip_mode": if rule.ip_is_whitelist { "whitelist" } else { "blacklist" },
+        "ip_is_whitelist": rule.ip_is_whitelist,
+        "ips": &rule.ips,
+        "preset_red": if rule.preset_apps {
+            crate::preset_apps::red_packages()
+        } else {
+            Vec::<String>::new()
+        },
+        "preset_orange": if rule.preset_apps {
+            crate::preset_apps::orange_packages()
+        } else {
+            Vec::<String>::new()
+        }
+    })
+}
+
 async fn handle_getconf(
     app: &Arc<App>,
     writer: &ControlWriter<'_>,
@@ -5034,20 +5061,7 @@ async fn handle_getconf(
         && worker_id <= 1
         && let Some(rule) = routing_rule
     {
-        let json_val = serde_json::json!({
-            "version": 2,
-            "name": rule.name,
-            "mode": if rule.is_whitelist { "whitelist" } else { "blacklist" },
-            "is_whitelist": rule.is_whitelist,
-            "packages": &rule.packages,
-            "domains_mode": if rule.domains_is_whitelist { "whitelist" } else { "blacklist" },
-            "domains_is_whitelist": rule.domains_is_whitelist,
-            "domains": &rule.direct_domains,
-            "template_domains": rule.template_domains,
-            "ip_mode": if rule.ip_is_whitelist { "whitelist" } else { "blacklist" },
-            "ip_is_whitelist": rule.ip_is_whitelist,
-            "ips": &rule.ips
-        });
+        let json_val = routing_rule_json(&rule);
         let raw_json = serde_json::to_string(&json_val).unwrap_or_default();
         use flate2::Compression;
         use flate2::write::GzEncoder;
@@ -6264,5 +6278,66 @@ mod tests {
     #[tokio::test]
     async fn dns_fallback_identifies_yandex_immediately_without_network() {
         assert_eq!(FALLBACK_DNS, "77.88.8.8,77.88.8.1");
+    }
+
+    fn routing_fixture_rule(preset_apps: bool) -> crate::model::RoutingRule {
+        crate::model::RoutingRule {
+            id: "r1".to_owned(),
+            name: "Основное правило".to_owned(),
+            is_whitelist: true,
+            packages: vec!["com.example.app".to_owned(), "com.example.two".to_owned()],
+            template_domains: true,
+            preset_apps,
+            direct_domains: vec!["example.com".to_owned()],
+            domains_is_whitelist: false,
+            ip_is_whitelist: true,
+            ips: vec!["10.66.67.0/24".to_owned()],
+        }
+    }
+
+    #[test]
+    fn routing_json_bumps_version_and_includes_preset_when_enabled() {
+        let json = routing_rule_json(&routing_fixture_rule(true));
+
+        assert_eq!(json["version"], 3);
+        let red = json["preset_red"]
+            .as_array()
+            .expect("preset_red is an array");
+        assert!(!red.is_empty(), "preset_red must not be empty");
+        assert_eq!(
+            json["preset_red"],
+            serde_json::json!(crate::preset_apps::red_packages())
+        );
+        assert_eq!(
+            json["preset_orange"],
+            serde_json::json!(crate::preset_apps::orange_packages())
+        );
+    }
+
+    #[test]
+    fn routing_json_keeps_empty_preset_arrays_when_disabled() {
+        let json = routing_rule_json(&routing_fixture_rule(false));
+
+        assert_eq!(json["version"], 3);
+        assert_eq!(json["preset_red"], serde_json::json!([]));
+        assert_eq!(json["preset_orange"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn routing_json_keeps_existing_fields_intact() {
+        let rule = routing_fixture_rule(true);
+        let json = routing_rule_json(&rule);
+
+        assert_eq!(json["name"], rule.name);
+        assert_eq!(json["mode"], "whitelist");
+        assert_eq!(json["is_whitelist"], true);
+        assert_eq!(json["packages"], serde_json::json!(&rule.packages));
+        assert_eq!(json["domains_mode"], "blacklist");
+        assert_eq!(json["domains_is_whitelist"], false);
+        assert_eq!(json["domains"], serde_json::json!(&rule.direct_domains));
+        assert_eq!(json["template_domains"], true);
+        assert_eq!(json["ip_mode"], "whitelist");
+        assert_eq!(json["ip_is_whitelist"], true);
+        assert_eq!(json["ips"], serde_json::json!(&rule.ips));
     }
 }

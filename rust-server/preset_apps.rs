@@ -21,7 +21,6 @@ pub fn preset_apps() -> &'static PresetApps {
     &PRESET
 }
 
-#[allow(dead_code)]
 pub fn red_packages() -> Vec<String> {
     preset_apps()
         .red
@@ -30,7 +29,6 @@ pub fn red_packages() -> Vec<String> {
         .collect()
 }
 
-#[allow(dead_code)]
 pub fn orange_packages() -> Vec<String> {
     preset_apps()
         .orange
@@ -237,7 +235,17 @@ mod tests {
     }
 
     #[test]
-    fn sberbank_is_the_only_orange_entry() {
-        assert_eq!(orange_packages(), vec!["ru.sberbankmobile".to_string()]);
+    fn orange_level_is_non_empty_and_contains_valid_packages() {
+        // The set of entries is owned by whoever edits ru_apps_preset.json, so
+        // this test pins only the structural contract: a non-empty list whose
+        // packages pass the same validator the parser applies.
+        let orange = orange_packages();
+        assert!(!orange.is_empty(), "shipped preset `orange` is empty");
+        for package in &orange {
+            assert!(
+                valid_package_name(package),
+                "shipped preset `orange` has an invalid package: {package}"
+            );
+        }
     }
 }

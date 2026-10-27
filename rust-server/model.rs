@@ -38,7 +38,7 @@ pub struct ClientGroup {
     pub vk_hashes: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RoutingRule {
     pub id: String,
@@ -46,10 +46,30 @@ pub struct RoutingRule {
     pub is_whitelist: bool,
     pub packages: Vec<String>,
     pub template_domains: bool,
+    pub preset_apps: bool,
     pub direct_domains: Vec<String>,
     pub domains_is_whitelist: bool,
     pub ip_is_whitelist: bool,
     pub ips: Vec<String>,
+}
+
+// The preset ships enabled, so a rule deserialized from an older backup (struct-level
+// `#[serde(default)]` falls back to `Self::default()`) must not silently opt out of it.
+impl Default for RoutingRule {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            is_whitelist: false,
+            packages: Vec::new(),
+            template_domains: false,
+            preset_apps: true,
+            direct_domains: Vec::new(),
+            domains_is_whitelist: false,
+            ip_is_whitelist: false,
+            ips: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -829,6 +849,7 @@ CREATE TABLE IF NOT EXISTS routing_rules (
     is_whitelist         INTEGER NOT NULL DEFAULT 0,
     packages_json        TEXT NOT NULL DEFAULT '[]',
     template_domains     INTEGER NOT NULL DEFAULT 0,
+    preset_apps          INTEGER NOT NULL DEFAULT 1,
     direct_domains       TEXT NOT NULL DEFAULT '[]',
     domains_is_whitelist INTEGER NOT NULL DEFAULT 0,
     ip_is_whitelist      INTEGER NOT NULL DEFAULT 0,
@@ -938,6 +959,14 @@ fn ensure_routing_rule_columns(connection: &Connection) -> Result<()> {
                 [],
             )
             .context("add ips_json column")?;
+    }
+    if !columns.iter().any(|column| column == "preset_apps") {
+        connection
+            .execute(
+                "ALTER TABLE routing_rules ADD COLUMN preset_apps INTEGER NOT NULL DEFAULT 1",
+                [],
+            )
+            .context("add preset_apps column")?;
     }
     Ok(())
 }
@@ -1143,8 +1172,8 @@ fn write_database_snapshot(connection: &mut Connection, db: &Database) -> Result
             .prepare(
                 "INSERT INTO routing_rules (
                     id, name, is_whitelist, packages_json, template_domains, direct_domains,
-                    domains_is_whitelist, ip_is_whitelist, ips_json
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                    domains_is_whitelist, ip_is_whitelist, ips_json, preset_apps
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT(id) DO UPDATE SET
                     name = excluded.name,
                     is_whitelist = excluded.is_whitelist,
@@ -1153,7 +1182,8 @@ fn write_database_snapshot(connection: &mut Connection, db: &Database) -> Result
                     direct_domains = excluded.direct_domains,
                     domains_is_whitelist = excluded.domains_is_whitelist,
                     ip_is_whitelist = excluded.ip_is_whitelist,
-                    ips_json = excluded.ips_json",
+                    ips_json = excluded.ips_json,
+                    preset_apps = excluded.preset_apps",
             )
             .context("prepare routing_rules insert")?;
         for rule in db.routing_rules.values() {
@@ -1172,6 +1202,7 @@ fn write_database_snapshot(connection: &mut Connection, db: &Database) -> Result
                     i64::from(rule.domains_is_whitelist),
                     i64::from(rule.ip_is_whitelist),
                     ips,
+                    i64::from(rule.preset_apps),
                 ])
                 .with_context(|| format!("write routing rule {}", rule.id))?;
         }
@@ -1440,7 +1471,7 @@ fn read_database_snapshot(config_dir: &Path) -> Result<Database> {
         let mut select = connection
             .prepare(
                 "SELECT id, name, is_whitelist, packages_json, template_domains, direct_domains,
-                        domains_is_whitelist, ip_is_whitelist, ips_json
+                        domains_is_whitelist, ip_is_whitelist, ips_json, preset_apps
                  FROM routing_rules",
             )
             .context("prepare routing_rules select")?;
@@ -1455,6 +1486,7 @@ fn read_database_snapshot(config_dir: &Path) -> Result<Database> {
             let domains_is_whitelist: bool = row.get::<_, i64>(6).unwrap_or(0) != 0;
             let ip_is_whitelist: bool = row.get::<_, i64>(7).unwrap_or(0) != 0;
             let ips_str: String = row.get(8).unwrap_or_default();
+            let preset_apps: bool = row.get::<_, i64>(9).unwrap_or(0) != 0;
             let packages: Vec<String> = serde_json::from_str(&pkgs_str).unwrap_or_default();
             let direct_domains: Vec<String> =
                 serde_json::from_str(&domains_str).unwrap_or_default();
@@ -1467,6 +1499,7 @@ fn read_database_snapshot(config_dir: &Path) -> Result<Database> {
                     is_whitelist,
                     packages,
                     template_domains,
+                    preset_apps,
                     direct_domains,
                     domains_is_whitelist,
                     ip_is_whitelist,
@@ -1846,7 +1879,7 @@ mod tests {
 
     use super::{
         Database, DatabasePersistence, PasswordEntry, PersistenceQueue, PersistenceUpdate,
-        TrafficCounters, TrafficSnapshot, load_database, save_database,
+        RoutingRule, TrafficCounters, TrafficSnapshot, load_database, save_database,
     };
 
     #[test]
@@ -1868,6 +1901,110 @@ mod tests {
         assert_eq!(restored.dns, database.dns);
         assert_eq!(restored.dns_provider, database.dns_provider);
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn fresh_schema_defaults_preset_apps_to_enabled() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection.execute_batch(super::DATABASE_SCHEMA).unwrap();
+        connection
+            .execute(
+                "INSERT INTO routing_rules (id, name) VALUES ('r1', 'x')",
+                [],
+            )
+            .unwrap();
+
+        let preset_apps: i64 = connection
+            .query_row(
+                "SELECT preset_apps FROM routing_rules WHERE id = 'r1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(preset_apps, 1);
+    }
+
+    #[test]
+    fn migration_enables_preset_for_existing_rules() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("csqtt-preset-migration-test-{unique}"));
+        std::fs::create_dir_all(&directory).unwrap();
+        // the schema as it shipped before preset_apps existed
+        let connection = rusqlite::Connection::open(directory.join(super::DATABASE_FILE)).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE routing_rules (
+                    id                   TEXT PRIMARY KEY,
+                    name                 TEXT NOT NULL,
+                    is_whitelist         INTEGER NOT NULL DEFAULT 0,
+                    packages_json        TEXT NOT NULL DEFAULT '[]',
+                    template_domains     INTEGER NOT NULL DEFAULT 0,
+                    direct_domains       TEXT NOT NULL DEFAULT '[]',
+                    domains_is_whitelist INTEGER NOT NULL DEFAULT 0,
+                    ip_is_whitelist      INTEGER NOT NULL DEFAULT 0,
+                    ips_json             TEXT NOT NULL DEFAULT '[]'
+                );
+                INSERT INTO routing_rules (
+                    id, name, is_whitelist, packages_json, template_domains, direct_domains,
+                    domains_is_whitelist, ip_is_whitelist, ips_json
+                ) VALUES ('r1', 'legacy rule', 0, '[]', 0, '[]', 0, 0, '[]');",
+            )
+            .unwrap();
+        drop(connection);
+
+        let restored = load_database(&directory).expect("load old database");
+
+        assert!(
+            restored.routing_rules["r1"].preset_apps,
+            "the migration must silently enable the preset on an existing rule"
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn preset_flag_round_trips_through_save_and_load() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("csqtt-preset-roundtrip-test-{unique}"));
+        let rule = |id: &str, preset_apps: bool| RoutingRule {
+            id: id.to_owned(),
+            name: format!("rule {id}"),
+            preset_apps,
+            ..RoutingRule::default()
+        };
+        let mut database = Database::default();
+        database
+            .routing_rules
+            .insert("r1".to_owned(), rule("r1", false));
+        // both flags are set explicitly, so the pair proves the column is written and read back
+        database
+            .routing_rules
+            .insert("r2".to_owned(), rule("r2", true));
+
+        save_database(&directory, &database).expect("save database");
+        let restored = load_database(&directory).expect("load database");
+
+        assert!(!restored.routing_rules["r1"].preset_apps);
+        assert!(restored.routing_rules["r2"].preset_apps);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn default_rule_has_preset_enabled() {
+        assert!(RoutingRule::default().preset_apps);
+    }
+
+    #[test]
+    fn json_rule_without_preset_flag_defaults_to_enabled() {
+        // the backup import path: a rule serialized before the flag existed
+        let rule: RoutingRule = serde_json::from_str(r#"{"id":"r1","name":"x"}"#).unwrap();
+        assert!(rule.preset_apps);
     }
 
     #[test]

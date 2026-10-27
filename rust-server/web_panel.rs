@@ -4075,6 +4075,7 @@ struct RoutingRuleInfo {
     mode: String,
     packages: Vec<String>,
     template_domains: bool,
+    preset_apps: bool,
     direct_domains: Vec<String>,
     domains: Vec<String>,
     domains_is_whitelist: bool,
@@ -4118,6 +4119,7 @@ async fn routing_rules_get(State(state): State<WebState>) -> Response {
             },
             packages: rule.packages.clone(),
             template_domains: rule.template_domains,
+            preset_apps: rule.preset_apps,
             direct_domains: rule.direct_domains.clone(),
             domains: rule.direct_domains.clone(),
             domains_is_whitelist: rule.domains_is_whitelist,
@@ -4154,6 +4156,10 @@ async fn template_domains_get() -> impl IntoResponse {
     )
 }
 
+async fn preset_apps_get() -> Json<&'static crate::preset_apps::PresetApps> {
+    Json(crate::preset_apps::preset_apps())
+}
+
 #[derive(Deserialize)]
 struct CreateRoutingRuleRequest {
     #[serde(default)]
@@ -4166,6 +4172,8 @@ struct CreateRoutingRuleRequest {
     packages: Vec<String>,
     #[serde(default)]
     template_domains: bool,
+    #[serde(default = "default_preset_enabled")]
+    preset_apps: bool,
     #[serde(default)]
     direct_domains: Vec<String>,
     #[serde(default)]
@@ -4188,6 +4196,10 @@ struct CreateRoutingRuleRequest {
     assigned_clients: Vec<String>,
     #[serde(default)]
     target_client_passwords: Option<Vec<String>>,
+}
+
+fn default_preset_enabled() -> bool {
+    true
 }
 
 async fn routing_rules_create(
@@ -4237,6 +4249,7 @@ async fn routing_rules_create(
         is_whitelist,
         packages: request.packages,
         template_domains: request.template_domains,
+        preset_apps: request.preset_apps,
         direct_domains,
         domains_is_whitelist,
         ip_is_whitelist,
@@ -4316,6 +4329,7 @@ async fn routing_rules_update(
         rule.is_whitelist = is_whitelist;
         rule.packages = request.packages;
         rule.template_domains = request.template_domains;
+        rule.preset_apps = request.preset_apps;
         rule.direct_domains = direct_domains;
         rule.domains_is_whitelist = domains_is_whitelist;
         rule.ip_is_whitelist = ip_is_whitelist;
@@ -5415,6 +5429,7 @@ pub async fn run(
             put(routing_rules_update).delete(routing_rules_delete),
         )
         .route("/api/template-domains", get(template_domains_get))
+        .route("/api/preset-apps", get(preset_apps_get))
         .route("/api/logs", get(logs_get))
         .route("/api/logs/toggle", post(logs_toggle))
         .route("/api/logs/clear", post(logs_clear))
@@ -9544,6 +9559,18 @@ const PANEL_HTML: &str = r##"
             <label for="rulePackages">Список пакетов приложений</label>
             <textarea id="rulePackages" rows="3" style="width: 100%; background: var(--surface); color: var(--text-main); border: 1px solid var(--border); border-radius: 12px; padding: 10px; font-family: monospace; font-size: 12px;" placeholder="com.instagram.android&#10;org.telegram.messenger"></textarea>
         </div>
+        <div class="toggle-row" id="rulePresetAppsRow" style="margin-bottom: 16px;">
+            <div style="display: flex; align-items: center; gap: 8px;">
+                <label for="rulePresetApps" style="cursor: pointer;">Готовый список RU приложений</label>
+                <button type="button" class="btn-icon" style="padding: 2px; border: none; background: transparent; cursor: pointer; color: var(--primary); display: flex; align-items: center;" onclick="openPresetAppsDlg()" title="Посмотреть список RU приложений">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
+                </button>
+            </div>
+            <label class="switch">
+                <input type="checkbox" id="rulePresetApps">
+                <span class="slider"></span>
+            </label>
+        </div>
         <div class="input-group">
             <label for="ruleDomainsMode">Режим исключения доменов</label>
             <select id="ruleDomainsMode" onchange="onRuleDomainsModeChange()">
@@ -9611,6 +9638,29 @@ const PANEL_HTML: &str = r##"
         <div id="templateDomainsList" style="max-height: 320px; overflow-y: auto; background: var(--bg-color); border: 1px solid var(--border); border-radius: 12px; padding: 12px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; line-height: 1.6; color: var(--text-main);"></div>
         <div class="dlg-actions" style="margin-top: 16px;">
             <button class="btn btn-primary" onclick="document.getElementById('templateDomainsDlg').close()">Понятно</button>
+        </div>
+    </dialog>
+
+    <dialog id="presetAppsDlg" style="max-width: 540px; width: min(540px, calc(100% - 24px)); max-height: 80vh; overflow-y: auto;">
+        <div class="dlg-header">
+            <h2>Готовый список RU приложений</h2>
+            <button class="close-btn" onclick="document.getElementById('presetAppsDlg').close()">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+            </button>
+        </div>
+        <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 10px; line-height: 1.5;">
+            Приложения, направляемые мимо туннеля по пресету. Список только для чтения.
+        </p>
+        <div id="presetRedGroup" style="margin-bottom: 12px;">
+            <h4 style="font-size: 13px; color: var(--text-main); margin-bottom: 6px;">Всегда мимо туннеля (<span id="presetRedCount">0</span>)</h4>
+            <div id="presetRedList" style="max-height: 220px; overflow-y: auto; background: var(--bg-color); border: 1px solid var(--border); border-radius: 12px; padding: 12px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; line-height: 1.6; color: var(--text-main);"></div>
+        </div>
+        <div id="presetOrangeGroup" style="margin-bottom: 12px;">
+            <h4 style="font-size: 13px; color: var(--text-main); margin-bottom: 6px;">Можно отключить (<span id="presetOrangeCount">0</span>)</h4>
+            <div id="presetOrangeList" style="max-height: 220px; overflow-y: auto; background: var(--bg-color); border: 1px solid var(--border); border-radius: 12px; padding: 12px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; line-height: 1.6; color: var(--text-main);"></div>
+        </div>
+        <div class="dlg-actions" style="margin-top: 16px;">
+            <button class="btn btn-primary" onclick="document.getElementById('presetAppsDlg').close()">Понятно</button>
         </div>
     </dialog>
 
@@ -11709,6 +11759,7 @@ const PANEL_HTML: &str = r##"
             onRuleDomainsModeChange();
             document.getElementById('ruleDomains').value = rule && (rule.domains || rule.direct_domains) ? (rule.domains || rule.direct_domains).join('\n') : '';
             document.getElementById('ruleTemplateDomains').checked = rule ? Boolean(rule.template_domains) : false;
+            document.getElementById('rulePresetApps').checked = rule ? Boolean(rule.preset_apps) : true;
             document.getElementById('ruleIpMode').value = rule ? (rule.ip_mode || (rule.ip_is_whitelist ? 'whitelist' : 'blacklist')) : 'blacklist';
             document.getElementById('ruleIps').value = rule && rule.ips ? rule.ips.join('\n') : '';
             document.getElementById('ruleDeleteBtn').style.display = rule ? 'inline-block' : 'none';
@@ -11840,6 +11891,7 @@ const PANEL_HTML: &str = r##"
                     domains_is_whitelist: domains_mode === 'whitelist',
                     direct_domains: domains,
                     template_domains,
+                    preset_apps: document.getElementById('rulePresetApps').checked,
                     ip_mode,
                     ip_is_whitelist: ip_mode === 'whitelist',
                     ips,
@@ -12113,6 +12165,51 @@ const PANEL_HTML: &str = r##"
                 return;
             }
             listEl.innerHTML = list.map(d => `<div style="padding: 2px 0;">${esc(d)}</div>`).join('');
+        }
+
+        let presetAppsCache = null;
+        async function openPresetAppsDlg() {
+            document.getElementById('presetAppsDlg').showModal();
+            if (!presetAppsCache) {
+                const loading = '<div style="color: var(--text-muted); text-align: center; padding: 10px;">Загрузка...</div>';
+                document.getElementById('presetRedList').innerHTML = loading;
+                document.getElementById('presetOrangeList').innerHTML = loading;
+                try {
+                    const r = await api('/api/preset-apps');
+                    if (r.ok) {
+                        presetAppsCache = await r.json();
+                    } else {
+                        presetAppsCache = { red: [], orange: [] };
+                    }
+                } catch(e) {
+                    presetAppsCache = { red: [], orange: [] };
+                }
+            }
+            renderPresetAppsGroup('presetRedList', 'presetRedCount', presetAppsCache.red,
+                'Уровень пуст: эти приложения поедут через туннель. Проверьте ru_apps_preset.json на сервере.');
+            renderPresetAppsGroup('presetOrangeList', 'presetOrangeCount', presetAppsCache.orange,
+                'Уровень пуст: нечего возвращать в туннель. Проверьте ru_apps_preset.json на сервере.');
+        }
+
+        function renderPresetAppsGroup(listId, countId, entries, emptyWarning) {
+            // A 200 response with an unexpected body (a string or an object)
+            // used to print `undefined` and throw on `.map`, leaving "Загрузка..."
+            // on screen forever.
+            const list = Array.isArray(entries) ? entries : [];
+            const countEl = document.getElementById(countId);
+            if (countEl) countEl.textContent = list.length;
+            const listEl = document.getElementById(listId);
+            if (!listEl) return;
+            if (list.length === 0) {
+                listEl.innerHTML = '<div style="color: var(--danger); text-align: center; padding: 10px;">' + esc(emptyWarning) + '</div>';
+                return;
+            }
+            // `name` is empty for a bare package name in the preset file.
+            listEl.innerHTML = list.map(e => {
+                const name = e && e.name ? e.name : '';
+                const pkg = e && e.package ? e.package : String(e);
+                return `<div style="padding: 2px 0;">${esc(name ? name + ' — ' : '')}${esc(pkg)}</div>`;
+            }).join('');
         }
 
         function filterTemplateDomains(query) {
@@ -13108,12 +13205,13 @@ const PANEL_HTML: &str = r##"
 #[cfg(test)]
 mod tests {
     use super::{
-        DNS_PROVIDERS, LOGIN_HTML, MAX_CLIENT_NAME_BYTES, PANEL_HTML, PWA_ICON_192_PNG,
-        PWA_ICON_512_PNG, PWA_MANIFEST, PWA_SERVICE_WORKER, count_active_sessions,
-        decrypt_csqtt_link, deploy_dns_profile_or_yandex, dns_provider_by_id, dns_provider_id,
-        encrypt_csqtt_link, make_client_link, manual_dns, normalize_client_vk_hashes,
-        normalize_vk_access_token, process_memory, process_memory_rollup, provider_dns,
-        validate_client_name, validate_proxy_profile_name, validate_workers,
+        CreateRoutingRuleRequest, DNS_PROVIDERS, LOGIN_HTML, MAX_CLIENT_NAME_BYTES, PANEL_HTML,
+        PWA_ICON_192_PNG, PWA_ICON_512_PNG, PWA_MANIFEST, PWA_SERVICE_WORKER,
+        count_active_sessions, decrypt_csqtt_link, deploy_dns_profile_or_yandex,
+        dns_provider_by_id, dns_provider_id, encrypt_csqtt_link, make_client_link, manual_dns,
+        normalize_client_vk_hashes, normalize_vk_access_token, process_memory,
+        process_memory_rollup, provider_dns, validate_client_name, validate_proxy_profile_name,
+        validate_workers,
     };
 
     #[test]
@@ -13410,5 +13508,66 @@ mod tests {
         assert!(validate_workers(Some(1)).is_err());
         assert!(validate_workers(Some(2)).is_err());
         assert!(validate_workers(Some(101)).is_err());
+    }
+
+    #[test]
+    fn rule_request_without_preset_flag_keeps_the_preset_enabled() {
+        // a cached panel JS predating the flag must not silently opt the rule out
+        let request: CreateRoutingRuleRequest = serde_json::from_str(r#"{"name":"r"}"#).unwrap();
+        assert!(request.preset_apps);
+        let disabled: CreateRoutingRuleRequest =
+            serde_json::from_str(r#"{"name":"r","preset_apps":false}"#).unwrap();
+        assert!(!disabled.preset_apps);
+    }
+
+    #[test]
+    fn preset_apps_payload_matches_the_shipped_file_shape() {
+        // The set of entries is owned by whoever edits ru_apps_preset.json, so
+        // this test pins only the serialized shape and package-name validity,
+        // never the concrete applications or the list length.
+        // Source of truth is `preset_apps::valid_package_name`; this is a copy,
+        // because the canonical validator is private to that module and widening
+        // its visibility just for a test was not worth it.
+        fn is_valid_package(name: &str) -> bool {
+            if name.is_empty() || name.len() > 255 || name.contains(char::is_whitespace) {
+                return false;
+            }
+            name.split('.').all(|segment| {
+                let mut chars = segment.chars();
+                matches!(chars.next(), Some(first) if first.is_ascii_alphabetic() || first == '_')
+                    && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            })
+        }
+
+        let value = serde_json::to_value(crate::preset_apps::preset_apps()).unwrap();
+        for level in ["red", "orange"] {
+            let entries = value[level]
+                .as_array()
+                .unwrap_or_else(|| panic!("preset `{level}` is not an array"));
+            assert!(!entries.is_empty(), "preset `{level}` is empty");
+            for entry in entries {
+                assert!(
+                    entry.is_object(),
+                    "preset `{level}` entry is not an object: {entry}"
+                );
+                let package = entry["package"].as_str().unwrap_or_else(|| {
+                    panic!("preset `{level}` entry has no string package: {entry}")
+                });
+                // A bare string entry in the file parses with an empty name, and
+                // the panel falls back to `e.name || e.package`, so only the type
+                // matters here: never pin the name's content.
+                let _name = entry["name"].as_str().unwrap_or_else(|| {
+                    panic!("preset `{level}` entry has no string name: {entry}")
+                });
+                assert!(
+                    !package.is_empty(),
+                    "preset `{level}` entry has an empty package: {entry}"
+                );
+                assert!(
+                    is_valid_package(package),
+                    "preset `{level}` has an invalid package: {package}"
+                );
+            }
+        }
     }
 }
