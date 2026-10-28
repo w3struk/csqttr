@@ -1,0 +1,444 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Existing git tag to publish'
+        required: true
+        type: string
+      dry_run:
+        description: 'Run all gates and build, but do not publish'
+        required: false
+        default: false
+        type: boolean
+permissions:
+  contents: read
+concurrency:
+  group: release
+  cancel-in-progress: false
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Полная история нужна гейту resolve: origin/main и тег обязаны быть
+          # локально, не полагаясь на pre-clone поведение раннера.
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Идёт ПЕРЕД Setup Java/Python: /opt/hostedtoolcache — это RUNNER_TOOL_CACHE,
+      # и удаление после setup-java оставило бы висячий JAVA_HOME (sdkmanager и
+      # Gradle падали бы). ubuntu-24.04 даёт ~14 ГБ SSD, а холодный прогон тянет
+      # SDK+NDK, три cargo-таргета и Gradle-кэши — риск No space left on device
+      # реальный. Свой SDK ставим в $RUNNER_TEMP, поэтому предустановленный
+      # /usr/local/lib/android не нужен; dotnet в этом job не используется.
+      # df -h / печатается для диагностики, если места не хватит.
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/hostedtoolcache || true
+          sudo rm -rf /usr/share/dotnet || true
+          df -h /
+
+      - name: Setup Java 17
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Python
+        uses: actions/setup-python@7f4fc3e22c37d6ff65e88745f38bd3157c663f7c # v4
+        with:
+          python-version: '3.12'
+
+      - name: Record start time
+        id: start
+        run: |
+          set -euo pipefail
+          echo "started=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve release target
+        id: resolve
+        # workflow_dispatch-входы не превращаются в INPUT_* автоматически: так
+        # бывает только у action'ов (`with:`). Без явного env ручной запуск
+        # приходил бы с пустым INPUT_TAG_NAME и падал на «tag name is empty».
+        env:
+          INPUT_TAG_NAME: ${{ inputs.tag_name }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          bash .github/scripts/resolve-release-target.sh
+
+      # При workflow_dispatch github.ref = refs/heads/main, поэтому без этого
+      # шага собралось бы дерево main, а не дерево коммита тега. Тег уже есть
+      # в локальной истории (checkout с fetch-depth: 0), сеть не нужна.
+      - name: Checkout release target
+        id: target
+        run: |
+          set -euo pipefail
+          git checkout --detach "${{ steps.resolve.outputs.commit }}"
+
+      # SDK/NDK намеренно не кешируются: ~1 ГБ, restore ненадёжен, установка
+      # дешевле риска. Пакеты platforms;android-37.0 и build-tools;37.0.0
+      # проверены на живом `sdkmanager --list` — пакета platforms;android-37
+      # не существует (API 37 публикуется в схеме android-37.0).
+      # Свой SDK ставим в $RUNNER_TEMP, поэтому предустановленный
+      # /usr/local/lib/android удаляется шагом Free disk space выше.
+      - name: Install Android SDK
+        run: |
+          set -euo pipefail
+          export ANDROID_HOME="$RUNNER_TEMP/android-sdk"
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+          curl -fsSL -o "$RUNNER_TEMP/cmdtools.zip" \
+            https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          unzip -q "$RUNNER_TEMP/cmdtools.zip" -d "$ANDROID_HOME/cmdline-tools"
+          mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          # Конечный ввод вместо `yes`: под `set -o pipefail` SIGPIPE у `yes`
+          # (exit 141) уронил бы весь шаг.
+          printf 'y\n%.0s' {1..100} | "$SDKM" --sdk_root="$ANDROID_HOME" --licenses > /dev/null
+          # build-tools запинен явно: появление 37.1.0 не должно молча подменить
+          # подписывающий/инспектирующий инструмент (apksigner, aapt2).
+          BT_VER=37.0.0
+          # Динамическим остаётся только cmake: на подпись он не влияет.
+          CMAKE_VER=$("$SDKM" --list 2>/dev/null \
+            | sed -n 's/^[[:space:]]*cmake;\(3\.[0-9.]*\).*/\1/p' \
+            | LC_ALL=C sort -V | tail -1)
+          [[ -n $CMAKE_VER ]] || {
+            echo "could not resolve cmake version from sdkmanager --list" >&2
+            exit 1
+          }
+          "$SDKM" --sdk_root="$ANDROID_HOME" \
+            "platforms;android-37.0" "build-tools;$BT_VER" "ndk;27.0.12077973" "cmake;$CMAKE_VER"
+          {
+            echo "ANDROID_HOME=$ANDROID_HOME"
+            echo "ANDROID_SDK_ROOT=$ANDROID_HOME"
+            echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973"
+            echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/27.0.12077973"
+            echo "BT_VER=$BT_VER"
+          } >> "$GITHUB_ENV"
+
+      # Версия из rust-toolchain.toml обоих крейтов; явный `toolchain install`
+      # делает шаг детерминированным независимо от каталога вызова.
+      - name: Install Rust 1.97.1
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt --component clippy
+          rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android x86_64-unknown-linux-musl --toolchain 1.97.1
+          rustc +1.97.1 --version
+
+      # Fallback при проблемах с 0.17.0: заменить версию на 0.16.0 — больше
+      # ничего менять не нужно.
+      - name: Install Zig 0.17.0
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          export ZIG_VERSION='0.17.0'
+          INDEX=$(curl -fsSL https://ziglang.org/download/index.json)
+          URL=$(jq -r --arg v "$ZIG_VERSION" '.[$v]["x86_64-linux"].tarball' <<<"$INDEX")
+          SHA=$(jq -r --arg v "$ZIG_VERSION" '.[$v]["x86_64-linux"].shasum' <<<"$INDEX")
+          [[ -n $URL && $URL != null && -n $SHA && $SHA != null ]] || {
+            echo "could not resolve zig $ZIG_VERSION x86_64-linux tarball/shasum" >&2
+            exit 1
+          }
+          curl -fsSL -o zig.tar.xz "$URL"
+          echo "$SHA  zig.tar.xz" | sha256sum -c -
+          mkdir -p "$RUNNER_TOOL_CACHE/zig"
+          tar -xJf zig.tar.xz -C "$RUNNER_TOOL_CACHE/zig" --strip-components=1
+          echo "$RUNNER_TOOL_CACHE/zig" >> "$GITHUB_PATH"
+          echo "ZIG_VERSION=$ZIG_VERSION" >> "$GITHUB_ENV"
+          # $GITHUB_PATH подействует только со следующего шага — проверяем по пути.
+          "$RUNNER_TOOL_CACHE/zig/zig" version
+
+      # Кешируем только модули/джарсы/wrapper, не весь ~/.gradle/caches: туда
+      # попадают cc-keystore и прочее лишнее.
+      - name: Cache Gradle dependencies
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.gradle/caches/modules-2
+            ~/.gradle/caches/jars-*
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle.kts', 'gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Cache Cargo registry
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('rust-client/Cargo.lock', 'rust-server/Cargo.lock') }}
+          restore-keys: |
+            cargo-registry-${{ runner.os }}-
+
+      # Версии cargo-ndk/cargo-zigbuild входят в ключ: иначе смена пина не
+      # инвалидирует кеш и в ~/.cargo/bin останется старый бинарь.
+      - name: Cache Cargo binaries
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: '~/.cargo/bin'
+          key: cargo-bin-${{ runner.os }}-ndk4.1.2-zigbuild0.24.0-${{ hashFiles('rust-client/Cargo.lock', 'rust-server/Cargo.lock') }}
+          restore-keys: |
+            cargo-bin-${{ runner.os }}-ndk4.1.2-zigbuild0.24.0-
+
+      - name: Cache Rust client host target
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: rust-client/target
+          key: cargo-client-target-${{ runner.os }}-${{ hashFiles('rust-client/Cargo.lock', 'rust-client/rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-client-target-${{ runner.os }}-
+
+      # --locked + --version = воспроизводимая установка; cargo install
+      # идемпотентен при восстановленном ~/.cargo/bin.
+      # `cargo-zigbuild --version` вместо `cargo zigbuild --version`: подкоманда
+      # `cargo zigbuild` флага --version не принимает (exit 1).
+      - name: Install cargo-ndk and cargo-zigbuild
+        run: |
+          set -euo pipefail
+          cargo install cargo-ndk --locked --version 4.1.2
+          cargo install cargo-zigbuild --locked --version 0.24.0
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          cargo ndk --version
+          cargo-zigbuild --version
+
+      # Гейты fail-closed: всё проверяемое отсекается до keystore и сборки.
+      - name: 'Gate: version lockup'
+        run: |
+          set -euo pipefail
+          python3 scripts/gen_version_lockup.py --check
+
+      # Нативную часть не собирает: гейт висит на merge*JniLibFolders/merge*Assets.
+      - name: 'Gate: Kotlin unit tests'
+        run: |
+          set -euo pipefail
+          ./gradlew :app:testDebugUnitTest
+
+      - name: 'Gate: Rust client'
+        working-directory: rust-client
+        run: |
+          set -euo pipefail
+          bash check_no_runtime_panics.sh
+          cargo fmt --all -- --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test --quiet
+
+      # LC_ALL=C: вывод cargo (а позже keytool) локализуется, а парсеры английские.
+      # CARGO_TARGET_DIR — как в локальном рецепте, чтобы не мешать сборке
+      # `cargo zigbuild` из Gradle.
+      - name: 'Gate: Rust server (musl via zig wrappers)'
+        working-directory: rust-server
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          # shellcheck source=../.github/scripts/musl-zig-env.sh
+          source ../.github/scripts/musl-zig-env.sh
+          cargo fmt --all -- --check
+          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/build/linux-musl-tests" cargo clippy --release --target x86_64-unknown-linux-musl --all-targets -- -D warnings
+          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/build/linux-musl-tests" cargo test --target x86_64-unknown-linux-musl
+
+      # Пароль идёт через env, а не argv: verify-signing-identity.sh передаёт
+      # keytool `-storepass:env`, поэтому секрет не всплывает даже при
+      # ACTIONS_STEP_DEBUG. Флага пути к константе в вызове нет — скрипт сам
+      # читает scripts/release_signing_fingerprint.txt из корня репозитория,
+      # то есть тройная сверка (keytool <-> константа <-> секрет) выполняется
+      # ещё до сборки. LC_ALL=C: парсится вывод keytool.
+      - name: Restore keystore
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEYSTORE_FINGERPRINT: ${{ secrets.ANDROID_KEYSTORE_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          base64 -d <<<"$ANDROID_KEYSTORE_BASE64" > "$RUNNER_TEMP/release.keystore"
+          chmod 600 "$RUNNER_TEMP/release.keystore"
+          bash .github/scripts/verify-signing-identity.sh \
+            --keystore "$RUNNER_TEMP/release.keystore" \
+            --storepass-env ANDROID_KEYSTORE_PASSWORD \
+            --alias "$ANDROID_KEY_ALIAS" \
+            --expected-fingerprint "$ANDROID_KEYSTORE_FINGERPRINT"
+
+      # Имена env — ровно те, что читает verifyReleaseSigning в
+      # app/build.gradle.kts. Gradle зовёт нативные скрипты с --no-tests,
+      # поэтому Rust-гейты не дублируются; -Pcsqtt.* не передаются.
+      - name: Build release APKs
+        env:
+          KEYSTORE_FILE: ${{ runner.temp }}/release.keystore
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          ./gradlew :app:assembleRelease
+
+      # Сверка установленных нативных артефактов с промежуточными: ловит
+      # подменённый или протухший бинарник до публикации.
+      - name: Verify native provenance
+        run: |
+          set -euo pipefail
+          bash scripts/server_asset_provenance.sh verify
+          bash scripts/native_client_provenance.sh verify
+
+      - name: Collect release assets
+        id: collect
+        run: |
+          set -euo pipefail
+          bash .github/scripts/collect-release-assets.sh \
+            --root "$GITHUB_WORKSPACE" \
+            --out "$RUNNER_TEMP/release-assets"
+
+      # Аргументы собираются циклом по файлам, а не глобом: `--apk DIR/*.apk`
+      # развернулся бы в позиционные аргументы (в --apk попал бы только
+      # первый), а скрипт отвергает позиционные — то есть упал бы после самой
+      # дорогой части прогона.
+      - name: Verify APK signatures
+        id: signcheck
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEYSTORE_FINGERPRINT: ${{ secrets.ANDROID_KEYSTORE_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          args=(--keystore "$RUNNER_TEMP/release.keystore" --storepass-env ANDROID_KEYSTORE_PASSWORD \
+                --alias "$ANDROID_KEY_ALIAS" --expected-fingerprint "$ANDROID_KEYSTORE_FINGERPRINT")
+          for f in "$RUNNER_TEMP"/release-assets/CSQTT-*.apk; do
+            args+=(--apk "$f")
+          done
+          APKSIGNER="$ANDROID_HOME/build-tools/$BT_VER/apksigner"
+          out=$(bash .github/scripts/verify-signing-identity.sh "${args[@]}" --apksigner "$APKSIGNER")
+          printf '%s\n' "$out"
+          {
+            echo "cn=$(sed -n 's/^CN=//p' <<<"$out" | head -n 1)"
+            echo "fingerprint=$(sed -n 's/^FINGERPRINT=//p' <<<"$out" | head -n 1)"
+          } >> "$GITHUB_OUTPUT"
+
+      # package обязан быть ровно csqtt.quic.amurcanov (без суффикса .debug),
+      # а versionName/versionCode — совпадать с прочитанными из
+      # app/build.gradle.kts теми же sed'ами, что в collect-release-assets.sh.
+      # aapt2 берётся из запиненного $BT_VER, а не из PATH.
+      - name: Verify APK identity
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          AAPT2="$ANDROID_HOME/build-tools/$BT_VER/aapt2"
+          EXPECTED_VERSION=$(sed -n 's/^[[:space:]]*versionName[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' app/build.gradle.kts | head -n 1)
+          EXPECTED_CODE=$(sed -n 's/^[[:space:]]*versionCode[[:space:]]*=[[:space:]]*\([0-9]*\).*/\1/p' app/build.gradle.kts | head -n 1)
+          [[ -n $EXPECTED_VERSION && -n $EXPECTED_CODE ]] || {
+            echo "could not read versionName/versionCode from app/build.gradle.kts" >&2
+            exit 1
+          }
+          found=0
+          for f in "$RUNNER_TEMP"/release-assets/CSQTT-*.apk; do
+            [[ -f $f ]] || continue
+            found=$((found + 1))
+            badging=$("$AAPT2" dump badging "$f")
+            pkg=$(sed -n "s/^package: name='\([^']*\)'.*/\1/p" <<<"$badging" | head -n 1)
+            version=$(sed -n "s/^package: .*versionName='\([^']*\)'.*/\1/p" <<<"$badging" | head -n 1)
+            code=$(sed -n "s/^package: .*versionCode='\([^']*\)'.*/\1/p" <<<"$badging" | head -n 1)
+            [[ $pkg == 'csqtt.quic.amurcanov' ]] || {
+              echo "unexpected package '$pkg' in $f (expected csqtt.quic.amurcanov)" >&2
+              exit 1
+            }
+            [[ $version == "$EXPECTED_VERSION" ]] || {
+              echo "unexpected versionName '$version' in $f (expected $EXPECTED_VERSION)" >&2
+              exit 1
+            }
+            [[ $code == "$EXPECTED_CODE" ]] || {
+              echo "unexpected versionCode '$code' in $f (expected $EXPECTED_CODE)" >&2
+              exit 1
+            }
+            echo "[OK] $f package=$pkg versionName=$version versionCode=$code"
+          done
+          (( found > 0 )) || {
+            echo "no release APK found in $RUNNER_TEMP/release-assets" >&2
+            exit 1
+          }
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-assets-${{ steps.resolve.outputs.tag }}
+          path: ${{ runner.temp }}/release-assets
+          retention-days: 30
+          if-no-files-found: error
+
+      # Keystore живёт только до конца прогона и удаляется всегда — даже если
+      # сверка или загрузка артефактов упали.
+      - name: Cleanup keystore
+        if: always()
+        run: |
+          set -euo pipefail
+          rm -f "$RUNNER_TEMP/release.keystore"
+
+      - name: Generate release note
+        run: |
+          set -euo pipefail
+          DURATION=$(( $(date +%s) - ${{ steps.start.outputs.started }} ))
+          bash .github/scripts/release-note.sh \
+            --root "$GITHUB_WORKSPACE" \
+            --tag "${{ steps.resolve.outputs.tag }}" \
+            --commit "${{ steps.resolve.outputs.commit }}" \
+            --duration-seconds "$DURATION" \
+            --fingerprint "${{ steps.signcheck.outputs.fingerprint }}" \
+            --signer "${{ steps.signcheck.outputs.cn }}" \
+            --out "$RUNNER_TEMP/release-note.md"
+
+      # Репетиция: тот же код публикации, что и в настоящем релизе, но
+      # черновик удаляется. Иначе write-путь не выполнялся бы в CI ни разу до
+      # первого настоящего релиза.
+      - name: 'Dry run: draft and discard'
+        if: steps.resolve.outputs.dry_run == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mapfile -t ASSETS < "$RUNNER_TEMP/release-assets/asset-paths.txt"
+          # --asset повторяемый: каждый файл — отдельный флаг. `--asset "${ASSETS[@]}"`
+          # отдал бы первый файл как значение, а остальные — позиционными
+          # аргументами, которые скрипт отвергает.
+          asset_args=()
+          for asset in "${ASSETS[@]}"; do
+            asset_args+=(--asset "$asset")
+          done
+          bash .github/scripts/publish-release.sh \
+            --tag "${{ steps.resolve.outputs.tag }}" \
+            --title "CSQTT ${{ steps.resolve.outputs.version }}" \
+            --note-file "$RUNNER_TEMP/release-note.md" \
+            "${asset_args[@]}" \
+            --dry-run
+          printf 'DRY RUN: черновик создан, проверен и удалён; публичного релиза нет.\n'
+          printf 'Ассеты остались в артефактах прогона release-assets-%s:\n' "${{ steps.resolve.outputs.tag }}"
+          cat "$RUNNER_TEMP/release-assets/asset-paths.txt"
+
+      # Строгое равенство, а не `!= 'true'`: при опечатке в id: выход пустой,
+      # и `!= 'true'` прошёл бы — то есть опубликовал бы в dry-run.
+      - name: Publish release
+        if: steps.resolve.outputs.dry_run == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mapfile -t ASSETS < "$RUNNER_TEMP/release-assets/asset-paths.txt"
+          asset_args=()
+          for asset in "${ASSETS[@]}"; do
+            asset_args+=(--asset "$asset")
+          done
+          bash .github/scripts/publish-release.sh \
+            --tag "${{ steps.resolve.outputs.tag }}" \
+            --title "CSQTT ${{ steps.resolve.outputs.version }}" \
+            --note-file "$RUNNER_TEMP/release-note.md" \
+            "${asset_args[@]}"

@@ -261,11 +261,7 @@ pub fn is_domain_in_list(sni: &str, direct_domains: &[String]) -> bool {
     false
 }
 
-pub fn is_direct_domain(
-    sni: &str,
-    template_domains: bool,
-    direct_domains: &[String],
-) -> bool {
+pub fn is_direct_domain(sni: &str, template_domains: bool, direct_domains: &[String]) -> bool {
     let sni_trimmed = sni.trim_end_matches('.');
     if template_domains && is_template_domain(sni_trimmed) {
         return true;
