@@ -1,0 +1,161 @@
+name: Beta
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+
+# Блока `concurrency` здесь нет намеренно. У GitHub Actions по умолчанию
+# `queue: single`: прогон, вставший в очередь той же группы, ОТМЕНЯЕТСЯ новым —
+# `cancel-in-progress: false` защищает только уже идущий прогон, а не
+# ожидающий. При трёх пушах второй коммит не собрался бы вообще и сообщения в
+# канале не было бы. Без блока прогоны просто стоят в очереди.
+#
+# `workflow_dispatch` без входов — предохранитель «проверить отправку, не
+# выдумывая коммит». beta-version.sh отвергает любую ветку, кроме main.
+#
+# Сам workflow ничего не публикует в GitHub Releases и не создаёт тегов:
+# единственный адресат беты — Telegram-канал.
+
+jobs:
+  version:
+    name: Resolve beta version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      commit: ${{ steps.version.outputs.commit }}
+      version: ${{ steps.version.outputs.version }}
+      version-code: ${{ steps.version.outputs.version-code }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      # Идёт до сборки: пустой телеграмный секрет обязан ронять прогон за
+      # секунды, а не через двадцать минут, после которых APK всё равно уехал
+      # бы в никуда.
+      - name: Check bot configuration
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -euo pipefail
+          [[ -n "$TELEGRAM_BOT_TOKEN" ]] || {
+            echo "TELEGRAM_BOT_TOKEN пуст — бот не сможет отправить APK" >&2
+            exit 1
+          }
+          [[ -n "$TELEGRAM_CHAT_ID" ]] || {
+            echo "TELEGRAM_CHAT_ID пуст — канал не задан" >&2
+            exit 1
+          }
+
+      # git rev-parse HEAD на этом checkout'е — ровно пушнутый коммит; этот sha
+      # уходит в build.yml как ref. version-code — то же значение, что прочитал
+      # beta-version.sh, и уходит как expected-version-code: build.yml сверяет
+      # своё представление об app/build.gradle.kts с представлением этой job'ы.
+      - name: Resolve beta version
+        id: version
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          bash .github/scripts/beta-version.sh \
+            --root "$GITHUB_WORKSPACE" \
+            --branch "$REF_NAME"
+
+  build:
+    name: Build beta APK
+    needs: version
+    permissions:
+      contents: read
+    # Reusable workflow: ни runs-on, ни timeout-minutes здесь быть не может —
+    # они живут внутри build.yml. Один ABI ⇒ isUniversalApk = false, в
+    # артефакте ровно один APK.
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ needs.version.outputs.commit }}
+      version-name: ${{ needs.version.outputs.version }}
+      expected-version-code: ${{ needs.version.outputs.version-code }}
+      abis: arm64-v8a
+    secrets:
+      ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+      ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+      ANDROID_KEYSTORE_FINGERPRINT: ${{ secrets.ANDROID_KEYSTORE_FINGERPRINT }}
+
+  notify:
+    name: Send to Telegram
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download build artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.build.outputs.artifact-name }}
+          path: ${{ runner.temp }}/build-output
+
+      # Опечатка в caption'е или разъехавшийся ref маскировали бы «собрали не
+      # тот коммит», и тестеры узнали бы об этом по коду внутри файла. Сверка
+      # идёт до отправки.
+      - name: Verify built commit
+        env:
+          BUILT: ${{ needs.build.outputs.commit }}
+          EXPECTED: ${{ needs.version.outputs.commit }}
+        run: |
+          set -euo pipefail
+          [[ "$BUILT" == "$EXPECTED" ]] || {
+            echo "build.yml собрал коммит '$BUILT', а job version разрешил '$EXPECTED'" >&2
+            exit 1
+          }
+
+      - name: Prepare Telegram document
+        id: document
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          COMMIT: ${{ needs.build.outputs.commit }}
+        run: |
+          set -euo pipefail
+          apk_dir="$RUNNER_TEMP/build-output/apk"
+          matches=("$apk_dir"/*arm64-v8a*.apk)
+          [[ -e "${matches[0]}" ]] || {
+            echo "нет APK arm64-v8a в $apk_dir" >&2
+            exit 1
+          }
+          (( ${#matches[@]} == 1 )) || {
+            echo "ожидался один APK arm64-v8a, найдено ${#matches[@]}" >&2
+            exit 1
+          }
+          mkdir -p "$RUNNER_TEMP/telegram"
+          dst="$RUNNER_TEMP/telegram/CSQTT-${VERSION}-arm64-v8a.apk"
+          cp -f "${matches[0]}" "$dst"
+          printf 'Бета CSQTT %s\nКоммит: %s\nСобрано: %s\n' \
+            "$VERSION" "$COMMIT" "$(date -u '+%Y-%m-%d %H:%M UTC')" \
+            > "$RUNNER_TEMP/telegram/caption.txt"
+          echo "path=$dst" >> "$GITHUB_OUTPUT"
+
+      # Отдельного «шага на ошибку» нет: падение отправки — красный прогон, а
+      # APK остаётся в артефакте release-assets-<version>.
+      - name: Send to Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -euo pipefail
+          bash .github/scripts/telegram-send.sh \
+            --document "${{ steps.document.outputs.path }}" \
+            --caption-file "$RUNNER_TEMP/telegram/caption.txt"
