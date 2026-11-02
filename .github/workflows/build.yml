@@ -195,15 +195,30 @@ jobs:
           restore-keys: |
             cargo-client-target-${{ runner.os }}-
 
-      # --locked + --version = воспроизводимая установка; cargo install
-      # идемпотентен при восстановленном ~/.cargo/bin.
+      # --locked + --version = воспроизводимая установка. `cargo install`
+      # отказывается перезаписывать уже существующий бинарь ("binary
+      # `cargo-ndk` already exists in destination"), а ~/.cargo/bin лежит в
+      # кеше — поэтому на втором прогоне установка падала бы с exit 101.
+      # Поэтому: если нужная версия уже на месте, ничего не ставим; если
+      # версия другая — переустанавливаем с --force.
       # `cargo-zigbuild --version` вместо `cargo zigbuild --version`: подкоманда
       # `cargo zigbuild` флага --version не принимает (exit 1).
       - name: Install cargo-ndk and cargo-zigbuild
         run: |
           set -euo pipefail
-          cargo install cargo-ndk --locked --version 4.1.2
-          cargo install cargo-zigbuild --locked --version 0.24.0
+          ensure_cargo_tool() {
+            local crate="$1" bin="$2" version="$3"
+            # Вывод `cargo-ndk --version` — ровно строка "cargo-ndk <версия>",
+            # поэтому сверяем целую строку: подстрока "4.1.2" совпала бы и с
+            # "4.1.20".
+            if "$bin" --version 2>/dev/null | grep -qxF "$bin $version"; then
+              printf '%s %s уже установлен — установка не требуется\n' "$bin" "$version"
+              return 0
+            fi
+            cargo install "$crate" --locked --version "$version" --force
+          }
+          ensure_cargo_tool cargo-ndk cargo-ndk 4.1.2
+          ensure_cargo_tool cargo-zigbuild cargo-zigbuild 0.24.0
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           cargo ndk --version
           cargo-zigbuild --version

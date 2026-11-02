@@ -971,23 +971,38 @@ want(
     "серверный гейт обязан source'ить .github/scripts/musl-zig-env.sh",
 )
 
-# 10.9 Пины cargo-* совпадают с версиями в ключе кеша cargo-bin.
+# 10.9 Пины cargo-* совпадают с версиями в ключе кеша cargo-bin, а сама
+# установка переносима на восстановленный ~/.cargo/bin: `cargo install` не
+# перезаписывает существующий бинарь и падает с exit 101 ("binary `cargo-ndk`
+# already exists in destination"), а кеш с бинарями восстанавливается.
 install_run = by_name["Install cargo-ndk and cargo-zigbuild"].get("run", "")
 cache_key = str((by_name["Cache Cargo binaries"].get("with") or {}).get("key", ""))
 for crate in ("cargo-ndk", "cargo-zigbuild"):
     match = re.search(
-        r"cargo install %s --locked --version ([0-9][0-9A-Za-z.+-]*)" % re.escape(crate),
+        r"ensure_cargo_tool %s %s ([0-9][0-9A-Za-z.+-]*)"
+        % (re.escape(crate), re.escape(crate)),
         install_run,
     )
     want(
         match is not None,
-        "в шаге установки нет пина `cargo install %s --locked --version <X>`" % crate,
+        "в шаге установки нет пина `ensure_cargo_tool %s %s <X>`" % (crate, crate),
     )
     want(
         match.group(1) in cache_key,
         "ключ кеша 'Cache Cargo binaries' не содержит запиненной версии %s (%s)"
         % (crate, match.group(1)),
     )
+want(
+    "--force" in install_run,
+    "установка cargo-* обязана переустанавливать бинарь (--force): cargo "
+    "install не перезаписывает существующий и падает с exit 101 на "
+    "восстановленном ~/.cargo/bin",
+)
+want(
+    'grep -qxF "$bin $version"' in install_run,
+    "шаг обязан сверять установленную версию ЦЕЛОЙ строкой до установки "
+    "(подстрока 4.1.2 совпала бы с 4.1.20)",
+)
 
 # 10.10 Подпись, сборка и сверки — ровно в этом порядке и после гейтов.
 SIGNING_AND_VERIFY = [
