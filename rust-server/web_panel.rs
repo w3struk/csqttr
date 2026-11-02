@@ -8052,7 +8052,7 @@ const PANEL_HTML_TEMPLATE: &str = r##"
 
         header { position: sticky; top: 0; z-index: 40; height: 72px; background: var(--header-glass); backdrop-filter: blur(16px); border-bottom: 1px solid var(--border); width: 100%; }
         .header-container { max-width: 1300px; width: 100%; margin: 0 auto; padding: 0 24px; height: 100%; display: flex; align-items: center; justify-content: space-between; }
-        .brand { display: flex; align-items: center; flex: 0 1 auto; min-width: 0; }
+        .brand { display: flex; align-items: center; gap: 8px; flex: 0 1 auto; min-width: 0; }
         .brand-logo { display: block; width: 165px; height: auto; }
         .version-logo { display: block; width: 62px; height: auto; flex: 0 1 auto; }
 
@@ -9187,6 +9187,10 @@ const PANEL_HTML_TEMPLATE: &str = r##"
                     </defs>
                     <path fill="url(#csqttLogoGradient)" fill-rule="evenodd" d="M79,11 L66,15 L48,25 L40,32 L27,49 L21,62 L17,78 L17,98 L19,108 L22,117 L33,136 L40,144 L56,156 L66,161 L84,166 L108,166 L118,164 L127,161 L143,152 L157,139 L160,135 L160,133 L137,116 L135,116 L123,128 L113,133 L106,135 L100,135 L99,136 L87,135 L73,130 L67,126 L57,116 L51,105 L48,93 L48,83 L51,71 L58,59 L67,50 L83,42 L105,41 L115,44 L129,53 L136,61 L160,44 L160,42 L155,35 L144,25 L135,19 L124,14 L108,10 Z M219,13 L208,18 L201,23 L191,35 L186,49 L186,66 L188,73 L193,82 L200,89 L208,94 L219,98 L248,103 L264,108 L270,113 L272,117 L272,125 L267,132 L260,136 L255,137 L234,137 L220,133 L212,129 L199,119 L181,141 L199,155 L212,161 L222,164 L232,165 L233,166 L257,166 L276,161 L285,156 L292,150 L298,142 L302,132 L303,112 L297,97 L287,87 L276,81 L258,76 L234,72 L224,68 L218,63 L216,58 L217,50 L222,44 L228,41 L237,39 L248,39 L258,41 L268,45 L279,53 L281,53 L299,32 L285,21 L270,14 L259,11 L233,10 Z M354,25 L344,34 L333,49 L328,60 L324,74 L324,79 L323,80 L324,103 L329,119 L336,132 L349,147 L360,155 L372,161 L391,166 L414,166 L430,162 L442,156 L460,174 L478,156 L462,140 L469,131 L474,122 L479,109 L481,99 L481,77 L479,68 L474,54 L466,41 L453,27 L441,19 L430,14 L414,10 L385,11 L372,15 Z M389,42 L411,41 L427,47 L442,61 L449,76 L450,96 L447,106 L444,112 L439,118 L421,100 L404,116 L405,119 L418,132 L416,134 L399,136 L385,133 L377,129 L363,116 L355,99 L354,83 L357,71 L361,63 L373,50 L379,46 Z M496,13 L496,44 L536,44 L537,45 L537,163 L568,163 L568,45 L569,44 L609,44 L610,43 L610,13 Z M628,13 L627,14 L627,37 L628,38 L627,43 L628,44 L666,44 L667,45 L667,163 L698,163 L699,162 L699,45 L700,44 L738,44 L738,13 Z"></path>
                 </svg>
+                <svg class="version-logo" viewBox="0 0 284 184" role="img" aria-label="Версия 2.5.1" fill="none" stroke="url(#versionLogoGradient)" stroke-width="13" stroke-linecap="round" stroke-linejoin="round">
+                    <defs><linearGradient id="versionLogoGradient" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="68" y2="340"><stop offset="0" stop-color="#1E88FE"></stop><stop offset="0.26" stop-color="#1576FD"></stop><stop offset="0.48" stop-color="#0B5FFC"></stop><stop offset="1" stop-color="#0A5CFC"></stop></linearGradient></defs>
+                    <path d="M 16,110.5 L 36,157.5 L 56,110.5 M 77,104 Q 77,90.5 99,90.5 Q 121,90.5 121,105 Q 121,120 109,130 L 77,157.5 H 121 M 142,157.5 L 142.01,157.5 M 207,90.5 H 163 V 118 H 185 Q 207,118 207,138 Q 207,157.5 185,157.5 Q 163,157.5 163,145 M 228,157.5 L 228.01,157.5 M 251.5,105 L 267.5,90.5 V 157.5"></path>
+                </svg>
             </div>
             <div class="header-actions">
                 <button class="btn btn-api" onclick="openApiDocsDlg()" title="API Документация">
@@ -9204,10 +9208,6 @@ const PANEL_HTML_TEMPLATE: &str = r##"
                 <button class="btn btn-ghost btn-icon" onclick="toggleTheme()" title="Сменить тему">
                     <svg id="themeIcon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
                 </button>
-                <svg class="version-logo" viewBox="0 0 284 184" role="img" aria-label="Версия 2.5.1" fill="none" stroke="url(#versionLogoGradient)" stroke-width="13" stroke-linecap="round" stroke-linejoin="round">
-                    <defs><linearGradient id="versionLogoGradient" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="68" y2="340"><stop offset="0" stop-color="#1E88FE"></stop><stop offset="0.26" stop-color="#1576FD"></stop><stop offset="0.48" stop-color="#0B5FFC"></stop><stop offset="1" stop-color="#0A5CFC"></stop></linearGradient></defs>
-                    <path d="M 16,110.5 L 36,157.5 L 56,110.5 M 77,104 Q 77,90.5 99,90.5 Q 121,90.5 121,105 Q 121,120 109,130 L 77,157.5 H 121 M 142,157.5 L 142.01,157.5 M 207,90.5 H 163 V 118 H 185 Q 207,118 207,138 Q 207,157.5 185,157.5 Q 163,157.5 163,145 M 228,157.5 L 228.01,157.5 M 251.5,105 L 267.5,90.5 V 157.5"></path>
-                </svg>
             </div>
         </div>
     </header>
