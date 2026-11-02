@@ -34,12 +34,14 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import com.csqtt.client.LinkSaveNotice
 import com.csqtt.client.SettingsStore
 import com.csqtt.client.ui.appSectionCardBorderColor
 import com.csqtt.client.ui.appSectionCardColor
 import com.csqtt.client.ui.components.CsqttSegmentedControl
 import com.csqtt.client.ui.design.CsqttShapes
 import com.csqtt.client.ui.design.CsqttSizes
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import java.io.File
 import java.text.SimpleDateFormat
@@ -76,6 +78,10 @@ fun ImportExportDialog(
             scope.launch {
                 isProcessing = true
                 try {
+                    // Роль читаем дважды — до и после импорта. Сообщение должно говорить о
+                    // фактической смене роли, а не о предположении: в JSON может прийти
+                    // csqtt_link_mode=true, и тогда пользователь теряет вкладку «Деплой».
+                    val roleBefore = settingsStore.csqttLinkMode.first()
                     val ok = settingsStore.importConfigJson(
                         jsonString = jsonText,
                         includeTunnel = includeTunnel,
@@ -84,7 +90,9 @@ fun ImportExportDialog(
                         includeSettings = includeSettings
                     )
                     if (ok) {
-                        Toast.makeText(context, "Конфигурация успешно импортирована ✓", Toast.LENGTH_LONG).show()
+                        val roleAfter = settingsStore.csqttLinkMode.first()
+                        val outcome = LinkSaveNotice.outcomeForImport(roleBefore, roleAfter)
+                        Toast.makeText(context, LinkSaveNotice.importToast(outcome), Toast.LENGTH_LONG).show()
                         onDismissRequest()
                     } else {
                         Toast.makeText(context, "Ошибка импорта: неверный формат JSON", Toast.LENGTH_SHORT).show()

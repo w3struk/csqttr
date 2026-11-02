@@ -1,6 +1,7 @@
 package com.csqtt.client.ui
 
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.first
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -27,6 +28,7 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.compose.foundation.verticalScroll
 import com.csqtt.client.CsqttConstants
+import com.csqtt.client.LinkSaveNotice
 import com.csqtt.client.TunnelManager
 import com.csqtt.client.ui.components.CsqttSegmentedControl
 import com.csqtt.client.ui.components.CsqttSettingRow
@@ -163,10 +165,26 @@ fun FloatingToolbar(
                 val parsed = com.csqtt.client.ui.utils.parseCsqttLink(rawLink)
                 if (parsed != null) {
                     showQrScanner = false
+                    val link = rawLink.trim()
                     scope.launch {
-                        settingsStore.saveCsqttParticipantLink(rawLink.trim())
+                        // Роль читаем из потока в момент записи: снимок TunnelAuthSnapshot
+                        // до первого emission DataStore отдаёт false, а колбэк диалога
+                        // захватывается один раз и переживает восстановление после смерти процесса.
+                        val roleBeforeParticipant = try {
+                            settingsStore.csqttLinkMode.first()
+                        } catch (_: java.io.IOException) {
+                            // Роль прочитать не удалось: не утверждаем смену — исход будет SAVED/FAILED.
+                            true
+                        }
+                        val saved = try {
+                            settingsStore.saveCsqttParticipantLink(link)
+                            true
+                        } catch (_: java.io.IOException) {
+                            false
+                        }
+                        val outcome = LinkSaveNotice.outcomeForParticipantLink(roleBeforeParticipant, saved)
+                        Toast.makeText(context, LinkSaveNotice.linkToast(outcome), Toast.LENGTH_LONG).show()
                     }
-                    Toast.makeText(context, "Ссылка подключена из QR-кода ✓ Режим участника включён", Toast.LENGTH_LONG).show()
                 } else {
                     Toast.makeText(context, "QR-код не содержит ссылку CSQTT", Toast.LENGTH_SHORT).show()
                 }
@@ -237,10 +255,10 @@ fun FloatingToolbar(
                         ),
                         selected = selectedRole,
                         onSelected = { role ->
+                            // Любое нажатие фиксирует явный выбор: сегмент отвечает и на клик
+                            // по уже выбранному варианту, и выбор важнее расчёта роли.
                             val participant = role == UsageRole.Participant
-                            if (participant != csqttLinkMode) {
-                                scope.launch { settingsStore.saveCsqttLinkMode(participant) }
-                            }
+                            scope.launch { settingsStore.saveCsqttLinkMode(participant) }
                         },
                         modifier = Modifier
                             .padding(horizontal = 4.dp)

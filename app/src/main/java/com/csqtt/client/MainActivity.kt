@@ -80,6 +80,7 @@ import com.csqtt.client.ui.utils.parseCsqttLink
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.first
+import java.io.IOException
 import kotlin.math.abs
 
 class MainActivity : ComponentActivity() {
@@ -201,11 +202,20 @@ class MainActivity : ComponentActivity() {
         }
         android.app.AlertDialog.Builder(this)
             .setTitle("Импорт конфигурации CSQTT")
-            .setMessage("Хост: ${link.host}\nPeer: ${link.port}\n\nЗаменить текущую конфигурацию?")
+            .setMessage("Хост: ${link.host}\nПорт: ${link.port}\n\nЗаменить текущую конфигурацию?")
             .setPositiveButton("Импортировать") { _, _ ->
                 lifecycleScope.launch {
-                    appSettingsStore.saveCsqttParticipantLink(raw)
-                    showRaisedToast("Конфигурация CSQTT успешно подключена", Toast.LENGTH_SHORT)
+                    // Роль читаем до записи: сохранение ссылки участником переводит её
+                    // в «Участника», и тост должен говорить об этом только при смене.
+                    // Чтение внутри try: битое хранилище не должно ронять процесс.
+                    val outcome = try {
+                        val roleBeforeParticipant = appSettingsStore.csqttLinkMode.first()
+                        appSettingsStore.saveCsqttParticipantLink(raw)
+                        LinkSaveNotice.outcomeForParticipantLink(roleBeforeParticipant, saved = true)
+                    } catch (_: IOException) {
+                        LinkSaveNotice.outcomeForParticipantLink(roleBeforeParticipant = false, saved = false)
+                    }
+                    showRaisedToast(LinkSaveNotice.configToast(outcome), Toast.LENGTH_SHORT)
                 }
             }
             .setNegativeButton("Отмена", null)
