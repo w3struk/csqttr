@@ -298,7 +298,11 @@ class SettingsStore(context: Context) {
     }
     val csqttLinkMode: Flow<Boolean> = dataStore.data.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
-        prefs[getProfileKey(CSQTT_LINK_MODE, profile)] ?: false
+        UsageRolePolicy.resolveParticipantMode(
+            storedMode = prefs[getProfileKey(CSQTT_LINK_MODE, profile)],
+            peer = prefs[getProfileKey(PEER, profile)] ?: "",
+            link = prefs[getProfileKey(CSQTT_LINK, profile)] ?: "",
+        )
     }
     val participantShowLogs: Flow<Boolean> = dataStore.data.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
@@ -396,7 +400,11 @@ class SettingsStore(context: Context) {
             connectionPassword = connectionPassword.value,
             connectionPasswordState = connectionPassword.state,
             csqttLink = prefs[getProfileKey(CSQTT_LINK, profile)] ?: "",
-            csqttLinkMode = prefs[getProfileKey(CSQTT_LINK_MODE, profile)] ?: false,
+            csqttLinkMode = UsageRolePolicy.resolveParticipantMode(
+                storedMode = prefs[getProfileKey(CSQTT_LINK_MODE, profile)],
+                peer = prefs[getProfileKey(PEER, profile)] ?: "",
+                link = prefs[getProfileKey(CSQTT_LINK, profile)] ?: "",
+            ),
         )
     }.onIo()
     val excludedApps: Flow<String> = dataStore.data.map { prefs ->
@@ -861,13 +869,6 @@ class SettingsStore(context: Context) {
         }
     }
 
-    suspend fun saveCsqttLink(link: String) {
-        dataStore.edit { prefs ->
-            val profile = prefs[ACTIVE_PROFILE] ?: 0
-            prefs[getProfileKey(CSQTT_LINK, profile)] = link
-        }
-    }
-
     suspend fun saveCsqttLinkMode(enabled: Boolean) {
         dataStore.edit { prefs ->
             val profile = prefs[ACTIVE_PROFILE] ?: 0
@@ -926,6 +927,9 @@ class SettingsStore(context: Context) {
             prefs[getProfileKey(LISTEN_PORT, profile)] = listenPort
             prefs[getProfileKey(SNI, profile)] = sni
             prefs[getProfileKey(NO_DNS, profile)] = noDns
+            // Сохранение собственных настроек — это и есть явный выбор роли «Владелец»:
+            // иначе очистка адреса сервера обнуляла профиль и пересчитывала роль в «Участника».
+            prefs[getProfileKey(CSQTT_LINK_MODE, profile)] = false
         }
     }
 
@@ -1550,7 +1554,9 @@ class SettingsStore(context: Context) {
             deploy.put("workers_per_hash", prefs[getProfileKey(WORKERS_PER_HASH, p)] ?: 18)
             deploy.put("extra_workers", prefs[getProfileKey(EXTRA_WORKERS, p)] ?: false)
             deploy.put("csqtt_link", prefs[getProfileKey(CSQTT_LINK, p)] ?: "")
-            deploy.put("csqtt_link_mode", prefs[getProfileKey(CSQTT_LINK_MODE, p)] ?: false)
+            // Ключ выгружается только при явном выборе роли: без него импорт снова
+            // вычислит роль по состоянию профиля.
+            prefs[getProfileKey(CSQTT_LINK_MODE, p)]?.let { deploy.put("csqtt_link_mode", it) }
             deploy.put("secret_path_enabled", prefs[getProfileKey(DEPLOY_SECRET_PATH_ENABLED, p)] ?: false)
             deploy.put("secret_path_uuid", prefs[getProfileKey(DEPLOY_SECRET_PATH_UUID, p)] ?: "")
             root.put("deploy", deploy)

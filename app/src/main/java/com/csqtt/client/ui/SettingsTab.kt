@@ -541,7 +541,7 @@ internal fun SettingsTabContent(
                             linkSaveJob?.cancel()
                             linkSaveJob = scope.launch {
                                 delay(300)
-                                settingsStore.saveCsqttLink(linkText)
+                                settingsStore.saveCsqttParticipantLink(linkText)
                             }
                         },
                         label = { Text("Ссылка csqtt://", maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis) },
