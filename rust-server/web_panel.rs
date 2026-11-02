@@ -5714,7 +5714,7 @@ const LOGIN_HTML_TEMPLATE: &str = r##"
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="theme-color" content="#0a0a0c">
+    <meta name="theme-color" id="themeColorMeta" content="#0a0a0c">
     <meta name="mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -5734,6 +5734,7 @@ const LOGIN_HTML_TEMPLATE: &str = r##"
         body { background-color: var(--bg-color); color: var(--text-main); min-height: 100vh; display: flex; align-items: center; justify-content: center; overflow: hidden; }
 
         main {
+            position: relative;
             z-index: 1; width: min(420px, calc(100% - 40px)); background: var(--glass);
             backdrop-filter: blur(20px); border: 1px solid var(--border); border-radius: 24px;
             padding: 48px 40px; box-shadow: 0 20px 40px rgba(0, 0, 0, 0.05);
@@ -5752,11 +5753,27 @@ const LOGIN_HTML_TEMPLATE: &str = r##"
         button:hover { transform: translateY(-2px); box-shadow: 0 12px 20px color-mix(in srgb, var(--primary) 35%, transparent); }
         button:active { transform: translateY(0); }
 
+        button.theme-toggle {
+            position: absolute; top: 16px; right: 16px; width: 36px; height: 36px;
+            margin: 0; padding: 0; display: flex; align-items: center; justify-content: center;
+            background: transparent; color: var(--text-muted); border: 1px solid var(--border);
+            border-radius: 10px; box-shadow: none; transform: none; transition: color 0.2s, border-color 0.2s;
+        }
+        button.theme-toggle:hover { color: var(--text-main); background: transparent; box-shadow: none; transform: none; }
+        button.theme-toggle:active { color: var(--text-main); transform: none; }
+
         #e { min-height: 20px; color: var(--danger); font-size: 14px; font-weight: 500; text-align: center; margin-top: 16px; opacity: 0; }
     </style>
+    <script>
+        if (localStorage.getItem('csqtt-theme') === 'dark') document.documentElement.setAttribute('data-theme', 'dark');
+        document.querySelector('meta[name="theme-color"]').setAttribute('content', getComputedStyle(document.documentElement).getPropertyValue('--bg-color').trim());
+    </script>
 </head>
 <body>
     <main>
+        <button class="theme-toggle" type="button" onclick="toggleTheme()" title="Сменить тему" aria-label="Сменить тему">
+            <svg id="themeIcon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
+        </button>
         <h1>Вход</h1>
         <form id="f">
             <div class="input-group">
@@ -5787,6 +5804,27 @@ const LOGIN_HTML_TEMPLATE: &str = r##"
             for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode((bytes[i] + 47) & 0xff);
             return 'c1:' + btoa(bin);
         }
+        const MOON_ICON = '<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>';
+        const SUN_ICON = '<circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>';
+        function syncThemeColorMeta() {
+            const meta = document.getElementById('themeColorMeta');
+            if (!meta) return;
+            meta.setAttribute('content', getComputedStyle(document.documentElement).getPropertyValue('--bg-color').trim());
+        }
+        function updateThemeIcon() {
+            const icon = document.getElementById('themeIcon');
+            if (!icon) return;
+            icon.innerHTML = document.documentElement.getAttribute('data-theme') === 'dark' ? SUN_ICON : MOON_ICON;
+        }
+        function toggleTheme() {
+            const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+            document.documentElement.setAttribute('data-theme', isDark ? 'light' : 'dark');
+            localStorage.setItem('csqtt-theme', isDark ? 'light' : 'dark');
+            updateThemeIcon();
+            syncThemeColorMeta();
+        }
+        updateThemeIcon();
+        syncThemeColorMeta();
         f.onsubmit = async x => {
             x.preventDefault();
             const btn = document.getElementById('submitBtn');
@@ -5816,11 +5854,11 @@ const LOGIN_HTML_TEMPLATE: &str = r##"
 "##;
 
 const CLIENT_SUB_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
-<html lang="ru" data-theme="dark">
+<html lang="ru">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="theme-color" content="#0a0a0c">
+    <meta name="theme-color" id="themeColorMeta" content="#f8fafc">
     <link rel="icon" type="image/svg+xml" href="/pwa-icon.svg">
     <link rel="apple-touch-icon" href="/pwa-icon.svg">
     <meta property="og:title" content="CSQTT">
@@ -5943,9 +5981,30 @@ const CLIENT_SUB_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
             transform: translateX(-50%) translateY(0);
             opacity: 1;
         }
+        .theme-toggle {
+            position: fixed; top: 16px; right: 16px; z-index: 20;
+            width: 36px; height: 36px; margin: 0; padding: 0;
+            display: inline-flex; align-items: center; justify-content: center;
+            background: var(--surface); color: var(--text-muted);
+            border: 1px solid var(--border); border-radius: 10px;
+            cursor: pointer; transition: color 0.2s, border-color 0.2s;
+        }
+        .theme-toggle:hover { color: var(--text-main); border-color: var(--text-muted); }
     </style>
+    <script>
+        function syncThemeColorMeta() {
+            const meta = document.getElementById('themeColorMeta');
+            if (!meta) return;
+            meta.setAttribute('content', getComputedStyle(document.documentElement).getPropertyValue('--bg-color').trim());
+        }
+        if (localStorage.getItem('csqtt-theme') === 'dark') document.documentElement.setAttribute('data-theme', 'dark');
+        syncThemeColorMeta();
+    </script>
 </head>
 <body>
+    <button class="theme-toggle" type="button" onclick="toggleTheme()" title="Сменить тему" aria-label="Сменить тему">
+        <svg id="themeIcon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
+    </button>
     <dialog id="qrDlg" style="max-width: 440px; width: min(440px, calc(100% - 24px)); text-align: center;" open="">
         <div class="dlg-header" style="justify-content: center;">
             <div style="display: flex; align-items: center; gap: 8px;">
@@ -5976,6 +6035,21 @@ const CLIENT_SUB_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
     <div id="toast" class="toast"></div>
 
     <script>
+        const MOON_ICON = '<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>';
+        const SUN_ICON = '<circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>';
+        function updateThemeIcon() {
+            const icon = document.getElementById('themeIcon');
+            if (!icon) return;
+            icon.innerHTML = document.documentElement.getAttribute('data-theme') === 'dark' ? SUN_ICON : MOON_ICON;
+        }
+        function toggleTheme() {
+            const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+            document.documentElement.setAttribute('data-theme', isDark ? 'light' : 'dark');
+            localStorage.setItem('csqtt-theme', isDark ? 'light' : 'dark');
+            updateThemeIcon();
+            syncThemeColorMeta();
+        }
+        updateThemeIcon();
                 function showToast(msg) {
             const t = document.getElementById('toast');
             if (!t) return;
@@ -6040,11 +6114,11 @@ const CLIENT_SUB_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
 "##;
 
 const GROUP_SUB_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
-<html lang="ru" data-theme="dark">
+<html lang="ru">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="theme-color" content="#0a0a0c">
+    <meta name="theme-color" id="themeColorMeta" content="#f8fafc">
     <link rel="icon" type="image/svg+xml" href="/pwa-icon.svg">
     <link rel="apple-touch-icon" href="/pwa-icon.svg">
     <meta property="og:title" content="CSQTT">
@@ -6266,7 +6340,24 @@ const GROUP_SUB_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
             transform: translateX(-50%) translateY(0);
             opacity: 1;
         }
+        .theme-toggle {
+            width: 36px; height: 36px; margin: 0; padding: 0;
+            display: inline-flex; align-items: center; justify-content: center;
+            background: var(--surface-hover); color: var(--text-muted);
+            border: 1px solid var(--border); border-radius: 10px;
+            cursor: pointer; transition: color 0.2s, border-color 0.2s;
+        }
+        .theme-toggle:hover { color: var(--text-main); border-color: var(--text-muted); }
     </style>
+    <script>
+        function syncThemeColorMeta() {
+            const meta = document.getElementById('themeColorMeta');
+            if (!meta) return;
+            meta.setAttribute('content', getComputedStyle(document.documentElement).getPropertyValue('--bg-color').trim());
+        }
+        if (localStorage.getItem('csqtt-theme') === 'dark') document.documentElement.setAttribute('data-theme', 'dark');
+        syncThemeColorMeta();
+    </script>
 </head>
 <body>
     <header class="header-bar">
@@ -6281,7 +6372,12 @@ const GROUP_SUB_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
             </svg>
             <h1 class="header-title">Группа: __GROUP_NAME__</h1>
         </div>
-        <div class="badge">__CLIENTS_COUNT__ клиентов</div>
+        <div style="display: flex; align-items: center; gap: 12px;">
+            <div class="badge">__CLIENTS_COUNT__ клиентов</div>
+            <button class="theme-toggle" type="button" onclick="toggleTheme()" title="Сменить тему" aria-label="Сменить тему">
+                <svg id="themeIcon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
+            </button>
+        </div>
     </header>
 
     <main class="group-grid" id="gridContainer"></main>
@@ -6289,6 +6385,21 @@ const GROUP_SUB_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
     <div id="toast" class="toast"></div>
 
     <script>
+        const MOON_ICON = '<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>';
+        const SUN_ICON = '<circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>';
+        function updateThemeIcon() {
+            const icon = document.getElementById('themeIcon');
+            if (!icon) return;
+            icon.innerHTML = document.documentElement.getAttribute('data-theme') === 'dark' ? SUN_ICON : MOON_ICON;
+        }
+        function toggleTheme() {
+            const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+            document.documentElement.setAttribute('data-theme', isDark ? 'light' : 'dark');
+            localStorage.setItem('csqtt-theme', isDark ? 'light' : 'dark');
+            updateThemeIcon();
+            syncThemeColorMeta();
+        }
+        updateThemeIcon();
 
         const clients = __CLIENTS_JSON__;
         function esc(s) {
@@ -6391,7 +6502,7 @@ const GROUP_ADMIN_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="theme-color" content="#0a0a0c">
+    <meta name="theme-color" id="themeColorMeta" content="#0a0a0c">
     <link rel="icon" type="image/svg+xml" href="/pwa-icon.svg">
     <link rel="apple-touch-icon" href="/pwa-icon.svg">
     <meta property="og:title" content="CSQTT">
@@ -7047,14 +7158,21 @@ const GROUP_ADMIN_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
     <div id="toast" class="toast"></div>
 
     <script>
+        function syncThemeColorMeta() {
+            const meta = document.getElementById('themeColorMeta');
+            if (!meta) return;
+            meta.setAttribute('content', getComputedStyle(document.documentElement).getPropertyValue('--bg-color').trim());
+        }
         function toggleTheme() {
             const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
             document.documentElement.setAttribute('data-theme', isDark ? 'light' : 'dark');
             localStorage.setItem('csqtt-theme', isDark ? 'light' : 'dark');
+            syncThemeColorMeta();
         }
         if (localStorage.getItem('csqtt-theme') === 'dark') {
             document.documentElement.setAttribute('data-theme', 'dark');
         }
+        syncThemeColorMeta();
 
         const adminUuid = window.location.pathname.split('/').filter(Boolean)[0];
         let currentData = null;
@@ -7900,7 +8018,7 @@ const PANEL_HTML_TEMPLATE: &str = r##"
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="theme-color" content="#0a0a0c">
+    <meta name="theme-color" id="themeColorMeta" content="#0a0a0c">
     <meta name="mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -10552,6 +10670,11 @@ const PANEL_HTML_TEMPLATE: &str = r##"
                 showToast("Не удалось скопировать", "error");
             }
         }
+        function syncThemeColorMeta() {
+            const meta = document.getElementById('themeColorMeta');
+            if (!meta) return;
+            meta.setAttribute('content', getComputedStyle(document.documentElement).getPropertyValue('--bg-color').trim());
+        }
         function toggleTheme() {
             const isDark = document.body.parentElement.getAttribute('data-theme') === 'dark';
             document.body.parentElement.setAttribute('data-theme', isDark ? 'light' : 'dark');
@@ -10559,8 +10682,10 @@ const PANEL_HTML_TEMPLATE: &str = r##"
             document.getElementById('themeIcon').innerHTML = isDark
                 ? '<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>'
                 : '<circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>';
+            syncThemeColorMeta();
         }
         if (localStorage.getItem('csqtt-theme') === 'dark') { toggleTheme(); }
+        syncThemeColorMeta();
 
         const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
