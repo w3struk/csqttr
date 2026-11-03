@@ -77,7 +77,14 @@ class QuickToggleTileService : TileService() {
     private fun openMainActivity() {
         runCatching {
             val intent = Intent(this, MainActivity::class.java).apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                // Запуск из тайла не должен проигрывать анимацию ActivityLaunchAnimator
+                // поверх уже существующей singleTop-активности: незавершённая анимация
+                // оставляет в окне TYPE_SYSTEM слой #status_bar_launch_animation_container.
+                addFlags(
+                    Intent.FLAG_ACTIVITY_NEW_TASK or
+                        Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                        Intent.FLAG_ACTIVITY_NO_ANIMATION
+                )
             }
             if (Build.VERSION.SDK_INT >= 34) {
                 val pendingIntent = PendingIntent.getActivity(

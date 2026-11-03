@@ -64,6 +64,8 @@ import androidx.lifecycle.lifecycleScope
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.isTraversalGroup
+import androidx.compose.ui.semantics.semantics
 import com.csqtt.client.ui.AppUpdateDialog
 import com.csqtt.client.ui.ConnectionTab
 import com.csqtt.client.ui.ExceptionsTab
@@ -136,8 +138,6 @@ class MainActivity : ComponentActivity() {
             val authContext = LocalContext.current.applicationContext
             val authScope = rememberCoroutineScope()
             val uiStateHolder = rememberSaveableStateHolder()
-            if (renderUi) {
-                uiStateHolder.SaveableStateProvider("main_ui") {
             val settingsStore = remember { appSettingsStore }
             val themeMode by settingsStore.themeMode.collectAsStateWithLifecycle(initialValue = CsqttConstants.Theme.MODE_SYSTEM)
             val activeFingerprint by settingsStore.selectedFingerprint.collectAsStateWithLifecycle(initialValue = CsqttConstants.Tunnel.DEFAULT_FINGERPRINT)
@@ -146,29 +146,36 @@ class MainActivity : ComponentActivity() {
             val baseDensity = LocalDensity.current
             val fixedDensity = remember(baseDensity.density) { Density(baseDensity.density, 1f) }
 
+            // Корневая поверхность монтируется безусловно: окно Activity и его
+            // a11y-узел живут всё время жизни Activity, а тяжёлый экран снимается
+            // с композиции по renderUi, пока приложение в фоне.
             CompositionLocalProvider(LocalDensity provides fixedDensity) {
-            CSQTTTheme(themeMode = themeMode) {
-                Surface(
-                    modifier = Modifier.fillMaxSize(),
-                    color = MaterialTheme.colorScheme.background,
-                ) {
-                    MainScreen(
-                        settingsStore = settingsStore,
-                        themeMode = themeMode,
-                        onThemeChange = { mode ->
-                            scope.launch {
-                                settingsStore.saveThemeMode(mode)
+                CSQTTTheme(themeMode = themeMode) {
+                    Surface(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .semantics { isTraversalGroup = true },
+                        color = MaterialTheme.colorScheme.background,
+                    ) {
+                        if (renderUi) {
+                            uiStateHolder.SaveableStateProvider("main_ui") {
+                                MainScreen(
+                                    settingsStore = settingsStore,
+                                    themeMode = themeMode,
+                                    onThemeChange = { mode ->
+                                        scope.launch {
+                                            settingsStore.saveThemeMode(mode)
+                                        }
+                                    },
+                                    activeFingerprint = activeFingerprint,
+                                    onFingerprintChange = { fp ->
+                                        scope.launch { settingsStore.saveFingerprint(fp) }
+                                    },
+                                    onVkAuthRequested = { showVkAuthDialog = true },
+                                )
                             }
-                        },
-                        activeFingerprint = activeFingerprint,
-                        onFingerprintChange = { fp ->
-                            scope.launch { settingsStore.saveFingerprint(fp) }
-                        },
-                        onVkAuthRequested = { showVkAuthDialog = true },
-                    )
-                }
-            }
-            }
+                        }
+                    }
                 }
             }
             if (showVkAuthDialog) {
