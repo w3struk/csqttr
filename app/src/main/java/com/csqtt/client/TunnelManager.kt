@@ -17,6 +17,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import java.io.BufferedReader
 import java.io.File
 import java.lang.ref.WeakReference
@@ -48,6 +49,8 @@ data class LogEntry(
     val isError: Boolean = false,
     val level: LogLevel? = null,
     val timestampMillis: Long,
+    /** Unique per journal row; assigned by [TunnelManager] when the row is appended. */
+    val id: Long = 0L,
 )
 
 private val LOG_STICKERS = Regex("[\\p{So}\\p{Sk}\\uFE0F\\u200D]")
@@ -148,8 +151,9 @@ object TunnelManager {
     )
 
     private const val LOG_UI_FLUSH_MS = 120L
-    private const val MAX_LOG_ENTRIES = 100
     private const val MAX_PENDING_LOGS = 128
+    private val nextLogEntryId = AtomicLong(1L)
+    private val nextSessionId = AtomicLong(1L)
     private const val MAX_LOG_MESSAGE_LENGTH = 4_096
     private val pendingLogLock = Any()
     private val pendingLogs = LinkedHashMap<String, PendingLog>()
@@ -913,9 +917,11 @@ object TunnelManager {
                 }
                 pendingLogs[pendingKey] = PendingLog(identity, key, cleanMessage, priority, isError, level, 1, timestamp)
             } else {
+                pendingLogs.remove(pendingKey)
                 pending.message = cleanMessage
                 pending.count += 1
                 pending.timestampMillis = timestamp
+                pendingLogs[pendingKey] = pending
             }
             scheduleLogFlushLocked()
         }
@@ -942,10 +948,6 @@ object TunnelManager {
     private fun applyPendingLog(pending: PendingLog) {
         val identity = pending.identity
         if (identity != null && !isCurrent(identity)) return
-        val index = logs.indexOfFirst { it.key == pending.key }
-        if (pending.isError && index == -1) {
-            unreadErrorCount.value++
-        }
         val incoming = LogEntry(
             key = pending.key,
             message = pending.message,
@@ -955,21 +957,18 @@ object TunnelManager {
             level = pending.level,
             timestampMillis = pending.timestampMillis,
         )
-        if (index != -1) {
-            val entry = logs[index]
-            val merged = LogAggregationPolicy.merge(entry, incoming)
-            if (entry.priority == pending.priority) {
-                logs[index] = merged
+        val mergeIndex = LogJournalPolicy.mergeIndex(logs, incoming.key)
+        if (mergeIndex >= 0) {
+            val merged = LogAggregationPolicy.merge(logs[mergeIndex], incoming)
+            if (mergeIndex == logs.lastIndex) {
+                logs[mergeIndex] = merged
             } else {
-                logs.removeAt(index)
-                insertSorted(merged)
+                logs.removeAt(mergeIndex)
+                logs.add(merged)
             }
         } else {
-            insertSorted(incoming)
-        }
-
-        while (logs.size > MAX_LOG_ENTRIES) {
-            logs.removeAt(0)
+            appendLogEntry(incoming)
+            unreadErrorCount.value += LogJournalPolicy.unreadIncrement(incoming, merged = false)
         }
     }
 
@@ -979,19 +978,29 @@ object TunnelManager {
             processGeneration == identity.generation &&
             lifecycleState.accepts(identity.ticket)
 
-    private fun insertSorted(entry: LogEntry) {
-        val comparator = compareBy<LogEntry>({ it.priority }, { if (it.isError) 1 else 0 }, { it.key })
-        var inserted = false
-        for (i in logs.indices) {
-            if (comparator.compare(entry, logs[i]) < 0) {
-                logs.add(i, entry)
-                inserted = true
-                break
-            }
+    private fun appendLogEntry(entry: LogEntry) {
+        val stamped = entry.copy(id = nextLogEntryId.getAndIncrement())
+        if (BuildConfig.DEBUG) {
+            require(stamped.id > 0L) { "Log entry id must be positive" }
         }
-        if (!inserted) {
-            logs.add(entry)
+        logs.add(stamped)
+        repeat(LogJournalPolicy.excess(logs.size)) {
+            logs.removeAt(0)
         }
+    }
+
+    private fun appendSessionMarker() {
+        appendLogEntry(
+            LogEntry(
+                key = "session_${nextSessionId.getAndIncrement()}",
+                message = "[СЕССИЯ] Новое подключение",
+                count = 1,
+                priority = 0,
+                isError = false,
+                level = LogLevel.LOG,
+                timestampMillis = System.currentTimeMillis(),
+            ),
+        )
     }
 
     fun start(context: Context, params: TunnelParams, isSwitching: Boolean = false) {
@@ -1012,7 +1021,6 @@ object TunnelManager {
                 val epoch = if (isSwitching) {
                     lifecycleState.requestRestart() ?: return@withLock
                 } else {
-                    clearLogs()
                     config.value = null
                     stats.value = "Ожидание данных..."
                     wrapAuthTimeoutCount = 0
@@ -1031,6 +1039,10 @@ object TunnelManager {
                 restartJob = null
                 if (isSwitching) terminateProcessLocked(processIdentity)
                 if (isSwitching) currentParams = params
+                withContext(Dispatchers.Main) {
+                    flushPendingLogs()
+                    if (!isSwitching && isLoggingEnabled && logs.isNotEmpty()) appendSessionMarker()
+                }
                 startProcessLocked(appContext, params, epoch)
             }
         }

@@ -58,6 +58,16 @@ class LogAggregationPolicyTest {
         assertEquals("existing", merged.key)
     }
 
+    @Test
+    fun mergeKeepsExistingEntryId() {
+        val merged = LogAggregationPolicy.merge(
+            entry(id = 42L),
+            entry(id = 43L),
+        )
+
+        assertEquals(42L, merged.id)
+    }
+
     private fun entry(
         key: String = "log",
         message: String = "message",
@@ -66,5 +76,6 @@ class LogAggregationPolicyTest {
         isError: Boolean = false,
         level: LogLevel? = null,
         timestampMillis: Long = 1_000L,
-    ) = LogEntry(key, message, count, priority, isError, level, timestampMillis)
+        id: Long = 0L,
+    ) = LogEntry(key, message, count, priority, isError, level, timestampMillis, id)
 }

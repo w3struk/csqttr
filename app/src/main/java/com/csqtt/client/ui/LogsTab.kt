@@ -29,8 +29,11 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -99,6 +102,32 @@ private fun LogsTerminal() {
     val copiedMessage = stringResource(R.string.logs_copied)
     val isDeploying by DeployManager.isDeploying.collectAsStateWithLifecycle()
 
+    var isAtBottom by remember { mutableStateOf(true) }
+
+    LaunchedEffect(listState) {
+        snapshotFlow {
+            listState.isScrollInProgress to listState.canScrollForward
+        }.collect { (isScrolling, canScrollForward) ->
+            if (isScrolling) {
+                isAtBottom = !canScrollForward
+            } else if (!canScrollForward) {
+                isAtBottom = true
+            }
+        }
+    }
+
+    LaunchedEffect(currentLogs.isEmpty()) {
+        if (currentLogs.isEmpty()) {
+            isAtBottom = true
+        }
+    }
+
+    LaunchedEffect(currentLogs.lastOrNull()?.id) {
+        if (!isDeploying && currentLogs.isNotEmpty() && isAtBottom) {
+            listState.scrollToItem(currentLogs.lastIndex)
+        }
+    }
+
     LaunchedEffect(currentLogs.size, isDeploying) {
         if (isDeploying) {
             val latestDeployIndex = currentLogs.indexOfLast { it.key.startsWith("deploy_") }
@@ -126,7 +155,7 @@ private fun LogsTerminal() {
             ) {
                 items(
                     items = currentLogs,
-                    key = { it.key },
+                    key = { it.id },
                     contentType = { "log_line" },
                 ) { entry ->
                     LogLine(entry)
