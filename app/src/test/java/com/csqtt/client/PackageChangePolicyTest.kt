@@ -27,6 +27,7 @@ class PackageChangePolicyTest {
         packageName: String,
         orangeEnabled: Set<String> = emptySet(),
         planExcludesPackages: Boolean = true,
+        localPackages: Set<String> = emptySet(),
     ): Boolean = PackageChangePolicy.needsVpnRebuild(
         packageName = packageName,
         preset = preset,
@@ -34,6 +35,30 @@ class PackageChangePolicyTest {
         transportPackages = transportPackages,
         orangeEnabled = orangeEnabled,
         planExcludesPackages = planExcludesPackages,
+        localPackages = localPackages,
+    )
+
+    private fun rule(
+        isWhite: Boolean,
+        packages: List<String> = emptyList(),
+    ): ServerRoutingRule = ServerRoutingRule(
+        isWhite = isWhite,
+        packages = packages,
+        domains = emptyList(),
+        templateDomains = false,
+        presetRed = preset.red.toList(),
+        presetOrange = preset.orange.toList(),
+    )
+
+    private fun localModeNeedsRebuild(
+        isWhitelist: Boolean,
+        localPackages: Set<String>,
+        packageName: String,
+    ): Boolean = PackageChangePolicy.needsVpnRebuild(
+        isWhitelist = isWhitelist,
+        localPackages = localPackages,
+        packageName = packageName,
+        transportPackages = transportPackages,
     )
 
     @Test
@@ -110,5 +135,155 @@ class PackageChangePolicyTest {
     @Test
     fun `an empty package name needs no rebuild`() {
         assertFalse(needsRebuild(""))
+    }
+
+    @Test
+    fun `a package from the local list needs a rebuild in any plan shape`() {
+        val localPackages = setOf("com.example.local")
+        assertTrue(
+            needsRebuild("com.example.local", planExcludesPackages = true, localPackages = localPackages)
+        )
+        assertTrue(
+            needsRebuild("com.example.local", planExcludesPackages = false, localPackages = localPackages)
+        )
+    }
+
+    @Test
+    fun `a local package needs a rebuild even under an empty white rule`() {
+        assertTrue(
+            PackageChangePolicy.needsVpnRebuild(
+                rule = rule(isWhite = true),
+                packageName = "com.example.local",
+                transportPackages = transportPackages,
+                orangeEnabled = emptySet(),
+                localPackages = setOf("com.example.local"),
+            )
+        )
+    }
+
+    @Test
+    fun `the local mode form rebuilds for the active list in both modes`() {
+        val localPackages = setOf("com.example.local")
+        assertTrue(
+            localModeNeedsRebuild(
+                isWhitelist = false,
+                localPackages = localPackages,
+                packageName = "com.example.local",
+            )
+        )
+        assertTrue(
+            localModeNeedsRebuild(
+                isWhitelist = true,
+                localPackages = localPackages,
+                packageName = "com.example.local",
+            )
+        )
+        assertFalse(
+            localModeNeedsRebuild(
+                isWhitelist = false,
+                localPackages = localPackages,
+                packageName = "com.example.unrelated",
+            )
+        )
+        assertFalse(
+            localModeNeedsRebuild(
+                isWhitelist = true,
+                localPackages = localPackages,
+                packageName = "com.example.unrelated",
+            )
+        )
+    }
+
+    @Test
+    fun `the local mode form still rebuilds transport only when excluding`() {
+        assertTrue(
+            localModeNeedsRebuild(
+                isWhitelist = false,
+                localPackages = emptySet(),
+                packageName = CsqttConstants.General.PACKAGE_VK,
+            )
+        )
+        assertFalse(
+            localModeNeedsRebuild(
+                isWhitelist = true,
+                localPackages = emptySet(),
+                packageName = CsqttConstants.General.PACKAGE_VK,
+            )
+        )
+    }
+
+    @Test
+    fun `a substituted white rule rebuilds for preset and transport packages`() {
+        val invisible = rule(isWhite = true, packages = listOf("com.example.invisible"))
+
+        listOf("ru.sberbankmobile", "com.wildberries.ru", CsqttConstants.General.PACKAGE_VK)
+            .forEach { pkg ->
+                assertTrue(
+                    "под подменой $pkg меняет покрытие",
+                    PackageChangePolicy.needsVpnRebuild(
+                        rule = invisible,
+                        packageName = pkg,
+                        transportPackages = transportPackages,
+                        orangeEnabled = emptySet(),
+                        localPackages = emptySet(),
+                        planSubstituted = true,
+                    ),
+                )
+            }
+
+        listOf("ru.sberbankmobile", "com.wildberries.ru", CsqttConstants.General.PACKAGE_VK)
+            .forEach { pkg ->
+                assertFalse(
+                    "обычный белый список всё так же не реагирует на $pkg",
+                    PackageChangePolicy.needsVpnRebuild(
+                        rule = invisible,
+                        packageName = pkg,
+                        transportPackages = transportPackages,
+                        orangeEnabled = emptySet(),
+                        localPackages = emptySet(),
+                        planSubstituted = false,
+                    ),
+                )
+            }
+    }
+
+    @Test
+    fun `a substituted white rule rebuilds when a local package disappears`() {
+        val invisible = rule(isWhite = true, packages = listOf("com.example.invisible"))
+        val localPackages = setOf("com.example.local")
+
+        assertTrue(
+            "удаление локального пакета — переход «в подмену»",
+            PackageChangePolicy.needsVpnRebuild(
+                rule = invisible,
+                packageName = "com.example.local",
+                transportPackages = transportPackages,
+                orangeEnabled = emptySet(),
+                localPackages = localPackages,
+                planSubstituted = true,
+            ),
+        )
+        assertTrue(
+            "переход «из подмены» ловится пакетом правила",
+            PackageChangePolicy.needsVpnRebuild(
+                rule = invisible,
+                packageName = "com.example.invisible",
+                transportPackages = transportPackages,
+                orangeEnabled = emptySet(),
+                localPackages = localPackages,
+                planSubstituted = true,
+            ),
+        )
+        assertFalse(
+            "посторонний пакет пересборку не запускает",
+            PackageChangePolicy.needsVpnRebuild(
+                rule = invisible,
+                packageName = "com.example.unrelated",
+                transportPackages = transportPackages,
+                orangeEnabled = emptySet(),
+                localPackages = localPackages,
+                planSubstituted = true,
+            ),
+        )
     }
 }

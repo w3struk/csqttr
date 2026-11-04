@@ -2,7 +2,6 @@ package com.csqtt.client
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -98,23 +97,6 @@ class AppRoutingPolicyTest {
             "в чёрном режиме пакет остаётся исключённым даже при записи в U",
             overlap in blackExcluded,
         )
-
-        val deviceWide = requireNotNull(
-            AppRoutingPolicy.serverRuleCounts(
-                hasServerRule = true,
-                isWhite = true,
-                rulePackages = emptySet(),
-                preset = both,
-                userEnabled = setOf(overlap),
-                installedPackages = installed + overlap,
-            )
-        )
-        assertEquals(
-            "в белом режиме «на все приложения» пакет тоже мимо туннеля",
-            2,
-            deviceWide.inTunnel,
-        )
-        assertEquals("мимо туннеля красный и оранжевый", 3, deviceWide.excluded)
     }
 
     @Test
@@ -226,169 +208,37 @@ class AppRoutingPolicyTest {
         )
     }
 
-    /**
-     * Установленные приложения устройства. Транспортные пакеты (CSQTT, VK)
-     * сюда не попадают — их отфильтровывает список приложений на экране.
-     */
-    private val installed = setOf(
-        "com.vpn",
-        "com.bank",
-        "ru.sberbankmobile",
-        "org.telegram.messenger",
-    )
-
-    private fun countsFor(
-        isWhite: Boolean,
-        rulePackages: Set<String>,
-        userEnabled: Set<String> = emptySet(),
-    ): RoutingCardCounts = requireNotNull(
-        AppRoutingPolicy.serverRuleCounts(
-            hasServerRule = true,
-            isWhite = isWhite,
-            rulePackages = rulePackages,
-            preset = preset,
-            userEnabled = userEnabled,
-            installedPackages = installed,
-        )
-    )
-
     @Test
-    fun deviceWideRuleOnlyWhenWhitelistHasNoOperatorPackages() {
+    fun invisibleWhitelistPredicateFiresOnlyForANonEmptyUninstalledSet() {
+        val installed = setOf("com.vpn")
+
         assertTrue(
-            "белый список без пакетов — это правило на все приложения",
-            AppRoutingPolicy.isDeviceWideRule(isWhite = true, rulePackages = emptySet()),
+            "непустой набор без установленных пакетов — подмена",
+            AppRoutingPolicy.isServerWhitelistInvisible(
+                isWhite = true,
+                rulePackages = setOf("com.example.notinstalled"),
+            ) { it in installed },
         )
         assertFalse(
-            "белый список с пакетами остаётся обычным белым списком",
-            AppRoutingPolicy.isDeviceWideRule(isWhite = true, rulePackages = setOf("com.vpn")),
+            "пустой набор — это «никто», подмены нет",
+            AppRoutingPolicy.isServerWhitelistInvisible(
+                isWhite = true,
+                rulePackages = emptySet(),
+            ) { it in installed },
         )
         assertFalse(
-            "чёрный список без пакетов правилом на все приложения не становится",
-            AppRoutingPolicy.isDeviceWideRule(isWhite = false, rulePackages = emptySet()),
-        )
-    }
-
-    @Test
-    fun blacklistCountsExcludeTheWholePreset() {
-        val counts = countsFor(isWhite = false, rulePackages = setOf("com.vpn"))
-
-        assertEquals("исключены правило, красный и оранжевый", 3, counts.excluded)
-        assertEquals("в туннеле только приложение вне пресета", 1, counts.inTunnel)
-        assertEquals("красный на устройстве", 1, counts.alwaysExcluded)
-        assertEquals("оранжевый на устройстве", 1, counts.optOut)
-    }
-
-    @Test
-    fun blacklistReturnsTheOrangeTheUserRestored() {
-        val counts = countsFor(
-            isWhite = false,
-            rulePackages = setOf("com.vpn"),
-            userEnabled = setOf("ru.sberbankmobile"),
-        )
-
-        assertEquals("возвращённый оранжевый больше не исключён", 2, counts.excluded)
-        assertEquals("он идёт в туннель вместе с обычными", 2, counts.inTunnel)
-    }
-
-    @Test
-    fun whitelistCountsOnlyInstalledRulePackages() {
-        val counts = countsFor(
-            isWhite = true,
-            rulePackages = setOf("com.vpn", "com.bank", "com.example.notinstalled"),
-        )
-
-        assertEquals("в туннеле обычный пакет правила", 1, counts.inTunnel)
-        assertEquals("красный вычтен, неустановленный не считается", 3, counts.excluded)
-        assertEquals("красный на устройстве", 1, counts.alwaysExcluded)
-        assertEquals("оранжевый на устройстве", 1, counts.optOut)
-    }
-
-    @Test
-    fun whitelistReturnsTheOrangeTheUserRestored() {
-        val counts = countsFor(
-            isWhite = true,
-            rulePackages = setOf("com.vpn"),
-            userEnabled = setOf("ru.sberbankmobile"),
-        )
-
-        assertEquals("возвращённый оранжевый в туннеле", 2, counts.inTunnel)
-        assertEquals("мимо туннеля остаются красный и приложение вне правила", 2, counts.excluded)
-    }
-
-    @Test
-    fun whitelistCountsKeepOperatorOrangeOutOfTheTunnel() {
-        val counts = countsFor(
-            isWhite = true,
-            rulePackages = setOf("com.vpn", "ru.sberbankmobile"),
-        )
-
-        assertEquals("оранжевый из списка оператора без U в туннель не идёт", 1, counts.inTunnel)
-        assertEquals("мимо туннеля красный, оранжевый и приложение вне правила", 3, counts.excluded)
-        assertEquals("красный на устройстве", 1, counts.alwaysExcluded)
-        assertEquals("оранжевый на устройстве", 1, counts.optOut)
-
-        val restored = countsFor(
-            isWhite = true,
-            rulePackages = setOf("com.vpn", "ru.sberbankmobile"),
-            userEnabled = setOf("ru.sberbankmobile"),
-        )
-
-        assertEquals("пользователь вернул оранжевый в туннель", 2, restored.inTunnel)
-        assertEquals("мимо туннеля красный и приложение вне правила", 2, restored.excluded)
-    }
-
-    @Test
-    fun whitelistWithEmptyPackageListTunnelsEverythingButThePreset() {
-        val counts = countsFor(isWhite = true, rulePackages = emptySet())
-
-        assertEquals("в туннель идут все, кроме красного и оранжевого", 2, counts.inTunnel)
-        assertEquals("мимо туннеля только красный и оранжевый", 2, counts.excluded)
-    }
-
-    @Test
-    fun whitelistWithEmptyPackageListReturnsTheOrangeTheUserRestored() {
-        val counts = countsFor(
-            isWhite = true,
-            rulePackages = emptySet(),
-            userEnabled = setOf("ru.sberbankmobile"),
-        )
-
-        assertEquals("возвращённый оранжевый больше не исключается", 3, counts.inTunnel)
-        assertEquals("мимо туннеля остаётся только красный", 1, counts.excluded)
-    }
-
-    @Test
-    fun countsIgnorePresetPackagesThatAreNotInstalled() {
-        val counts = requireNotNull(
-            AppRoutingPolicy.serverRuleCounts(
-                hasServerRule = true,
-                isWhite = false,
+            "установленный пакет в наборе уважается",
+            AppRoutingPolicy.isServerWhitelistInvisible(
+                isWhite = true,
                 rulePackages = setOf("com.vpn"),
-                preset = PresetApps(
-                    red = setOf("com.bank", "com.bank.notinstalled"),
-                    orange = setOf("ru.sberbankmobile", "ru.orange.notinstalled"),
-                ),
-                userEnabled = emptySet(),
-                installedPackages = installed,
-            )
+            ) { it in installed },
         )
-
-        assertEquals("неустановленный красный не считается", 1, counts.alwaysExcluded)
-        assertEquals("неустановленный оранжевый не считается", 1, counts.optOut)
-        assertEquals("и в исключённые не попадает", 3, counts.excluded)
-    }
-
-    @Test
-    fun countsAreNullWithoutServerRule() {
-        val counts = AppRoutingPolicy.serverRuleCounts(
-            hasServerRule = false,
-            isWhite = true,
-            rulePackages = setOf("com.vpn"),
-            preset = preset,
-            userEnabled = emptySet(),
-            installedPackages = installed,
+        assertFalse(
+            "чёрный режим подмены не имеет",
+            AppRoutingPolicy.isServerWhitelistInvisible(
+                isWhite = false,
+                rulePackages = setOf("com.example.notinstalled"),
+            ) { it in installed },
         )
-
-        assertNull("без серверного правила карточка показывает локальные списки", counts)
     }
 }

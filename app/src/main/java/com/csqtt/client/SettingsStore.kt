@@ -1,7 +1,6 @@
 package com.csqtt.client
 
 import android.content.Context
-import android.content.pm.PackageManager
 import androidx.datastore.preferences.core.MutablePreferences
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
@@ -138,24 +137,14 @@ class SettingsStore(context: Context) {
 
         private val IS_WHITELIST = booleanPreferencesKey("is_whitelist")
         private val SPLIT_TUNNEL_WHITELIST_MIGRATED = booleanPreferencesKey("split_tunnel_whitelist_migrated")
+        private val SPLIT_TUNNEL_INVERTED_LIST_REPAIRED =
+            booleanPreferencesKey("split_tunnel_inverted_list_repaired")
         private val EXTRA_WORKERS = booleanPreferencesKey("extra_workers")
         private val AUTO_JS_RISK_ACKNOWLEDGED = booleanPreferencesKey("auto_js_risk_acknowledged")
         private val TCP_TRANSPORT_RISK_ACKNOWLEDGED = booleanPreferencesKey("tcp_transport_risk_acknowledged")
         private val BATTERY_OPTIMIZATION_PROMPT_HANDLED =
             booleanPreferencesKey("battery_optimization_prompt_handled")
         private val AUTO_PAUSE_ON_WIFI = booleanPreferencesKey("auto_pause_on_wifi")
-        private val DOMAIN_ROUTING_ENABLED = booleanPreferencesKey("domain_routing_enabled")
-        private val DOMAIN_IS_WHITELIST = booleanPreferencesKey("domain_is_whitelist")
-        private val TEMPLATE_DOMAINS_ENABLED = booleanPreferencesKey("template_domains_enabled")
-        private val DIRECT_DOMAINS = stringPreferencesKey("direct_domains")
-        private val DIRECT_DOMAINS_BLACK = stringPreferencesKey("direct_domains_black")
-        private val DIRECT_DOMAINS_WHITE = stringPreferencesKey("direct_domains_white")
-
-        private val IP_ROUTING_ENABLED = booleanPreferencesKey("ip_routing_enabled")
-        private val IP_IS_WHITELIST = booleanPreferencesKey("ip_is_whitelist")
-        private val DIRECT_IPS_BLACK = stringPreferencesKey("direct_ips_black")
-        private val DIRECT_IPS_WHITE = stringPreferencesKey("direct_ips_white")
-
         private val THEME_MODE = stringPreferencesKey("theme_mode") 
         private val IS_DYNAMIC_COLOR = booleanPreferencesKey("is_dynamic_color")
         private val THEME_PALETTE = stringPreferencesKey("theme_palette")
@@ -230,36 +219,6 @@ class SettingsStore(context: Context) {
         @Volatile
         internal var cachedOrangeTunnelEnabled: String? = null
 
-        @Volatile
-        internal var cachedDomainRoutingEnabled: Boolean? = null
-
-        @Volatile
-        internal var cachedDomainIsWhitelist: Boolean? = null
-
-        @Volatile
-        internal var cachedTemplateDomainsEnabled: Boolean? = null
-
-        @Volatile
-        internal var cachedDirectDomains: String? = null
-
-        @Volatile
-        internal var cachedDirectDomainsBlack: String? = null
-
-        @Volatile
-        internal var cachedDirectDomainsWhite: String? = null
-
-        @Volatile
-        internal var cachedIpRoutingEnabled: Boolean? = null
-
-        @Volatile
-        internal var cachedIpIsWhitelist: Boolean? = null
-
-        @Volatile
-        internal var cachedDirectIpsBlack: String? = null
-
-        @Volatile
-        internal var cachedDirectIpsWhite: String? = null
-
         private val uiCacheStarted = java.util.concurrent.atomic.AtomicBoolean(false)
         private val migrationsStarted = java.util.concurrent.atomic.AtomicBoolean(false)
 
@@ -268,9 +227,9 @@ class SettingsStore(context: Context) {
             val newName = "${baseKey.name}_$profile"
             @Suppress("UNCHECKED_CAST")
             return when (baseKey) {
-                PEER, VK_HASHES, SECONDARY_VK_HASH, PROTOCOL, SNI, USER_AGENT, DEPLOY_IP, DEPLOY_LOGIN, DEPLOY_PASSWORD, DEPLOY_PASSWORD_ENCRYPTED, DEPLOY_SSH_PORT, EXCLUDED_APPS, WHITELIST_APPS, DIRECT_DOMAINS, DIRECT_DOMAINS_BLACK, DIRECT_DOMAINS_WHITE, DIRECT_IPS_BLACK, DIRECT_IPS_WHITE, CONNECTION_PASSWORD, CONNECTION_PASSWORD_ENCRYPTED, CONNECTION_PASSWORD_LOCAL, DEPLOY_MAIN_PASSWORD, DEPLOY_MAIN_PASSWORD_ENCRYPTED, DEPLOY_WEB_LOGIN, DEPLOY_WEB_PASSWORD, DEPLOY_WEB_PASSWORD_ENCRYPTED, PROXY_MODE, PROXY_HOST, VK_AUTH_MODE, OBFS_MODE, TURN_TRANSPORT, SRTP_MODE, CAPTCHA_MODE, CAPTCHA_SOLVE_METHOD, CAPTCHA_WBV_SOLVE_METHOD, CSQTT_LINK, SELECTED_FINGERPRINT, ACTIVE_CLIENT_IDS, VK_HASH_MODE, VK_ACCESS_TOKEN, VK_ACCESS_TOKEN_ENCRYPTED, VK_ACCESS_TOKEN_USER_ID, SSH_PRIVATE_KEY, SSH_PRIVATE_KEY_ENCRYPTED, SSH_KEY_PASSPHRASE, SSH_KEY_PASSPHRASE_ENCRYPTED, SSH_CERTIFICATE, SSH_CERTIFICATE_ENCRYPTED, VK_HASH_CHECK_RESULTS, CLIENT_ID_CHECK_RESULTS, CUSTOM_TURN_IPS, SELECTED_TURN_SUBNET -> stringPreferencesKey(newName) as Preferences.Key<T>
+                PEER, VK_HASHES, SECONDARY_VK_HASH, PROTOCOL, SNI, USER_AGENT, DEPLOY_IP, DEPLOY_LOGIN, DEPLOY_PASSWORD, DEPLOY_PASSWORD_ENCRYPTED, DEPLOY_SSH_PORT, EXCLUDED_APPS, WHITELIST_APPS, CONNECTION_PASSWORD, CONNECTION_PASSWORD_ENCRYPTED, CONNECTION_PASSWORD_LOCAL, DEPLOY_MAIN_PASSWORD, DEPLOY_MAIN_PASSWORD_ENCRYPTED, DEPLOY_WEB_LOGIN, DEPLOY_WEB_PASSWORD, DEPLOY_WEB_PASSWORD_ENCRYPTED, PROXY_MODE, PROXY_HOST, VK_AUTH_MODE, OBFS_MODE, TURN_TRANSPORT, SRTP_MODE, CAPTCHA_MODE, CAPTCHA_SOLVE_METHOD, CAPTCHA_WBV_SOLVE_METHOD, CSQTT_LINK, SELECTED_FINGERPRINT, ACTIVE_CLIENT_IDS, VK_HASH_MODE, VK_ACCESS_TOKEN, VK_ACCESS_TOKEN_ENCRYPTED, VK_ACCESS_TOKEN_USER_ID, SSH_PRIVATE_KEY, SSH_PRIVATE_KEY_ENCRYPTED, SSH_KEY_PASSPHRASE, SSH_KEY_PASSPHRASE_ENCRYPTED, SSH_CERTIFICATE, SSH_CERTIFICATE_ENCRYPTED, VK_HASH_CHECK_RESULTS, CLIENT_ID_CHECK_RESULTS, CUSTOM_TURN_IPS, SELECTED_TURN_SUBNET -> stringPreferencesKey(newName) as Preferences.Key<T>
                 WORKERS_PER_HASH, LISTEN_PORT, SERVER_PEER_PORT, PROXY_PORT, SERVER_WEB_PORT -> intPreferencesKey(newName) as Preferences.Key<T>
-                MANUAL_PORTS_ENABLED, NO_DNS, IS_WHITELIST, CSQTT_LINK_MODE, DETAILED_LOGS, SSH_KEYS_MODE, DOCKER_INSTALL, EXTRA_WORKERS, SPLIT_TUNNEL_WHITELIST_MIGRATED, DOMAIN_ROUTING_ENABLED, DOMAIN_IS_WHITELIST, TEMPLATE_DOMAINS_ENABLED, IP_ROUTING_ENABLED, IP_IS_WHITELIST -> booleanPreferencesKey(newName) as Preferences.Key<T>
+                MANUAL_PORTS_ENABLED, NO_DNS, IS_WHITELIST, CSQTT_LINK_MODE, DETAILED_LOGS, SSH_KEYS_MODE, DOCKER_INSTALL, EXTRA_WORKERS, SPLIT_TUNNEL_WHITELIST_MIGRATED -> booleanPreferencesKey(newName) as Preferences.Key<T>
                 CONNECTION_GENERATION -> longPreferencesKey(newName) as Preferences.Key<T>
                 else -> stringPreferencesKey(newName) as Preferences.Key<T>
             }
@@ -536,58 +495,6 @@ class SettingsStore(context: Context) {
         prefs[getProfileKey(IS_WHITELIST, profile)] ?: false
     }
 
-    val domainRoutingEnabled: Flow<Boolean> = dataStore.data.map { prefs ->
-        val profile = prefs[ACTIVE_PROFILE] ?: 0
-        prefs[getProfileKey(DOMAIN_ROUTING_ENABLED, profile)] ?: false
-    }
-
-    val templateDomainsEnabled: Flow<Boolean> = dataStore.data.map { prefs ->
-        val profile = prefs[ACTIVE_PROFILE] ?: 0
-        prefs[getProfileKey(TEMPLATE_DOMAINS_ENABLED, profile)] ?: false
-    }
-
-    val domainIsWhitelist: Flow<Boolean> = dataStore.data.map { prefs ->
-        val profile = prefs[ACTIVE_PROFILE] ?: 0
-        prefs[getProfileKey(DOMAIN_IS_WHITELIST, profile)] ?: false
-    }
-
-    val directDomains: Flow<String> = dataStore.data.map { prefs ->
-        val profile = prefs[ACTIVE_PROFILE] ?: 0
-        prefs[getProfileKey(DIRECT_DOMAINS, profile)] ?: ""
-    }
-
-    val directDomainsBlack: Flow<String> = dataStore.data.map { prefs ->
-        val profile = prefs[ACTIVE_PROFILE] ?: 0
-        prefs[getProfileKey(DIRECT_DOMAINS_BLACK, profile)]
-            ?: prefs[getProfileKey(DIRECT_DOMAINS, profile)]
-            ?: ""
-    }
-
-    val directDomainsWhite: Flow<String> = dataStore.data.map { prefs ->
-        val profile = prefs[ACTIVE_PROFILE] ?: 0
-        prefs[getProfileKey(DIRECT_DOMAINS_WHITE, profile)] ?: ""
-    }
-
-    val ipRoutingEnabled: Flow<Boolean> = dataStore.data.map { prefs ->
-        val profile = prefs[ACTIVE_PROFILE] ?: 0
-        prefs[getProfileKey(IP_ROUTING_ENABLED, profile)] ?: false
-    }
-
-    val ipIsWhitelist: Flow<Boolean> = dataStore.data.map { prefs ->
-        val profile = prefs[ACTIVE_PROFILE] ?: 0
-        prefs[getProfileKey(IP_IS_WHITELIST, profile)] ?: false
-    }
-
-    val directIpsBlack: Flow<String> = dataStore.data.map { prefs ->
-        val profile = prefs[ACTIVE_PROFILE] ?: 0
-        prefs[getProfileKey(DIRECT_IPS_BLACK, profile)] ?: ""
-    }
-
-    val directIpsWhite: Flow<String> = dataStore.data.map { prefs ->
-        val profile = prefs[ACTIVE_PROFILE] ?: 0
-        prefs[getProfileKey(DIRECT_IPS_WHITE, profile)] ?: ""
-    }
-
     val profileNames: Flow<Map<Int, String>> = dataStore.data.map { prefs ->
         (CsqttConstants.Profiles.MIN_INDEX..CsqttConstants.Profiles.MAX_INDEX).associateWith { p ->
             val name = prefs[getProfileKey(PROFILE_NAME, p)]
@@ -660,6 +567,7 @@ class SettingsStore(context: Context) {
                 migrateConnectionPasswordsToLocalStorage()
                 migrateSecretsToKeystore()
                 migrateLegacyWhitelistMode()
+                repairInvertedLocalBlacklist()
             }
         }
         if (uiCacheStarted.compareAndSet(false, true)) {
@@ -687,16 +595,6 @@ class SettingsStore(context: Context) {
                 launch { isWhitelist.collect { cachedIsWhitelist = it } }
                 launch { showSystemApps.collect { cachedShowSystemApps = it } }
                 launch { orangeTunnelEnabled.collect { cachedOrangeTunnelEnabled = it } }
-                launch { domainRoutingEnabled.collect { cachedDomainRoutingEnabled = it } }
-                launch { domainIsWhitelist.collect { cachedDomainIsWhitelist = it } }
-                launch { templateDomainsEnabled.collect { cachedTemplateDomainsEnabled = it } }
-                launch { directDomains.collect { cachedDirectDomains = it } }
-                launch { directDomainsBlack.collect { cachedDirectDomainsBlack = it } }
-                launch { directDomainsWhite.collect { cachedDirectDomainsWhite = it } }
-                launch { ipRoutingEnabled.collect { cachedIpRoutingEnabled = it } }
-                launch { ipIsWhitelist.collect { cachedIpIsWhitelist = it } }
-                launch { directIpsBlack.collect { cachedDirectIpsBlack = it } }
-                launch { directIpsWhite.collect { cachedDirectIpsWhite = it } }
             }
         }
     }
@@ -1283,78 +1181,6 @@ class SettingsStore(context: Context) {
         }
     }
 
-    suspend fun saveDomainRoutingEnabled(enabled: Boolean) {
-        dataStore.edit { prefs ->
-            val profile = prefs[ACTIVE_PROFILE] ?: 0
-            prefs[getProfileKey(DOMAIN_ROUTING_ENABLED, profile)] = enabled
-        }
-    }
-
-    suspend fun saveTemplateDomainsEnabled(enabled: Boolean) {
-        dataStore.edit { prefs ->
-            val profile = prefs[ACTIVE_PROFILE] ?: 0
-            prefs[getProfileKey(TEMPLATE_DOMAINS_ENABLED, profile)] = enabled
-        }
-    }
-
-    suspend fun saveDomainIsWhitelist(isWhitelist: Boolean) {
-        dataStore.edit { prefs ->
-            val profile = prefs[ACTIVE_PROFILE] ?: 0
-            prefs[getProfileKey(DOMAIN_IS_WHITELIST, profile)] = isWhitelist
-        }
-    }
-
-    suspend fun saveDirectDomains(domains: String) {
-        dataStore.edit { prefs ->
-            val profile = prefs[ACTIVE_PROFILE] ?: 0
-            prefs[getProfileKey(DIRECT_DOMAINS, profile)] = domains
-            prefs[getProfileKey(DIRECT_DOMAINS_BLACK, profile)] = domains
-        }
-    }
-
-    suspend fun saveDirectDomainsBlack(domains: String) {
-        dataStore.edit { prefs ->
-            val profile = prefs[ACTIVE_PROFILE] ?: 0
-            prefs[getProfileKey(DIRECT_DOMAINS_BLACK, profile)] = domains
-            prefs[getProfileKey(DIRECT_DOMAINS, profile)] = domains
-        }
-    }
-
-    suspend fun saveDirectDomainsWhite(domains: String) {
-        dataStore.edit { prefs ->
-            val profile = prefs[ACTIVE_PROFILE] ?: 0
-            prefs[getProfileKey(DIRECT_DOMAINS_WHITE, profile)] = domains
-        }
-    }
-
-    suspend fun saveIpRoutingEnabled(enabled: Boolean) {
-        dataStore.edit { prefs ->
-            val profile = prefs[ACTIVE_PROFILE] ?: 0
-            prefs[getProfileKey(IP_ROUTING_ENABLED, profile)] = enabled
-        }
-    }
-
-    suspend fun saveIpIsWhitelist(isWhitelist: Boolean) {
-        dataStore.edit { prefs ->
-            val profile = prefs[ACTIVE_PROFILE] ?: 0
-            prefs[getProfileKey(IP_IS_WHITELIST, profile)] = isWhitelist
-        }
-    }
-
-    suspend fun saveDirectIpsBlack(ips: String) {
-        dataStore.edit { prefs ->
-            val profile = prefs[ACTIVE_PROFILE] ?: 0
-            prefs[getProfileKey(DIRECT_IPS_BLACK, profile)] = ips
-        }
-    }
-
-    suspend fun saveDirectIpsWhite(ips: String) {
-        dataStore.edit { prefs ->
-            val profile = prefs[ACTIVE_PROFILE] ?: 0
-            prefs[getProfileKey(DIRECT_IPS_WHITE, profile)] = ips
-        }
-    }
-
     private suspend fun migrateSecretsToKeystore() {
         dataStore.edit { prefs ->
             for (profile in CsqttConstants.Profiles.MIN_INDEX..CsqttConstants.Profiles.MAX_INDEX) {
@@ -1390,15 +1216,18 @@ class SettingsStore(context: Context) {
         }
     }
 
+    /**
+     * Легаси хранил единственный список в `EXCLUDED_APPS` и в белом режиме
+     * держал там белый список. Переносим его в `WHITELIST_APPS`, а чёрную
+     * ветку оставляем пустой: синтез «всё установленное минус белый список»
+     * под чёрным правилом прочитался бы как настоящий чёрный список и увёл бы
+     * мимо тоннеля почти всё устройство. Профиль, у которого белый ключ уже
+     * заполнен, не трогаем — это состояние новой настройки, а не легаси.
+     */
     suspend fun migrateLegacyWhitelistMode() {
         val currentPrefs = dataStore.data.first()
         if (currentPrefs[SPLIT_TUNNEL_WHITELIST_MIGRATED] == true) return
 
-        val hasLegacyWhitelist =
-            (CsqttConstants.Profiles.MIN_INDEX..CsqttConstants.Profiles.MAX_INDEX).any { profile ->
-            currentPrefs[getProfileKey(IS_WHITELIST, profile)] == true
-        }
-        val installedApps = if (hasLegacyWhitelist) installedSplitTunnelPackages() else emptySet()
         dataStore.edit { prefs ->
             if (prefs[SPLIT_TUNNEL_WHITELIST_MIGRATED] == true) return@edit
 
@@ -1406,19 +1235,10 @@ class SettingsStore(context: Context) {
                 val whitelistKey = getProfileKey(IS_WHITELIST, profile)
                 val appsKey = getProfileKey(EXCLUDED_APPS, profile)
                 val whitelistAppsKey = getProfileKey(WHITELIST_APPS, profile)
-                if (prefs[whitelistAppsKey] == null && prefs[whitelistKey] == true) {
-                    val existing = prefs[appsKey]
-                    if (!existing.isNullOrEmpty()) {
-                        prefs[whitelistAppsKey] = existing
-                    }
-                }
-                if (prefs[whitelistKey] == true) {
-                    val legacyExcluded = prefs[appsKey]
-                        ?.split(",")
-                        ?.filter { it.isNotEmpty() }
-                        ?.toSet()
-                        ?: emptySet()
-                    prefs[appsKey] = (installedApps - legacyExcluded).sorted().joinToString(",")
+                if (prefs[whitelistKey] == true && prefs[whitelistAppsKey] == null) {
+                    val migrated = LegacyAppListsMigration.fromLegacyWhiteList(prefs[appsKey])
+                    prefs[appsKey] = migrated.black
+                    prefs[whitelistAppsKey] = migrated.white
                 }
             }
 
@@ -1426,18 +1246,47 @@ class SettingsStore(context: Context) {
         }
     }
 
-    private fun installedSplitTunnelPackages(): Set<String> {
-        return runCatching {
-            appContext.packageManager
-                .getInstalledApplications(PackageManager.GET_META_DATA)
-                .map { it.packageName }
-                .filter {
-                    it != appContext.packageName &&
-                        !it.contains("vkontakte") &&
-                        !it.contains("vk.calls")
-                }
-                .toSet()
-        }.getOrDefault(emptySet())
+        /**
+     * Одноразовый ремонт чёрной ветки, которую прежняя легаси-миграция успела
+     * синтезировать в белом профиле.
+     *
+     * Миграция 2.5.0/2.5.1 для белого профиля с непустым `EXCLUDED_APPS` писала
+     * туда «все установленные минус старый белый список» и всегда ставила
+     * `SPLIT_TUNNEL_WHITELIST_MIGRATED = true`. Новая [migrateLegacyWhitelistMode]
+     * выходит по этому флагу на первой строке, поэтому до данных обновившихся
+     * пользователей она не доходит. Под чёрным правилом сервера `effectivePackages`
+     * читает именно эту ветку и уводит мимо тоннеля почти всё устройство.
+     *
+     * Поэтому ремонт идёт отдельным ключом и отдельным проходом: у каждого профиля
+     * в белом режиме чёрная ветка очищается. У белого профиля непустой чёрный
+     * список почти всегда синтезирован прежней миграцией; осознанно сохранённый
+     * пользователем список (переключился в чёрный режим, отредактировал, вернулся
+     * в белый) эта миграция тоже затирает — осознанный размен, иначе перевёрнутый
+     * синтез остаётся у всех обновившихся. Профили в чёрном режиме не трогаем: там
+     * чёрный список пользовательский.
+     *
+     * Повторный запуск ничего не меняет: проход закрыт собственным ключом, а не
+     * `SPLIT_TUNNEL_WHITELIST_MIGRATED` (его выставляет любое сохранение списков).
+     */
+    suspend fun repairInvertedLocalBlacklist() {
+        val currentPrefs = dataStore.data.first()
+        if (currentPrefs[SPLIT_TUNNEL_INVERTED_LIST_REPAIRED] == true) return
+
+        dataStore.edit { prefs ->
+            if (prefs[SPLIT_TUNNEL_INVERTED_LIST_REPAIRED] == true) return@edit
+
+            for (profile in CsqttConstants.Profiles.MIN_INDEX..CsqttConstants.Profiles.MAX_INDEX) {
+                val whitelistKey = getProfileKey(IS_WHITELIST, profile)
+                val appsKey = getProfileKey(EXCLUDED_APPS, profile)
+                val repaired = LegacyAppListsMigration.repairedBlacklist(
+                    isWhitelist = prefs[whitelistKey] == true,
+                    black = prefs[appsKey],
+                )
+                if (repaired != null) prefs[appsKey] = repaired
+            }
+
+            prefs[SPLIT_TUNNEL_INVERTED_LIST_REPAIRED] = true
+        }
     }
 
     private fun readSecret(
@@ -1567,15 +1416,6 @@ class SettingsStore(context: Context) {
             exc.put("excluded_apps", prefs[getProfileKey(EXCLUDED_APPS, p)] ?: "")
             exc.put("whitelist_apps", prefs[getProfileKey(WHITELIST_APPS, p)] ?: "")
             exc.put("is_whitelist", prefs[getProfileKey(IS_WHITELIST, p)] ?: false)
-            exc.put("domain_routing_enabled", prefs[getProfileKey(DOMAIN_ROUTING_ENABLED, p)] ?: false)
-            exc.put("domain_is_whitelist", prefs[getProfileKey(DOMAIN_IS_WHITELIST, p)] ?: false)
-            exc.put("template_domains_enabled", prefs[getProfileKey(TEMPLATE_DOMAINS_ENABLED, p)] ?: false)
-            exc.put("direct_domains_black", prefs[getProfileKey(DIRECT_DOMAINS_BLACK, p)] ?: prefs[getProfileKey(DIRECT_DOMAINS, p)] ?: "")
-            exc.put("direct_domains_white", prefs[getProfileKey(DIRECT_DOMAINS_WHITE, p)] ?: "")
-            exc.put("ip_routing_enabled", prefs[getProfileKey(IP_ROUTING_ENABLED, p)] ?: false)
-            exc.put("ip_is_whitelist", prefs[getProfileKey(IP_IS_WHITELIST, p)] ?: false)
-            exc.put("direct_ips_black", prefs[getProfileKey(DIRECT_IPS_BLACK, p)] ?: "")
-            exc.put("direct_ips_white", prefs[getProfileKey(DIRECT_IPS_WHITE, p)] ?: "")
             root.put("exceptions", exc)
         }
 
@@ -1660,15 +1500,6 @@ class SettingsStore(context: Context) {
                     if (exc.has("excluded_apps")) mutable[getProfileKey(EXCLUDED_APPS, p)] = exc.getString("excluded_apps")
                     if (exc.has("whitelist_apps")) mutable[getProfileKey(WHITELIST_APPS, p)] = exc.getString("whitelist_apps")
                     if (exc.has("is_whitelist")) mutable[getProfileKey(IS_WHITELIST, p)] = exc.getBoolean("is_whitelist")
-                    if (exc.has("domain_routing_enabled")) mutable[getProfileKey(DOMAIN_ROUTING_ENABLED, p)] = exc.getBoolean("domain_routing_enabled")
-                    if (exc.has("domain_is_whitelist")) mutable[getProfileKey(DOMAIN_IS_WHITELIST, p)] = exc.getBoolean("domain_is_whitelist")
-                    if (exc.has("template_domains_enabled")) mutable[getProfileKey(TEMPLATE_DOMAINS_ENABLED, p)] = exc.getBoolean("template_domains_enabled")
-                    if (exc.has("direct_domains_black")) mutable[getProfileKey(DIRECT_DOMAINS_BLACK, p)] = exc.getString("direct_domains_black")
-                    if (exc.has("direct_domains_white")) mutable[getProfileKey(DIRECT_DOMAINS_WHITE, p)] = exc.getString("direct_domains_white")
-                    if (exc.has("ip_routing_enabled")) mutable[getProfileKey(IP_ROUTING_ENABLED, p)] = exc.getBoolean("ip_routing_enabled")
-                    if (exc.has("ip_is_whitelist")) mutable[getProfileKey(IP_IS_WHITELIST, p)] = exc.getBoolean("ip_is_whitelist")
-                    if (exc.has("direct_ips_black")) mutable[getProfileKey(DIRECT_IPS_BLACK, p)] = exc.getString("direct_ips_black")
-                    if (exc.has("direct_ips_white")) mutable[getProfileKey(DIRECT_IPS_WHITE, p)] = exc.getString("direct_ips_white")
                 }
                 if (includeSettings && root.has("settings")) {
                     val s = root.getJSONObject("settings")

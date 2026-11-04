@@ -32,8 +32,6 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
-import kotlinx.coroutines.flow.combine
-import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -99,7 +97,6 @@ class TunnelService : Service() {
     private var vkRecoveryJob: Job? = null
     private var autoPauseSettingsJob: Job? = null
     private var autoPauseWifiWatchJob: Job? = null
-    private var domainRoutingSettingsJob: Job? = null
     private val autoPauseMutex = Mutex()
     private val wifiNetworkLock = Any()
     private val physicalWifiNetworks = mutableSetOf<Network>()
@@ -121,7 +118,6 @@ class TunnelService : Service() {
         registerPackageChangeReceiver()
         registerPhysicalNetworkCallback()
         observeAutoPauseOnWifi()
-        observeDomainRoutingSettings()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -226,14 +222,6 @@ class TunnelService : Service() {
                             return@launch
                         }
 
-                        val domainWhite = store.domainIsWhitelist.first()
-                        val domainList = if (domainWhite) store.directDomainsWhite.first() else store.directDomainsBlack.first()
-                        val ipWhite = store.ipIsWhitelist.first()
-                        val ipList = if (ipWhite) store.directIpsWhite.first() else store.directIpsBlack.first()
-                        val hasDomains = if (domainWhite) domainList.isNotBlank() else (domainList.isNotBlank() || store.templateDomainsEnabled.first())
-                        val effectiveDomainEnabled = store.domainRoutingEnabled.first() && hasDomains
-                        val effectiveIpEnabled = IpRoutingPolicy.isEnabled(ipList)   // список и есть переключатель
-
                         val params = TunnelParams(
                             peer = intent.getStringExtra("peer") ?: "",
                             vkHashes = resolvedHashes.value,
@@ -261,13 +249,6 @@ class TunnelService : Service() {
                             allowHashRedistribution = resolvedHashes.allowWorkerRedistribution,
                             vkHashMode = resolvedHashes.mode,
                             vkAccessToken = resolvedHashes.accessToken,
-                            domainRoutingEnabled = effectiveDomainEnabled,
-                            domainIsWhitelist = domainWhite,
-                            templateDomains = if (domainWhite) false else store.templateDomainsEnabled.first(),
-                            directDomains = domainList,
-                            ipRoutingEnabled = effectiveIpEnabled,
-                            ipIsWhitelist = ipWhite,
-                            directIps = ipList,
                         )
                         launch(Dispatchers.Main) {
                             if (isCurrentStart(requestGeneration)) startTunnel(params)
@@ -446,12 +427,6 @@ class TunnelService : Service() {
                         tokenFromLink = source.tokenFromLink,
                     )
                 }
-                val domainWhite = store.domainIsWhitelist.first()
-                val domainList = if (domainWhite) store.directDomainsWhite.first() else store.directDomainsBlack.first()
-                val ipWhite = store.ipIsWhitelist.first()
-                val ipList = if (ipWhite) store.directIpsWhite.first() else store.directIpsBlack.first()
-                val ipRouting = IpRoutingPolicy.isEnabled(ipList)   // список и есть переключатель
-
                 val params = TunnelParams(
                     peer = source.peer,
                     vkHashes = restoredHashes?.value ?: "",
@@ -474,15 +449,6 @@ class TunnelService : Service() {
                     allowHashRedistribution = restoredHashes?.allowWorkerRedistribution == true,
                     vkHashMode = restoredHashes?.mode ?: CsqttConstants.VkAutoHash.MODE_MANUAL,
                     vkAccessToken = restoredHashes?.accessToken.orEmpty(),
-                    domainRoutingEnabled = store.domainRoutingEnabled.first() ||
-                        (!domainWhite && store.templateDomainsEnabled.first()) ||
-                        domainList.isNotBlank(),
-                    domainIsWhitelist = domainWhite,
-                    templateDomains = if (domainWhite) false else store.templateDomainsEnabled.first(),
-                    directDomains = domainList,
-                    ipRoutingEnabled = ipRouting,
-                    ipIsWhitelist = ipWhite,
-                    directIps = ipList,
                 )
                 if (
                     params.peer.isNotEmpty() &&
@@ -978,13 +944,7 @@ class TunnelService : Service() {
 
     private fun onPackageChanged(intent: Intent) {
         if (!TunnelManager.running.value) return
-        // Локальный режим (серверного правила нет) сознательно не покрыт. В
-        // локальном чёрном списке план — `Disallow(список из SettingsStore)`,
-        // поэтому переустановка уже перечисленного приложения оставит его новый
-        // UID внутри тоннеля — тот же дефект, который чинится здесь. Списки
-        // пользователя живут своей жизнью (он отмечает уже установленные
-        // приложения), это отдельная задача.
-        val rule = TunnelManager.activeServerRoutingRule.value ?: return
+        val rule = TunnelManager.activeServerRoutingRule.value
         val changedPackage = intent.data?.schemeSpecificPart?.takeIf { it.isNotEmpty() } ?: return
         val transportPackages = CsqttConstants.General.VK_TRANSPORT_PACKAGES +
             applicationContext.packageName
@@ -995,9 +955,51 @@ class TunnelService : Service() {
             ?.filter { it.isNotEmpty() }
             ?.toSet()
             .orEmpty()
-        if (!PackageChangePolicy.needsVpnRebuild(rule, changedPackage, transportPackages, orangeEnabled)) {
-            return
+        fun localSet(raw: String?) = raw?.split(",")?.filter { it.isNotEmpty() }?.toSet().orEmpty()
+        val needsRebuild = if (rule != null) {
+            val localBlack = localSet(SettingsStore.cachedExcludedApps)
+            val localWhite = localSet(SettingsStore.cachedWhitelistApps)
+            val rulePackages = rule.packages.toSet()
+            // Тот же эффективный набор, что startVpn передаёт в build; предикат
+            // подмены — общий с планом, карточкой и подписью диалога.
+            val effective = MergedRoutingPolicy.effectivePackages(
+                ruleIsWhite = rule.isWhite,
+                rulePackages = rulePackages,
+                localBlack = localBlack,
+                localWhite = localWhite,
+            )
+            fun isInstalledOnDevice(pkg: String) =
+                runCatching {
+                    applicationContext.packageManager.getPackageInfo(pkg, 0)
+                }.isSuccess
+            val substituted = AppRoutingPolicy.isServerWhitelistInvisible(
+                rule.isWhite,
+                effective,
+                ::isInstalledOnDevice,
+            )
+            // Локальный список передаётся реальным: под подменой политика не
+            // считает его элементы частью плана, но ловит их удаление как
+            // переход «в подмену». Обнуление здесь скрыло бы этот переход.
+            val localPackages = if (rule.isWhite) localWhite else localBlack
+            PackageChangePolicy.needsVpnRebuild(
+                rule,
+                changedPackage,
+                transportPackages,
+                orangeEnabled,
+                localPackages,
+                planSubstituted = substituted,
+            )
+        } else {
+            // Локальный режим: правило исчезло — главный список профиля снова
+            // задаёт план. Переустановка пакета из него оставит новый UID не там,
+            // поэтому триггер обязателен и здесь.
+            val isWhitelist = SettingsStore.cachedIsWhitelist ?: false
+            val localPackages = localSet(
+                if (isWhitelist) SettingsStore.cachedWhitelistApps else SettingsStore.cachedExcludedApps
+            )
+            PackageChangePolicy.needsVpnRebuild(isWhitelist, localPackages, changedPackage, transportPackages)
         }
+        if (!needsRebuild) return
 
         // Обновление приложения присылает несколько событий подряд, а пересборка
         // рвёт TCP у UID с изменившимся покрытием: ждём, пока пачка уляжется.
@@ -1087,32 +1089,6 @@ class TunnelService : Service() {
             SettingsStore(applicationContext).autoPauseOnWifi.collect { enabled ->
                 autoPauseOnWifiEnabled = enabled
                 reconcileWifiAutoPause()
-            }
-        }
-    }
-
-    private fun observeDomainRoutingSettings() {
-        domainRoutingSettingsJob?.cancel()
-        domainRoutingSettingsJob = serviceScope.launch {
-            val store = SettingsStore(applicationContext)
-            combine(
-                store.domainRoutingEnabled,
-                store.templateDomainsEnabled,
-                store.directDomains,
-            ) { domainEnabled, templateEnabled, domains ->
-                DomainRoutingUpdate(
-                    enabled = domainEnabled || templateEnabled || domains.isNotBlank(),
-                    templateDomains = templateEnabled,
-                    directDomains = domains,
-                )
-            }.distinctUntilChanged().collect { update ->
-                if (TunnelManager.running.value && !TunnelManager.serverRoutingActive.value) {
-                    TunnelManager.updateDomainRouting(
-                        enabled = update.enabled,
-                        templateDomains = update.templateDomains,
-                        directDomains = update.directDomains,
-                    )
-                }
             }
         }
     }
@@ -1477,8 +1453,6 @@ class TunnelService : Service() {
         startGeneration++
         autoPauseSettingsJob?.cancel()
         autoPauseSettingsJob = null
-        domainRoutingSettingsJob?.cancel()
-        domainRoutingSettingsJob = null
         stopWifiAutoPauseWatch()
         updateJob?.cancel()
         networkSwapJob?.cancel()
@@ -1522,9 +1496,3 @@ class TunnelService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 }
-
-private data class DomainRoutingUpdate(
-    val enabled: Boolean,
-    val templateDomains: Boolean,
-    val directDomains: String,
-)

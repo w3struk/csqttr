@@ -21,19 +21,6 @@ internal data class PresetApps(
 }
 
 /**
- * Итог серверного правила для карточки приложений: сколько установленных
- * приложений реально идёт через туннель, сколько мимо него, а также сколько
- * красных («всегда мимо туннеля») и оранжевых («можно отключить») стоит на
- * устройстве.
- */
-internal data class RoutingCardCounts(
-    val inTunnel: Int,
-    val excluded: Int,
-    val alwaysExcluded: Int,
-    val optOut: Int,
-)
-
-/**
  * Матрица режим × уровень: какие пакеты фактически попадают в туннель.
  *
  * Красный уровень сильнее любого выбора оператора — в белом списке он вычитается
@@ -59,52 +46,25 @@ internal object AppRoutingPolicy {
         if (packageName in userEnabled) userEnabled - packageName else userEnabled + packageName
 
     /**
-     * «Правило на все приложения»: белый список оператора без единого пакета.
-     * Такое правило раздаёт домены и адреса всему устройству — в туннель идёт всё
-     * установленное, кроме пресета. Решение общее для карточки и для
-     * `TunVpnService`, чтобы они не разошлись.
+     * Подмена «на все приложения» (спека §2, §7.8 — решение владельца 2026-10-27):
+     * белый режим серверного правила, эффективный набор непуст, но ни один пакет
+     * не установлен в нашем пользователе (приватное пространство Android обычному
+     * приложению «не видно»). Отличить его от «правило перечислило приложения
+     * другого устройства» нельзя — оба случая трактуются одинаково, осознанно.
+     * Набор — эффективный (правило ∪ локальный список), ровно тот, что `build`
+     * получает как rulePackages; наличие серверного правила гейтит вызывающий
+     * (в build — по hasServerRule; cardCounts существует только под правилом).
+     * Единственный источник правды для build, cardCounts, признака подмены для
+     * подписи диалога (`AppDialogPolicy.substitutionApplied`) и per-UID триггера
+     * (`TunnelService.onPackageChanged` передаёт результат в overload
+     * `PackageChangePolicy.needsVpnRebuild` как `planSubstituted`).
      */
-    fun isDeviceWideRule(isWhite: Boolean, rulePackages: Set<String>): Boolean =
-        isWhite && rulePackages.isEmpty()
-
-    /**
-     * Счётчики для карточки «Маршрутизация приложений»: что серверное правило
-     * делает на этом устройстве.
-     *
-     * Белый режим бывает двух видов. Пустой список пакетов оператора — это
-     * «правило на все приложения» ([isDeviceWideRule]): в туннель идёт всё
-     * установленное, кроме красных и не возвращённых пользователем оранжевых.
-     * Непустой список — обычный белый список. Без серверного правила считать
-     * нечего, поэтому результат `null`: карточка в этом случае показывает
-     * локальные списки.
-     */
-    fun serverRuleCounts(
-        hasServerRule: Boolean,
+    fun isServerWhitelistInvisible(
         isWhite: Boolean,
         rulePackages: Set<String>,
-        preset: PresetApps,
-        userEnabled: Set<String>,
-        installedPackages: Set<String>,
-    ): RoutingCardCounts? {
-        if (!hasServerRule) return null
-        val userOranges = orangeTunnelEnabled(preset, userEnabled)
-        val excluded = if (isWhite) {
-            val inTunnel = if (isDeviceWideRule(isWhite, rulePackages)) {
-                installedPackages - preset.red - (preset.orange - userOranges)
-            } else {
-                (allowedInTunnel(rulePackages, preset) + userOranges) intersect installedPackages
-            }
-            installedPackages - inTunnel
-        } else {
-            (excludedInTunnel(rulePackages, preset) - userOranges) intersect installedPackages
-        }
-        return RoutingCardCounts(
-            inTunnel = (installedPackages - excluded).size,
-            excluded = excluded.size,
-            alwaysExcluded = (preset.red intersect installedPackages).size,
-            optOut = (preset.orange intersect installedPackages).size,
-        )
-    }
+        isInstalled: (String) -> Boolean,
+    ): Boolean =
+        isWhite && rulePackages.isNotEmpty() && rulePackages.none(isInstalled)
 }
 
 /**
@@ -118,12 +78,19 @@ internal sealed interface VpnAppsPlan {
 
     /**
      * Мимо туннеля идут эти пакеты. CSQTT исключает себя отдельно и первым,
-     * потому что ошибка именно на этом шаге фатальна для VPN; [deviceWide]
-     * отличает «правило на все приложения» от обычного чёрного списка.
+     * потому что ошибка именно на этом шаге фатальна для VPN.
+     *
+     * @param deviceWide план покрывает всё устройство минус [packages]; в новой
+     *   семантике истинно только при [substituted] — других источников
+     *   device-wide нет.
+     * @param substituted подмена: белый список правила непуст, но ни один пакет
+     *   не установлен — правило применено ко всем приложениям, кроме пресета и
+     *   транспорта (спека §7.8).
      */
     data class Disallow(
         val packages: List<String>,
         val deviceWide: Boolean = false,
+        val substituted: Boolean = false,
     ) : VpnAppsPlan
 
     /** VPN поднимать нельзя: [message] называет настоящую причину отказа. */
@@ -176,38 +143,43 @@ internal object VpnAppRouting {
         val installedIncluded = allowedSet
             .filter { pkg -> pkg !in transportPackages && isInstalled(pkg) }
             .toSet()
-        // Ветку «правило на все приложения» выбирает список оператора, а не
-        // эффективный набор: иначе непустой U сделал бы набор непустым и сузил бы VPN
-        // до одного разрешённого оранжевого приложения вместо «все приложения, кроме
-        // пресета». Признак общий с карточкой — [AppRoutingPolicy.isDeviceWideRule].
-        val deviceWide = hasServerRule && AppRoutingPolicy.isDeviceWideRule(isWhite, rulePackages)
-        if (installedIncluded.isNotEmpty() && !deviceWide) {
-            return VpnAppsPlan.Allow(installedIncluded.toList())
-        }
-
-        // An empty server package list means a device-wide domain/IP rule.
-        // A nonempty list with no installed matches must never broaden to all apps.
-        if (!deviceWide) {
-            return VpnAppsPlan.Failure(
-                emptyWhitelistMessage(
-                    hasServerRule = hasServerRule,
-                    rulePackages = rulePackages,
-                    preset = preset,
-                    orangeEnabled = orangeEnabled,
-                    transportPackages = transportPackages,
-                    isInstalled = isInstalled,
-                )
-            )
-        }
-
+        // Подмена (спека §2, §7.8): белый набор правила непуст, но ни один его
+        // пакет не установлен — правило применяется ко всем приложениям, кроме
+        // пресета и транспорта. Предикат оценивается по эффективному набору до
+        // возвращённых оранжевых, а проверка стоит до ветки Allow: иначе
+        // установленный возвращённый оранжевый сузил бы план до одного приложения,
+        // пока карточка и подпись в диалоге показывают device-wide.
+        val substituted = hasServerRule &&
+            AppRoutingPolicy.isServerWhitelistInvisible(isWhite, rulePackages, isInstalled)
         // Пресет идёт мимо туннеля вместе со всеми остальными. Оранжевые из U не
         // исключаются — пользователь вернул их в туннель.
         val disallowed = (transportPackages - selfPackage) +
             (AppRoutingPolicy.forcedExcluded(preset) + (preset.orange - orangeEnabled))
                 .filter { it !in transportPackages }
-        return VpnAppsPlan.Disallow(
-            packages = disallowed.filter { it != selfPackage && isInstalled(it) },
-            deviceWide = true,
+        if (substituted) {
+            return VpnAppsPlan.Disallow(
+                packages = disallowed.filter { it != selfPackage && isInstalled(it) },
+                deviceWide = true,
+                substituted = true,
+            )
+        }
+
+        if (installedIncluded.isNotEmpty()) {
+            return VpnAppsPlan.Allow(installedIncluded.toList())
+        }
+
+        // Пустой эффективный белый набор — отказ в обоих режимах: пустой список
+        // значит «никто», а не «все» (спека §7.9).
+        return VpnAppsPlan.Failure(
+            emptyWhitelistMessage(
+                hasServerRule = hasServerRule,
+                isWhite = isWhite,
+                rulePackages = rulePackages,
+                preset = preset,
+                orangeEnabled = orangeEnabled,
+                transportPackages = transportPackages,
+                isInstalled = isInstalled,
+            )
         )
     }
 
@@ -226,9 +198,21 @@ internal object VpnAppRouting {
      * в локальном режиме (там оранжевых нет), и когда приложения просто не
      * установлены. Совет зависит от причины: если причин несколько, он называет
      * действие для каждой.
+     *
+     * Пустой список — это «никто», а не «все» (спека §7.9), одинаково в обоих
+     * режимах. Серверный вариант «ни одно приложение из правила не установлено»
+     * недостижим: непустой невидимый набор перехватывает подмена, а пустой
+     * уходит в первую ветку.
+     *
+     * Пустой серверный белый список обязан назвать режим правила и список,
+     * который надо заполнить: после терминального отказа UI теряет правило и
+     * падает в режим профиля, поэтому пользователь с чёрным профилем по
+     * умолчанию правит чёрный список, а отказ повторяется. Текст — единственное,
+     * что связывает его с белым списком.
      */
     private fun emptyWhitelistMessage(
         hasServerRule: Boolean,
+        isWhite: Boolean,
         rulePackages: Set<String>,
         preset: PresetApps,
         orangeEnabled: Set<String>,
@@ -236,15 +220,17 @@ internal object VpnAppRouting {
         isInstalled: (String) -> Boolean,
     ): String {
         if (rulePackages.isEmpty()) {
-            return "Whitelist пуст: выберите приложения, которые должны идти через туннель"
+            if (!hasServerRule) {
+                return "Whitelist пуст: выберите приложения, которые должны идти через туннель"
+            }
+            val mode = if (isWhite) "белом" else "чёрном"
+            val list = if (isWhite) "белый" else "чёрный"
+            return "Whitelist пуст: правило сервера задано в $mode режиме — " +
+                "добавьте приложения в $list список"
         }
         val installedRule = rulePackages.filter(isInstalled)
         if (installedRule.isEmpty()) {
-            return if (hasServerRule) {
-                "Whitelist пуст: ни одно приложение из правила сервера не установлено на устройстве"
-            } else {
-                "Whitelist пуст: ни одно выбранное приложение не установлено на устройстве"
-            }
+            return "Whitelist пуст: ни одно выбранное приложение не установлено на устройстве"
         }
         val reasons = buildList {
             if (installedRule.any { it in preset.red }) {

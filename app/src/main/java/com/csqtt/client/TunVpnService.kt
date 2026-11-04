@@ -171,20 +171,31 @@ class TunVpnService : VpnService() {
         vpnMutex.withLock {
         try {
             val serverRule = TunnelManager.activeServerRoutingRule.value
+            // Оба локальных списка читаются всегда: под правилом нужен тот,
+            // что соответствует режиму оператора (правило чёрное — чёрный,
+            // белое — белый), в локальном режиме главный список профиля.
+            val settingsStore = SettingsStore(applicationContext)
+            fun localList(raw: String) = raw.split(",").filter { it.isNotEmpty() }.toSet()
+            val localBlack = localList(settingsStore.excludedApps.first())
+            val localWhite = localList(settingsStore.whitelistApps.first())
             val isWhitelist: Boolean
             val userSelected: Set<String>
             if (serverRule != null) {
                 isWhitelist = serverRule.isWhite
-                userSelected = serverRule.packages.filter { it.isNotEmpty() }.toSet()
+                // Правило сервера поверх локального списка, а не вместо него:
+                // режим задаёт оператор, дополнения — пользователь. Объединённый
+                // набор уходит в VpnAppRouting.build, который не знает о его
+                // происхождении; подмену невидимого белого списка build решает
+                // тем же предикатом, что карточка и per-UID триггер.
+                userSelected = MergedRoutingPolicy.effectivePackages(
+                    ruleIsWhite = serverRule.isWhite,
+                    rulePackages = serverRule.packages.filter { it.isNotEmpty() }.toSet(),
+                    localBlack = localBlack,
+                    localWhite = localWhite,
+                )
             } else {
-                val settingsStore = SettingsStore(applicationContext)
                 isWhitelist = settingsStore.isWhitelist.first()
-                val savedApps = if (isWhitelist) {
-                    settingsStore.whitelistApps.first()
-                } else {
-                    settingsStore.excludedApps.first()
-                }
-                userSelected = savedApps.split(",").filter { it.isNotEmpty() }.toSet()
+                userSelected = if (isWhitelist) localWhite else localBlack
             }
             // Пресет существует только вместе с серверным правилом: в локальном режиме
             // его нет, и поведение остаётся прежним.
@@ -244,24 +255,10 @@ class TunVpnService : VpnService() {
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 try {
-                    val ipWhite: Boolean
-                    val ipListStr: String
-                    if (serverRule != null) {
-                        ipWhite = serverRule.ipIsWhite
-                        ipListStr = serverRule.ips.joinToString(",")
-                    } else {
-                        val settingsStore = SettingsStore(applicationContext)
-                        ipWhite = settingsStore.ipIsWhitelist.first()
-                        // IP-роутинг включается ровно тогда, когда список непуст: отдельного
-                        // выключателя нет (сохранение IP ставит ipRoutingEnabled, ничего его не
-                        // снимает, у старых конфигов его нет), значит список и есть намерение —
-                        // то же правило, что в командной строке клиента и в сборщиках TunnelParams
-                        ipListStr = if (ipWhite) {
-                            settingsStore.directIpsWhite.first()
-                        } else {
-                            settingsStore.directIpsBlack.first()
-                        }
-                    }
+                    // Исключённые маршруты строятся только из правила сервера: локальных
+                    // списков адресов больше нет, в локальном режиме адресов не исключаем.
+                    val ipWhite = serverRule?.ipIsWhite ?: false
+                    val ipListStr = serverRule?.ips?.joinToString(",").orEmpty()
 
                     if (!ipWhite && ipListStr.isNotBlank()) {
                         ipListStr.split(",", " ", "\n", "\t")
@@ -357,6 +354,14 @@ class TunVpnService : VpnService() {
                     }
                     if (appsPlan.deviceWide) {
                         Log.i(TAG, "Server rule applies to all applications (no package filter)")
+                    }
+                    if (appsPlan.substituted) {
+                        TunnelManager.updateLog(
+                            "vpn_whitelist_fallback",
+                            "[TUN] Белый список правила сервера не содержит установленных приложений: " +
+                                "правило применено ко всем приложениям, кроме пресета и транспорта",
+                            30,
+                        )
                     }
                     appsPlan.packages.forEach { pkg ->
                         try { builder.addDisallowedApplication(pkg) } catch (_: Exception) {}

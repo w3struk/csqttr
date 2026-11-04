@@ -42,6 +42,7 @@ internal data class AppItem(
     val icon: ImageBitmap?,
     val isSystem: Boolean,
     val presetRisk: PresetRisk? = null,
+    val serverRule: Boolean = false,
 )
 
 @Composable
@@ -130,6 +131,19 @@ internal fun AppRow(
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f),
                     )
+                    if (app.serverRule) {
+                        Surface(
+                            shape = CsqttShapes.Small,
+                            color = colors.surfaceVariant,
+                            contentColor = colors.onSurfaceVariant,
+                        ) {
+                            Text(
+                                text = "Правило сервера",
+                                style = MaterialTheme.typography.labelSmall,
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                            )
+                        }
+                    }
                     if (app.isSystem) {
                         Surface(
                             shape = CsqttShapes.Small,

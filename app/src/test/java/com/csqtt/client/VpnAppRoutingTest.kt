@@ -7,8 +7,8 @@ import org.junit.Test
 
 /**
  * Проверяет решение, которое `TunVpnService` передаёт в `VpnService.Builder`,
- * без Android: чёрный режим, обычный белый список, белый список «на все
- * приложения» и отказ поднять VPN.
+ * без Android: чёрный режим, обычный белый список, отказ при пустом наборе и
+ * подмена невидимого белого списка.
  */
 class VpnAppRoutingTest {
 
@@ -149,12 +149,60 @@ class VpnAppRoutingTest {
     }
 
     @Test
-    fun emptyServerWhitelistExcludesThePresetFromAllApps() {
+    fun `emptyServerWhitelistFailsWithTheRealCause`() {
         val plan = build(isWhite = true, rulePackages = emptySet())
 
-        assertTrue("правило на все приложения — это disallow-список", plan is VpnAppsPlan.Disallow)
+        assertTrue("пустой белый список не поднимает VPN", plan is VpnAppsPlan.Failure)
+        val message = (plan as VpnAppsPlan.Failure).message
+        assertTrue(
+            "текст называет режим правила: $message",
+            message.contains("правило сервера задано в белом режиме"),
+        )
+        assertTrue(
+            "и список, который надо заполнить: $message",
+            message.contains("белый список"),
+        )
+    }
+
+    @Test
+    fun `emptyServerWhitelistWithARestoredOrangeCarriesJustThatOrange`() {
+        val plan = build(
+            isWhite = true,
+            rulePackages = emptySet(),
+            orangeEnabled = setOf("ru.sberbankmobile"),
+        )
+
+        assertEquals(
+            "возвращённый оранжевый — элемент белого списка и идёт в туннель один",
+            listOf("ru.sberbankmobile"),
+            (plan as VpnAppsPlan.Allow).packages,
+        )
+    }
+
+    @Test
+    fun `localWhitelistOfUninstalledPackagesStillFailsWithTheRealCause`() {
+        val plan = build(
+            isWhite = true,
+            rulePackages = setOf("com.example.notinstalled"),
+            hasServerRule = false,
+        )
+
+        val message = (plan as VpnAppsPlan.Failure).message
+        assertTrue(
+            "текст называет неустановленные приложения: $message",
+            message.contains("не установлено"),
+        )
+        assertFalse("и не врёт про оранжевые", message.contains("оранж"))
+    }
+
+    @Test
+    fun `serverWhitelistOfInvisiblePackagesFallsBackToAllApps`() {
+        val plan = build(isWhite = true, rulePackages = setOf("com.example.notinstalled"))
+
+        assertTrue("подмена — это disallow-план", plan is VpnAppsPlan.Disallow)
         val disallow = plan as VpnAppsPlan.Disallow
-        assertTrue("ветка «на все приложения»", disallow.deviceWide)
+        assertTrue("план покрывает всё устройство", disallow.deviceWide)
+        assertTrue("и помечен подменой", disallow.substituted)
         assertFalse("себя сервис исключает отдельно", self in disallow.packages)
         assertEquals(
             "мимо туннеля идут транспорт и весь пресет",
@@ -164,15 +212,65 @@ class VpnAppRoutingTest {
     }
 
     @Test
-    fun deviceWideRuleStillReturnsAnOrangeTheUserRestored() {
+    fun `aVisiblePackageInTheMergedSetKeepsTheAllowPlan`() {
         val plan = build(
             isWhite = true,
+            rulePackages = setOf("com.example.notinstalled", "org.telegram.messenger"),
+        )
+
+        assertEquals(
+            "видимый пакет уважается — подмены нет",
+            listOf("org.telegram.messenger"),
+            (plan as VpnAppsPlan.Allow).packages,
+        )
+    }
+
+    @Test
+    fun `anInvisibleRuleWithARestoredOrangeStillFallsBackToAllApps`() {
+        val plan = build(
+            isWhite = true,
+            rulePackages = setOf("com.example.notinstalled"),
+            orangeEnabled = setOf("ru.sberbankmobile"),
+        )
+
+        assertTrue("подмена проверяется до ветки Allow", plan is VpnAppsPlan.Disallow)
+        val disallow = plan as VpnAppsPlan.Disallow
+        assertTrue("план остаётся device-wide", disallow.deviceWide)
+        assertTrue("и помечен подменой", disallow.substituted)
+        assertEquals(
+            "возвращённый оранжевый в туннеле, в disallow-списке его нет",
+            setOf("com.vkontakte.android", "com.bank"),
+            disallow.packages.toSet(),
+        )
+    }
+
+    @Test
+    fun `blackRuleWithEmptyPackagesTunnelsTheDeviceExceptPresetAndTransport`() {
+        val plan = build(isWhite = false, rulePackages = emptySet())
+
+        assertTrue("чёрное пустое правило — disallow-план", plan is VpnAppsPlan.Disallow)
+        val disallow = plan as VpnAppsPlan.Disallow
+        assertFalse("это не подмена", disallow.deviceWide)
+        assertFalse("и не помечено подменой", disallow.substituted)
+        assertFalse("себя сервис исключает отдельно", self in disallow.packages)
+        assertEquals(
+            "мимо туннеля идут транспорт и весь пресет",
+            setOf("com.vkontakte.android", "com.bank", "ru.sberbankmobile"),
+            disallow.packages.toSet(),
+        )
+    }
+
+    @Test
+    fun `blackRuleWithEmptyPackagesStillReturnsTheOrangeTheUserRestored`() {
+        val plan = build(
+            isWhite = false,
             rulePackages = emptySet(),
             orangeEnabled = setOf("ru.sberbankmobile"),
         ) as VpnAppsPlan.Disallow
 
+        assertFalse("это по-прежнему чёрный план, не подмена", plan.deviceWide)
         assertEquals(
-            "возвращённый оранжевый не исключается",
+            "возвращённый оранжевый в туннеле, в disallow-списке его нет",
             setOf("com.vkontakte.android", "com.bank"),
             plan.packages.toSet(),
         )
@@ -189,18 +287,10 @@ class VpnAppRoutingTest {
             message.contains("выберите приложения"),
         )
         assertFalse("в локальном режиме оранжевых нет", message.contains("оранж"))
-    }
-
-    @Test
-    fun whitelistOfDisabledAppsFailsWithTheRealCause() {
-        val plan = build(isWhite = true, rulePackages = setOf("com.example.notinstalled"))
-
-        val message = (plan as VpnAppsPlan.Failure).message
-        assertTrue(
-            "текст называет неустановленные приложения: $message",
-            message.contains("не установлено"),
+        assertFalse(
+            "и режима серверного правила тоже нет: $message",
+            message.contains("правило сервера"),
         )
-        assertFalse("и не врёт про оранжевые", message.contains("верните оранжевые"))
     }
 
     @Test

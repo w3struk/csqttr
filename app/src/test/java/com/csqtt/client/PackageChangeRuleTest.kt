@@ -66,14 +66,14 @@ class PackageChangeRuleTest {
     }
 
     @Test
-    fun `a device-wide whitelist reacts to the preset and the transport`() {
-        val deviceWide = rule(isWhite = true, packages = emptyList())
+    fun `an empty whitelist reacts like a plain allow plan`() {
+        val empty = rule(isWhite = true, packages = emptyList())
 
-        assertTrue(needsRebuild(deviceWide, red))
-        assertTrue(needsRebuild(deviceWide, orange))
-        assertTrue(needsRebuild(deviceWide, CsqttConstants.General.PACKAGE_VK))
-        assertTrue(needsRebuild(deviceWide, self))
-        assertFalse(needsRebuild(deviceWide, "org.telegram.messenger"))
+        assertFalse("без подмены план ничего не исключает", needsRebuild(empty, red))
+        assertFalse(needsRebuild(empty, orange))
+        assertFalse(needsRebuild(empty, CsqttConstants.General.PACKAGE_VK))
+        assertFalse(needsRebuild(empty, self))
+        assertFalse(needsRebuild(empty, "org.telegram.messenger"))
     }
 
     @Test

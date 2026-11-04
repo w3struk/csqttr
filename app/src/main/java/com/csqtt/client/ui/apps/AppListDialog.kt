@@ -58,7 +58,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
-import com.csqtt.client.AppRoutingPolicy
 import com.csqtt.client.PresetApps
 import com.csqtt.client.PresetRisk
 import com.csqtt.client.R
@@ -94,6 +93,7 @@ internal fun AppListDialog(
     onSwitchMode: (Boolean) -> Unit,
     onClose: () -> Unit,
     serverLocked: Boolean = false,
+    substituted: Boolean = false,
     lockedPackages: Set<String> = emptySet(),
     preset: PresetApps = PresetApps(red = emptySet(), orange = emptySet()),
     orangeTunnelEnabled: Set<String> = emptySet(),
@@ -103,20 +103,7 @@ internal fun AppListDialog(
     val appListState = rememberLazyListState()
     var menuExpanded by remember { mutableStateOf(false) }
 
-    // The preset lists only say which packages exist in a level; the sections
-    // show the ones actually installed on the device. `appsList` is already
-    // narrowed by the caller, so the sections must not claim a device-wide
-    // installed count while a filter is on.
-    fun installedPresetApps(pkgs: Set<String>): List<AppItem> =
-        appsList.filter { it.packageName in pkgs }
-
     val filtersActive = searchQuery.isNotBlank() || !showSystemApps
-
-    // A white rule without packages — «правило на все приложения» — routes every
-    // installed app through the tunnel. The predicate is shared with the routing
-    // card and `TunVpnService` so the checkbox cannot disagree with them.
-    val isDeviceWideRule = serverLocked &&
-        AppRoutingPolicy.isDeviceWideRule(isWhitelist, lockedPackages)
 
     // The viewport resets on mode and query changes so the selected group is
     // visible again.
@@ -392,14 +379,33 @@ internal fun AppListDialog(
                     )
                 }
 
-                Text(
-                    text = stringResource(R.string.exceptions_selected_count, activeSelection.size),
-                    style = MaterialTheme.typography.labelLarge,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                    softWrap = false,
-                    overflow = TextOverflow.Ellipsis,
-                )
+                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(
+                        text = stringResource(R.string.exceptions_selected_count, activeSelection.size),
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        softWrap = false,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    // Подмена: белый список правила непуст, но ни одного из его
+                    // пакетов нет среди установленных (например, они в приватном
+                    // пространстве). Тогда план — «все приложения», и пользовательский
+                    // выбор на него не влияет. Признак считается вызывающим по
+                    // нефильтрованному набору установленных тем же предикатом, что у
+                    // сборщика плана, счётчиков карточки и per-UID триггера.
+                    if (serverLocked) {
+                        Text(
+                            text = if (substituted) {
+                                "Ваши выборы не применяются, пока действует правило на все приложения"
+                            } else {
+                                "Режим задан правилом сервера. Вы редактируете свой ${if (isWhitelist) "белый" else "чёрный"} список — он дополняет правило"
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
 
                 // The preset sections are rendered as elements of the list below,
                 // not as a fixed column above it: they have to scroll with the
@@ -442,77 +448,110 @@ internal fun AppListDialog(
                             contentPadding = PaddingValues(bottom = 8.dp),
                             verticalArrangement = Arrangement.spacedBy(CsqttSpacing.Xs),
                         ) {
-                            if (serverLocked && preset.all.isNotEmpty()) {
-                                presetSection(
-                                    title = "Всегда мимо туннеля",
-                                    installed = installedPresetApps(preset.red),
-                                    totalInPreset = preset.red.size,
-                                    risk = PresetRisk.RED,
-                                    isWhitelist = isWhitelist,
-                                    orangeTunnelEnabled = orangeTunnelEnabled,
-                                    filtersActive = filtersActive,
-                                    onToggleOrange = onToggleOrange,
-                                )
-                                presetSection(
-                                    title = "Можно отключить",
-                                    installed = installedPresetApps(preset.orange),
-                                    totalInPreset = preset.orange.size,
-                                    risk = PresetRisk.ORANGE,
-                                    isWhitelist = isWhitelist,
-                                    orangeTunnelEnabled = orangeTunnelEnabled,
-                                    filtersActive = filtersActive,
-                                    onToggleOrange = onToggleOrange,
-                                )
-                            }
+                            val sections = AppDialogPolicy.buildSections(
+                                apps = appsList,
+                                packageName = { it.packageName },
+                                ruleActive = serverLocked,
+                                rulePackages = lockedPackages,
+                                preset = preset,
+                            )
 
-                            items(
-                                items = appsList,
-                                key = { it.packageName },
-                                contentType = { "application" },
-                            ) { app ->
-                                val risk = preset.riskOf(app.packageName)
-                                when {
-                                    // Preset rows win over the lock: an orange
-                                    // package stays under user control even
-                                    // when the operator's rule lists it.
-                                    risk != null -> AppRow(
-                                        app = app.copy(presetRisk = risk),
-                                        isSelected = presetRowChecked(
-                                            risk = risk,
-                                            isWhitelist = isWhitelist,
-                                            packageName = app.packageName,
-                                            orangeTunnelEnabled = orangeTunnelEnabled,
-                                        ),
-                                        enabled = risk == PresetRisk.ORANGE,
-                                        onClick = {
-                                            if (risk == PresetRisk.ORANGE) onToggleOrange(app.packageName)
-                                        },
-                                    )
+                            sections.forEach { section ->
+                                when (section.source) {
+                                    AppSectionSource.RED -> {
+                                        item(key = "header-${section.source.name}", contentType = "preset-header") {
+                                            PresetSectionHeader(
+                                                title = section.title,
+                                                shownCount = section.rows.size,
+                                                totalInPreset = section.total,
+                                                risk = PresetRisk.RED,
+                                                filtersActive = filtersActive,
+                                            )
+                                        }
+                                        items(
+                                            items = section.rows,
+                                            key = { "section-${section.source.name}-${it.packageName}" },
+                                            contentType = { "preset-row" },
+                                        ) { app ->
+                                            AppRow(
+                                                app = app.copy(presetRisk = PresetRisk.RED),
+                                                isSelected = presetRowChecked(
+                                                    risk = PresetRisk.RED,
+                                                    isWhitelist = isWhitelist,
+                                                    packageName = app.packageName,
+                                                    orangeTunnelEnabled = orangeTunnelEnabled,
+                                                ),
+                                                enabled = false,
+                                                onClick = {},
+                                            )
+                                        }
+                                    }
 
-                                    serverLocked && app.packageName in lockedPackages -> AppRow(
-                                        app = app,
-                                        isSelected = true,
-                                        enabled = false,
-                                        onClick = {},
-                                    )
+                                    AppSectionSource.SERVER -> {
+                                        item(key = "header-${section.source.name}", contentType = "server-header") {
+                                            ServerSectionHeader(
+                                                title = section.title,
+                                                shownCount = section.rows.size,
+                                                totalInRule = section.total,
+                                                filtersActive = filtersActive,
+                                            )
+                                        }
+                                        items(
+                                            items = section.rows,
+                                            key = { "section-${section.source.name}-${it.packageName}" },
+                                            contentType = { "server-row" },
+                                        ) { app ->
+                                            AppRow(
+                                                app = app.copy(serverRule = true),
+                                                isSelected = true,
+                                                enabled = false,
+                                                onClick = {},
+                                            )
+                                        }
+                                    }
 
-                                    // Reached only under a server rule: the row
-                                    // cannot change routing, so it must not
-                                    // pretend the user can toggle it. Under a
-                                    // device-wide rule every non-preset app goes
-                                    // through the tunnel, hence the checked box.
-                                    serverLocked -> AppRow(
-                                        app = app,
-                                        isSelected = isDeviceWideRule,
-                                        enabled = false,
-                                        onClick = {},
-                                    )
+                                    AppSectionSource.ORANGE -> {
+                                        item(key = "header-${section.source.name}", contentType = "preset-header") {
+                                            PresetSectionHeader(
+                                                title = section.title,
+                                                shownCount = section.rows.size,
+                                                totalInPreset = section.total,
+                                                risk = PresetRisk.ORANGE,
+                                                filtersActive = filtersActive,
+                                            )
+                                        }
+                                        items(
+                                            items = section.rows,
+                                            key = { "section-${section.source.name}-${it.packageName}" },
+                                            contentType = { "preset-row" },
+                                        ) { app ->
+                                            AppRow(
+                                                app = app.copy(presetRisk = PresetRisk.ORANGE),
+                                                isSelected = presetRowChecked(
+                                                    risk = PresetRisk.ORANGE,
+                                                    isWhitelist = isWhitelist,
+                                                    packageName = app.packageName,
+                                                    orangeTunnelEnabled = orangeTunnelEnabled,
+                                                ),
+                                                enabled = true,
+                                                onClick = { onToggleOrange(app.packageName) },
+                                            )
+                                        }
+                                    }
 
-                                    else -> AppRow(
-                                        app = app,
-                                        isSelected = app.packageName in activeSelection,
-                                        onClick = { onToggleApp(app.packageName) },
-                                    )
+                                    AppSectionSource.USER -> {
+                                        items(
+                                            items = section.rows,
+                                            key = { "section-${section.source.name}-${it.packageName}" },
+                                            contentType = { "application" },
+                                        ) { app ->
+                                            AppRow(
+                                                app = app,
+                                                isSelected = app.packageName in activeSelection,
+                                                onClick = { onToggleApp(app.packageName) },
+                                            )
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -541,50 +580,54 @@ private fun presetRowChecked(
                          else packageName !in orangeTunnelEnabled
 }
 
-/**
- * One preset level, emitted as regular items of the app list so the section
- * scrolls with the list and never takes a fixed slice of the dialog height.
- * Red rows are informational only, orange rows stay under user control.
- *
- * Keys are prefixed by the level: the same package can appear both here and in
- * the list below, and the list requires keys to be unique.
- */
-private fun LazyListScope.presetSection(
+@Composable
+private fun ServerSectionHeader(
     title: String,
-    installed: List<AppItem>,
-    totalInPreset: Int,
-    risk: PresetRisk,
-    isWhitelist: Boolean,
-    orangeTunnelEnabled: Set<String>,
+    shownCount: Int,
+    totalInRule: Int,
     filtersActive: Boolean,
-    onToggleOrange: (String) -> Unit,
 ) {
-    item(key = "preset-header-${risk.name}", contentType = "preset-header") {
-        PresetSectionHeader(
-            title = title,
-            shownCount = installed.size,
-            totalInPreset = totalInPreset,
-            risk = risk,
-            filtersActive = filtersActive,
-        )
-    }
-    items(
-        items = installed,
-        key = { "preset-${risk.name}-${it.packageName}" },
-        contentType = { "preset-row" },
-    ) { item ->
-        AppRow(
-            app = item.copy(presetRisk = risk),
-            isSelected = presetRowChecked(risk, isWhitelist, item.packageName, orangeTunnelEnabled),
-            enabled = risk == PresetRisk.ORANGE,
-            // Red rows are informational: the toggle is spelled out per level
-            // instead of relying on the row ignoring clicks.
-            onClick = if (risk == PresetRisk.ORANGE) {
-                { onToggleOrange(item.packageName) }
-            } else {
-                {}
-            },
-        )
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = CsqttSpacing.Xs),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 1,
+                softWrap = false,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            Text(
+                text = if (filtersActive) "Показано: $shownCount" else "Установлено: $shownCount",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                softWrap = false,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        if (shownCount == 0) {
+            Text(
+                text = if (filtersActive) {
+                    "нет совпадений с фильтром"
+                } else {
+                    "не установлено ни одного приложения (в правиле $totalInRule)"
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
     }
 }
 

@@ -38,10 +38,7 @@ class SettingsStoreExportImportProfileTest {
         "DEPLOY_IP", "DEPLOY_LOGIN", "DEPLOY_SSH_PORT", "SERVER_WEB_PORT", "DOCKER_INSTALL",
         "SSH_KEYS_MODE", "VK_HASHES", "SECONDARY_VK_HASH", "VK_AUTH_MODE", "VK_HASH_MODE",
         "WORKERS_PER_HASH", "EXTRA_WORKERS", "CSQTT_LINK", "CSQTT_LINK_MODE",
-        "EXCLUDED_APPS", "WHITELIST_APPS", "IS_WHITELIST", "DOMAIN_ROUTING_ENABLED",
-        "DOMAIN_IS_WHITELIST", "TEMPLATE_DOMAINS_ENABLED",
-        "DIRECT_DOMAINS_BLACK", "DIRECT_DOMAINS", "DIRECT_DOMAINS_WHITE", "IP_ROUTING_ENABLED",
-        "IP_IS_WHITELIST", "DIRECT_IPS_BLACK", "DIRECT_IPS_WHITE",
+        "EXCLUDED_APPS", "WHITELIST_APPS", "IS_WHITELIST",
         "SELECTED_FINGERPRINT", "SELECTED_TURN_SUBNET", "TURN_SUBNET_IP_LIMIT",
         "PARTICIPANT_SHOW_LOGS",
     )
@@ -93,6 +90,27 @@ class SettingsStoreExportImportProfileTest {
             "экспорт не должен уносить токен доступа VK",
             exportBody.contains("""put("vk_access_token""""),
         )
+    }
+
+    @Test
+    fun `the export and import no longer carry domain or IP settings`() {
+        val removed = listOf(
+            "DOMAIN_ROUTING_ENABLED", "DOMAIN_IS_WHITELIST", "TEMPLATE_DOMAINS_ENABLED",
+            "DIRECT_DOMAINS", "DIRECT_DOMAINS_BLACK", "DIRECT_DOMAINS_WHITE",
+            "IP_ROUTING_ENABLED", "IP_IS_WHITELIST", "DIRECT_IPS_BLACK", "DIRECT_IPS_WHITE",
+        )
+        for (key in removed) {
+            assertFalse("экспорт всё ещё переносит $key", exportBody.contains(key))
+            assertFalse("импорт всё ещё переносит $key", importBody.contains(key))
+        }
+        for (jsonName in listOf(
+            "domain_routing_enabled", "domain_is_whitelist", "template_domains_enabled",
+            "direct_domains", "direct_ips",
+            "ip_routing_enabled", "ip_is_whitelist", "direct_ips_black", "direct_ips_white",
+        )) {
+            assertFalse("экспорт всё ещё пишет $jsonName", exportBody.contains("\"$jsonName\""))
+            assertFalse("импорт всё ещё читает $jsonName", importBody.contains("\"$jsonName\""))
+        }
     }
 
     @Test

@@ -13,7 +13,6 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.SupervisorJob
@@ -1137,50 +1136,6 @@ object TunnelManager {
         }
         cmd.add("-captcha-mode")
         cmd.add(params.captchaMode)
-        val isDomainRoutingActive = params.domainRoutingEnabled || params.templateDomains || params.directDomains.isNotBlank()
-        if (isDomainRoutingActive) {
-            cmd.add("--domain-routing")
-            if (params.domainIsWhitelist) {
-                cmd.add("--domain-whitelist")
-            }
-            if (params.templateDomains && !params.domainIsWhitelist) {
-                cmd.add("--template-domains")
-                val templateFile = java.io.File(context.filesDir, "domains.txt")
-                if (!templateFile.exists() || templateFile.length() == 0L) {
-                    runCatching {
-                        context.assets.open("domains.txt").use { input ->
-                            templateFile.outputStream().use { output -> input.copyTo(output) }
-                        }
-                    }
-                }
-                if (templateFile.exists() && templateFile.length() > 0L) {
-                    cmd.add("--domains-file")
-                    cmd.add(templateFile.absolutePath)
-                }
-            }
-            if (params.directDomains.isNotBlank()) {
-                val userFile = java.io.File(context.filesDir, "user.txt")
-                runCatching {
-                    val content = params.directDomains.split(',').filter { it.isNotBlank() }.joinToString("\n")
-                    userFile.writeText(content)
-                }
-                if (userFile.exists() && userFile.length() > 0L) {
-                    cmd.add("--domains-file")
-                    cmd.add(userFile.absolutePath)
-                }
-            }
-        }
-        if (params.ipRoutingEnabled || params.directIps.isNotBlank()) {
-            cmd.add("--ip-routing")
-            if (params.ipIsWhitelist) {
-                cmd.add("--ip-whitelist")
-            }
-            if (params.directIps.isNotBlank()) {
-                cmd.add("--direct-ips")
-                cmd.add(params.directIps)
-            }
-        }
-
         val pb = ProcessBuilder(cmd)
         pb.directory(context.filesDir)
         pb.redirectErrorStream(false)
@@ -2064,6 +2019,16 @@ object TunnelManager {
 
         activeContext()?.let { ctx ->
             if (newServerRule != null) {
+                // Rust-клиент молча режет список до 1024 доменов (rust-client/dispatcher.rs),
+                // поэтому о потере хвоста говорит журнал приложения.
+                if (newServerRule.domains.size > 1024) {
+                    updateLog(
+                        "domain_cap",
+                        "Правило сервера содержит ${newServerRule.domains.size} доменов; клиент применит первые 1024",
+                        20,
+                        false,
+                    )
+                }
                 updateDomainRouting(
                     enabled = newServerRule.templateDomains || newServerRule.domains.isNotEmpty(),
                     templateDomains = newServerRule.templateDomains,
@@ -2086,35 +2051,23 @@ object TunnelManager {
                     startTunVpnService(ctx, reloadIntent)
                 }
             } else if (previousRule != null) {
-                activeScope.launch {
-                    val settingsStore = SettingsStore(ctx)
-                    val domainWhite = settingsStore.domainIsWhitelist.first()
-                    val domainEnabled = settingsStore.domainRoutingEnabled.first()
-                    val templateEnabled = settingsStore.templateDomainsEnabled.first()
-                    val domains = if (domainWhite) settingsStore.directDomainsWhite.first() else settingsStore.directDomainsBlack.first()
-                    val ipWhite = settingsStore.ipIsWhitelist.first()
-                    val ips = if (ipWhite) settingsStore.directIpsWhite.first() else settingsStore.directIpsBlack.first()
-                    val hasDomains = if (domainWhite) domains.isNotBlank() else (domains.isNotBlank() || templateEnabled)
-                    val effectiveDomainEnabled = domainEnabled && hasDomains
-                    val effectiveIpEnabled = IpRoutingPolicy.isEnabled(ips)   // список и есть переключатель
-                    updateDomainRouting(
-                        enabled = effectiveDomainEnabled,
-                        templateDomains = if (domainWhite) false else templateEnabled,
-                        directDomains = domains,
-                        isWhitelist = domainWhite,
-                        ipRoutingEnabled = effectiveIpEnabled,
-                        ipIsWhitelist = ipWhite,
-                        directIps = ips,
-                    )
-                    if (vpnReady.value) {
-                        val reloadIntent = Intent(ctx, TunVpnService::class.java).apply {
-                            action = "RELOAD_ROUTING"
-                            putExtra("client_ip", clientIp)
-                            putExtra("dns", dns)
-                            putExtra("reason", "routing_cleared")
-                        }
-                        startTunVpnService(ctx, reloadIntent)
+                // Локальных доменов и адресов больше нет: правило исчезло — значит чистим
+                // и домены, и адреса в клиенте одной командой.
+                updateDomainRouting(
+                    enabled = false,
+                    templateDomains = false,
+                    directDomains = "",
+                    ipRoutingEnabled = false,
+                    directIps = "",
+                )
+                if (vpnReady.value) {
+                    val reloadIntent = Intent(ctx, TunVpnService::class.java).apply {
+                        action = "RELOAD_ROUTING"
+                        putExtra("client_ip", clientIp)
+                        putExtra("dns", dns)
+                        putExtra("reason", "routing_cleared")
                     }
+                    startTunVpnService(ctx, reloadIntent)
                 }
             }
         }
@@ -2132,31 +2085,6 @@ object TunnelManager {
         val identity = processIdentity ?: return
         val command = "UPDATE_DOMAINS|enabled=${if (enabled) 1 else 0};template=${if (templateDomains) 1 else 0};whitelist=${if (isWhitelist) 1 else 0};domains=$directDomains;ip_enabled=${if (ipRoutingEnabled) 1 else 0};ip_whitelist=${if (ipIsWhitelist) 1 else 0};ips=$directIps"
         writeProcessCommand(identity, command, "domain_routing_err")
-    }
-
-    fun pushLocalRouting(ctx: Context) {
-        if (serverRoutingActive.value) return
-        activeScope.launch {
-            val settingsStore = SettingsStore(ctx)
-            val domainWhite = settingsStore.domainIsWhitelist.first()
-            val domainEnabled = settingsStore.domainRoutingEnabled.first()
-            val templateEnabled = settingsStore.templateDomainsEnabled.first()
-            val domains = if (domainWhite) settingsStore.directDomainsWhite.first() else settingsStore.directDomainsBlack.first()
-            val ipWhite = settingsStore.ipIsWhitelist.first()
-            val ips = if (ipWhite) settingsStore.directIpsWhite.first() else settingsStore.directIpsBlack.first()
-            val hasDomains = if (domainWhite) domains.isNotBlank() else (domains.isNotBlank() || templateEnabled)
-            val effectiveDomainEnabled = domainEnabled && hasDomains
-            val effectiveIpEnabled = IpRoutingPolicy.isEnabled(ips)   // список и есть переключатель
-            updateDomainRouting(
-                enabled = effectiveDomainEnabled,
-                templateDomains = if (domainWhite) false else templateEnabled,
-                directDomains = domains,
-                isWhitelist = domainWhite,
-                ipRoutingEnabled = effectiveIpEnabled,
-                ipIsWhitelist = ipWhite,
-                directIps = ips,
-            )
-        }
     }
 
     private fun writeCaptchaResult(result: String, identity: ProcessIdentity) {
@@ -2232,11 +2160,4 @@ data class TunnelParams(
     val vkHashMode: String = CsqttConstants.VkAutoHash.MODE_MANUAL,
     val vkAccessToken: String = "",
     val customTurnIps: String = "",
-    val domainRoutingEnabled: Boolean = false,
-    val domainIsWhitelist: Boolean = false,
-    val templateDomains: Boolean = false,
-    val directDomains: String = "",
-    val ipRoutingEnabled: Boolean = false,
-    val ipIsWhitelist: Boolean = false,
-    val directIps: String = "",
 )
