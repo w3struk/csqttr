@@ -255,32 +255,29 @@ class TunVpnService : VpnService() {
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 try {
-                    // Исключённые маршруты строятся только из правила сервера: локальных
-                    // списков адресов больше нет, в локальном режиме адресов не исключаем.
-                    val ipWhite = serverRule?.ipIsWhite ?: false
-                    val ipListStr = serverRule?.ips?.joinToString(",").orEmpty()
-
-                    if (!ipWhite && ipListStr.isNotBlank()) {
-                        ipListStr.split(",", " ", "\n", "\t")
-                            .map { it.trim() }
-                            .filter { it.isNotEmpty() }
-                            .forEach { rawIp ->
-                                try {
-                                    val (ipPart, prefixPart) = if (rawIp.contains("/")) {
-                                        val split = rawIp.split("/", limit = 2)
-                                        split[0] to split[1].toInt()
-                                    } else {
-                                        rawIp to 32
-                                    }
-                                    val addr = java.net.InetAddress.getByName(ipPart)
-                                    if (addr is java.net.Inet4Address) {
-                                        builder.excludeRoute(android.net.IpPrefix(addr, prefixPart))
-                                    }
-                                } catch (e: Exception) {
-                                    Log.w(TAG, "Failed to exclude route for IP: $rawIp", e)
+                    // Единственный источник excludeRoute — явный список оператора.
+                    // Шаблонные тысячи CIDR сюда не попадают никогда: они идут
+                    // только в direct_relay Rust-клиента.
+                    val ipListStr = VpnExcludeRoutePolicy.entries(serverRule).joinToString(",")
+                    ipListStr.split(",", " ", "\n", "\t")
+                        .map { it.trim() }
+                        .filter { it.isNotEmpty() }
+                        .forEach { rawIp ->
+                            try {
+                                val (ipPart, prefixPart) = if (rawIp.contains("/")) {
+                                    val split = rawIp.split("/", limit = 2)
+                                    split[0] to split[1].toInt()
+                                } else {
+                                    rawIp to 32
                                 }
+                                val addr = java.net.InetAddress.getByName(ipPart)
+                                if (addr is java.net.Inet4Address) {
+                                    builder.excludeRoute(android.net.IpPrefix(addr, prefixPart))
+                                }
+                            } catch (e: Exception) {
+                                Log.w(TAG, "Failed to exclude route for IP: $rawIp", e)
                             }
-                    }
+                        }
                 } catch (e: Exception) {
                     Log.w(TAG, "excludeRoute processing failed: ${e.message}", e)
                 }

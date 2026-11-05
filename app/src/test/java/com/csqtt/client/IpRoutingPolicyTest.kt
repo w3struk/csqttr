@@ -22,7 +22,6 @@ class IpRoutingPolicyTest {
         isWhite = isWhite,
         packages = packages,
         domains = emptyList(),
-        templateDomains = false,
         ipIsWhite = ipIsWhite,
         ips = ips,
         presetRed = presetRed,

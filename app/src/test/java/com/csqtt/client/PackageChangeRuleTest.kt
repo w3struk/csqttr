@@ -26,7 +26,6 @@ class PackageChangeRuleTest {
         isWhite = isWhite,
         packages = packages,
         domains = emptyList(),
-        templateDomains = false,
         presetRed = listOf(red),
         presetOrange = listOf(orange),
     )
@@ -82,7 +81,6 @@ class PackageChangeRuleTest {
             isWhite = true,
             packages = listOf("com.vpn"),
             domains = emptyList(),
-            templateDomains = false,
         )
 
         assertTrue(needsRebuild(whitelist, "com.vpn"))

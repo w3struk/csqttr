@@ -121,6 +121,7 @@ object TunnelManager {
     private const val CRASH_RESTART_MAX_DELAY_MS = 60_000L
     private const val VPN_START_RETRY_MS = 10_000L
     private const val TUN_LOSS_REBUILD_WINDOW_MS = 60_000L
+    private const val IPS_WRITE_ERROR = "routing_ips_write_err"
 
     private val startStopMutex = kotlinx.coroutines.sync.Mutex()
     private val lifecycleState = TunnelLifecycleState()
@@ -175,12 +176,21 @@ object TunnelManager {
     @Volatile
     private var lastContext: WeakReference<Context>? = null
     private fun activeContext(): Context? = strongAppContext ?: lastContext?.get()
+    private fun routingCache(context: Context) = RoutingIpsCache(context.filesDir)
     @Volatile
     private var activeSettingsStore: SettingsStore? = null
     @Volatile
     private var currentCaptchaSolveMethod = "auto" 
     @Volatile
     private var lastAppliedDns: String? = null
+
+    /**
+     * Последнее решение по серверному правилу терминально: список адресов не
+     * получен или не сошёлся по sha. Следующий кадр `Config` обязан не поднимать
+     * VPN, даже если корутина остановки ещё не успела выполниться.
+     */
+    @Volatile
+    private var routingTerminal: Boolean = false
 
     @Volatile
     var isLoggingEnabled = true
@@ -483,7 +493,7 @@ object TunnelManager {
                             return@launch
                         }
                         val (clientIp, dns) = RoutingConfigPolicy.tunnelEndpoints(config.value)
-                        applyServerRoutingRule(rule, clientIp, dns)
+                        applyServerRoutingRule(rule, clientIp, dns, identity)
                     }
                 }
             }
@@ -494,7 +504,7 @@ object TunnelManager {
                 activeScope.launch(Dispatchers.Main) {
                     if (!isCurrent(identity)) return@launch
                     val (clientIp, dns) = RoutingConfigPolicy.tunnelEndpoints(config.value)
-                    applyServerRoutingRule(null, clientIp, dns)
+                    applyServerRoutingRule(null, clientIp, dns, identity)
                 }
             }
             is TunnelEventParser.Event.Workers -> {
@@ -680,8 +690,11 @@ object TunnelManager {
         // Иначе уже полученное правило затиралось бы при каждом подключении.
         val ruleToApply = RoutingConfigPolicy.ruleToApply(newServerRule, activeServerRoutingRule.value)
         if (ruleToApply != null) {
-            applyServerRoutingRule(ruleToApply, clientIp, dns)
+            applyServerRoutingRule(ruleToApply, clientIp, dns, identity)
         }
+        // Терминальное решение по правилу важнее факта остановки: корутина
+        // handleCriticalError асинхронна, а этот кадр мог прийти раньше неё.
+        if (routingTerminal) return
 
         activeContext()?.let { ctx ->
             lastVpnStartAttemptMs = SystemClock.elapsedRealtime()
@@ -1112,6 +1125,7 @@ object TunnelManager {
             hashList,
             params.allowHashRedistribution || jsHashMode,
         )
+        routingTerminal = false
         val cmd = mutableListOf(
             binaryPath,
             "-peer", params.peer,
@@ -1155,6 +1169,7 @@ object TunnelManager {
         }
         cmd.add("-captcha-mode")
         cmd.add(params.captchaMode)
+        RoutingIpsArgvPolicy.flag(routingCache(context).readSha()).forEach(cmd::add)
         val pb = ProcessBuilder(cmd)
         pb.directory(context.filesDir)
         pb.redirectErrorStream(false)
@@ -2031,78 +2046,162 @@ object TunnelManager {
     fun parseServerRoutingRuleJson(routingJsonStr: String): ServerRoutingRule? =
         parseServerRoutingRule(routingJsonStr)
 
-    fun applyServerRoutingRule(newServerRule: ServerRoutingRule?, clientIp: String, dns: String) {
+    private fun applyServerRoutingRule(
+        newServerRule: ServerRoutingRule?,
+        clientIp: String,
+        dns: String,
+        identity: ProcessIdentity,
+    ): RoutingApplyResult {
         val previousRule = activeServerRoutingRule.value
         activeServerRoutingRule.value = newServerRule
         serverRoutingActive.value = (newServerRule != null)
 
-        activeContext()?.let { ctx ->
-            if (newServerRule != null) {
-                // Rust-клиент молча режет список до 1024 доменов (rust-client/dispatcher.rs),
-                // поэтому о потере хвоста говорит журнал приложения.
-                if (newServerRule.domains.size > 1024) {
-                    updateLog(
-                        "domain_cap",
-                        "Правило сервера содержит ${newServerRule.domains.size} доменов; клиент применит первые 1024",
-                        20,
-                        false,
-                    )
+        if (newServerRule == null) {
+            if (!clearTemplateIps(identity)) {
+                return routingWriteFailure(identity, "не удалось очистить список адресов сервера")
+            }
+            // Aдреса и домены очищаются раздельно: шаблон живёт в UPDATE_IPS,
+            // явный список — в UPDATE_DOMAINS.
+            updateDomainRouting(
+                enabled = false,
+                directDomains = "",
+                ipIsWhitelist = false,
+                directIps = "",
+            )
+            if (previousRule != null && vpnReady.value) {
+                reloadRouting(clientIp, dns, "routing_cleared")
+            }
+            routingTerminal = false
+            return RoutingApplyResult.Applied
+        }
+
+        val context = activeContext()
+        val cache = context?.let(::routingCache)
+        val decision = RoutingIpsPolicy.decide(
+            newServerRule,
+            cache?.readSha(),
+            cache?.readText(),
+        )
+        when (decision) {
+            is RoutingIpsPolicy.Decision.Update -> {
+                cache?.let {
+                    runCatching { it.write(decision.text, decision.sha) }
+                        .onFailure { error ->
+                            updateLog(
+                                "routing_ips_cache_error",
+                                "Не удалось сохранить список адресов в кеш: ${error.message}",
+                                20,
+                                true,
+                            )
+                        }
                 }
-                updateDomainRouting(
-                    enabled = newServerRule.templateDomains || newServerRule.domains.isNotEmpty(),
-                    templateDomains = newServerRule.templateDomains,
-                    directDomains = newServerRule.domains.joinToString(","),
-                    isWhitelist = newServerRule.domainsIsWhite,
-                    ipRoutingEnabled = newServerRule.ips.isNotEmpty(),
-                    ipIsWhitelist = newServerRule.ipIsWhite,
-                    directIps = newServerRule.ips.joinToString(","),
-                )
-                // excludeRoutes VPN собираются из ips/ipIsWhite тоже: смена там (маршрутизация приложений
-                // от панели) оставляла старые маршруты до переподключения
-                val vpnInputsChanged = IpRoutingPolicy.needsVpnRebuild(previousRule, newServerRule)
-                if (vpnReady.value && vpnInputsChanged) {
-                    val reloadIntent = Intent(ctx, TunVpnService::class.java).apply {
-                        action = "RELOAD_ROUTING"
-                        putExtra("client_ip", clientIp)
-                        putExtra("dns", dns)
-                        putExtra("reason", "routing_changed")
-                    }
-                    startTunVpnService(ctx, reloadIntent)
+                if (!updateTemplateIps(identity, decision.sha, decision.text)) {
+                    return routingWriteFailure(identity, "не удалось отправить список адресов сервера")
                 }
-            } else if (previousRule != null) {
-                // Локальных доменов и адресов больше нет: правило исчезло — значит чистим
-                // и домены, и адреса в клиенте одной командой.
-                updateDomainRouting(
-                    enabled = false,
-                    templateDomains = false,
-                    directDomains = "",
-                    ipRoutingEnabled = false,
-                    directIps = "",
+                updateLog(
+                    "routing_ips_updated",
+                    "Список адресов сервера обновлён: ${decision.count} записей, sha ${decision.sha}",
+                    20,
                 )
-                if (vpnReady.value) {
-                    val reloadIntent = Intent(ctx, TunVpnService::class.java).apply {
-                        action = "RELOAD_ROUTING"
-                        putExtra("client_ip", clientIp)
-                        putExtra("dns", dns)
-                        putExtra("reason", "routing_cleared")
-                    }
-                    startTunVpnService(ctx, reloadIntent)
+            }
+            is RoutingIpsPolicy.Decision.FromCache -> {
+                if (!updateTemplateIps(identity, decision.sha, decision.text)) {
+                    return routingWriteFailure(identity, "не удалось отправить список адресов сервера")
+                }
+                updateLog(
+                    "routing_ips_cached",
+                    "Список адресов сервера из кеша: ${decision.count} записей, sha ${decision.sha}",
+                    20,
+                )
+            }
+            is RoutingIpsPolicy.Decision.Terminal -> {
+                routingTerminal = true
+                updateProcessLog(identity, decision.code, decision.message, 99, true)
+                handleCriticalError(decision.message, identity)
+                // Ни одной команды не отправлено: туннель не должен подняться.
+                return RoutingApplyResult.Terminal(decision.code, decision.message)
+            }
+            RoutingIpsPolicy.Decision.Disabled -> {
+                if (!clearTemplateIps(identity)) {
+                    return routingWriteFailure(identity, "не удалось очистить список адресов сервера")
                 }
             }
         }
+
+        routingTerminal = false
+        // Rust-клиент молча режет список до 1024 доменов (rust-client/dispatcher.rs),
+        // поэтому о потере хвоста говорит журнал приложения.
+        if (newServerRule.domains.size > 1024) {
+            updateLog(
+                "domain_cap",
+                "Правило сервера содержит ${newServerRule.domains.size} доменов; клиент применит первые 1024",
+                20,
+                false,
+            )
+        }
+        // Порядок важен: сначала UPDATE_IPS (шаблон), затем UPDATE_DOMAINS (явный
+        // список и домены). Обе команды независимы и не затирают друг друга.
+        updateDomainRouting(
+            enabled = newServerRule.domains.isNotEmpty(),
+            directDomains = newServerRule.domains.joinToString(","),
+            isWhitelist = newServerRule.domainsIsWhite,
+            ipIsWhitelist = newServerRule.ipIsWhite,
+            directIps = newServerRule.ips.joinToString(","),
+        )
+        // excludeRoutes VPN собираются из ips/ipIsWhite тоже: смена там (маршрутизация приложений
+        // от панели) оставляла старые маршруты до переподключения
+        val vpnInputsChanged = IpRoutingPolicy.needsVpnRebuild(previousRule, newServerRule)
+        if (context != null && vpnReady.value && vpnInputsChanged) {
+            reloadRouting(clientIp, dns, "routing_changed")
+        }
+        return RoutingApplyResult.Applied
     }
+
+    private fun routingWriteFailure(identity: ProcessIdentity, message: String): RoutingApplyResult {
+        routingTerminal = true
+        handleCriticalError(message, identity)
+        return RoutingApplyResult.Terminal(IPS_WRITE_ERROR, message)
+    }
+
+    private fun reloadRouting(clientIp: String, dns: String, reason: String) {
+        val ctx = activeContext() ?: return
+        val reloadIntent = Intent(ctx, TunVpnService::class.java).apply {
+            action = "RELOAD_ROUTING"
+            putExtra("client_ip", clientIp)
+            putExtra("dns", dns)
+            putExtra("reason", reason)
+        }
+        startTunVpnService(ctx, reloadIntent)
+    }
+
+    private fun updateTemplateIps(identity: ProcessIdentity, sha: String, text: String): Boolean {
+        val context = activeContext() ?: return false
+        val blob = routingCache(context).base64Gzip(text)
+        return writeProcessCommand(
+            identity,
+            RoutingCommandPolicy.updateIpsCommand(sha, blob),
+            IPS_WRITE_ERROR,
+        )
+    }
+
+    private fun clearTemplateIps(identity: ProcessIdentity): Boolean =
+        writeProcessCommand(identity, RoutingCommandPolicy.clearIpsCommand(), IPS_WRITE_ERROR)
 
     fun updateDomainRouting(
         enabled: Boolean,
-        templateDomains: Boolean,
         directDomains: String,
         isWhitelist: Boolean = false,
-        ipRoutingEnabled: Boolean = false,
         ipIsWhitelist: Boolean = false,
         directIps: String = "",
     ) {
         val identity = processIdentity ?: return
-        val command = "UPDATE_DOMAINS|enabled=${if (enabled) 1 else 0};template=${if (templateDomains) 1 else 0};whitelist=${if (isWhitelist) 1 else 0};domains=$directDomains;ip_enabled=${if (ipRoutingEnabled) 1 else 0};ip_whitelist=${if (ipIsWhitelist) 1 else 0};ips=$directIps"
+        val command = RoutingCommandPolicy.domainRoutingCommand(
+            enabled = enabled,
+            directDomains = directDomains,
+            isWhitelist = isWhitelist,
+            ipIsWhitelist = ipIsWhitelist,
+            directIps = directIps,
+        )
         writeProcessCommand(identity, command, "domain_routing_err")
     }
 

@@ -103,4 +103,36 @@ class ServerRoutingRuleTest {
         assertEquals(emptyList<String>(), orange.presetOrange)
         assertEquals(emptyList<String>(), orange.presetRed)
     }
+
+    @Test fun ipsShaAndBlobAreParsed() {
+        val sha = "a".repeat(64)
+        val rule = requireNotNull(parseServerRoutingRule("""{"ips_sha":"$sha","ips_blob":"AAAA"}"""))
+        assertEquals(sha, rule.ipsSha)
+        assertEquals("AAAA", rule.ipsBlob)
+        assertTrue(rule.templateIps)
+    }
+
+    @Test fun aMalformedShaRejectsTheWholeRule() {
+        assertNull(parseServerRoutingRule("""{"ips_sha":"xyz"}"""))
+        assertNull(parseServerRoutingRule("""{"ips_sha":"${"A".repeat(64)}"}"""))
+        assertNull(parseServerRoutingRule("""{"ips_sha":42}"""))
+    }
+
+    @Test fun aBlobWithoutAShaRejectsTheWholeRule() {
+        assertNull(parseServerRoutingRule("""{"ips_blob":"AAAA"}"""))
+    }
+
+    @Test fun templateAddressesNeverEnterTheExplicitIpsList() {
+        val rule = requireNotNull(
+            parseServerRoutingRule("""{"ips":["1.1.1.1"],"ips_sha":"${"a".repeat(64)}"}"""),
+        )
+        assertEquals(listOf("1.1.1.1"), rule.ips)
+    }
+
+    @Test fun theRetiredTemplateDomainsKeyIsIgnored() {
+        val rule = requireNotNull(
+            parseServerRoutingRule("""{"template_domains":true,"template_ips":true}"""),
+        )
+        assertFalse(rule.templateIps)
+    }
 }

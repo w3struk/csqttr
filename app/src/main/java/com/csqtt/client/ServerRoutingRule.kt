@@ -6,13 +6,16 @@ data class ServerRoutingRule(
     val isWhite: Boolean,
     val packages: List<String>,
     val domains: List<String>,
-    val templateDomains: Boolean,
     val ipIsWhite: Boolean = false,
     val ips: List<String> = emptyList(),
     val domainsIsWhite: Boolean = isWhite,
     val presetRed: List<String> = emptyList(),
     val presetOrange: List<String> = emptyList(),
-)
+    val ipsSha: String? = null,
+    val ipsBlob: String? = null,
+) {
+    val templateIps: Boolean get() = ipsSha != null
+}
 
 internal fun isRoutingPackageName(value: String): Boolean =
     value.length in 1..255 &&
@@ -61,15 +64,32 @@ internal fun parseServerRoutingRule(value: String): ServerRoutingRule? = runCatc
     require(packages.all(::isRoutingPackageName)) { "invalid routing package name" }
     val presetRed = lenientPresetPackages(json, "preset_red")
     val presetOrange = lenientPresetPackages(json, "preset_orange")
+    val ipsSha = if (json.has("ips_sha") && !json.isNull("ips_sha")) {
+        val raw = json.get("ips_sha")
+        require(raw is String) { "ips_sha must be a string" }
+        require(RoutingIpsPolicy.SHA_PATTERN.matches(raw)) { "invalid ips_sha" }
+        raw
+    } else {
+        null
+    }
+    val ipsBlob = if (json.has("ips_blob") && !json.isNull("ips_blob")) {
+        val raw = json.get("ips_blob")
+        require(raw is String) { "ips_blob must be a string" }
+        require(ipsSha != null) { "ips_blob requires ips_sha" }
+        raw.takeIf { it.isNotEmpty() }
+    } else {
+        null
+    }
     ServerRoutingRule(
         isWhite = appsWhite,
         packages = packages,
         domains = strings("domains"),
-        templateDomains = json.optBoolean("template_domains", false),
         ipIsWhite = json.optBoolean("ip_is_whitelist", json.optString("ip_mode", "blacklist") == "whitelist"),
         ips = strings("ips"),
         domainsIsWhite = domainsWhite,
         presetRed = presetRed,
         presetOrange = presetOrange,
+        ipsSha = ipsSha,
+        ipsBlob = ipsBlob,
     )
 }.getOrNull()

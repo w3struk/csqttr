@@ -9,7 +9,6 @@ class RoutingConfigPolicyTest {
         isWhite = true,
         packages = packages,
         domains = emptyList(),
-        templateDomains = false,
     )
 
     @Test
