@@ -202,7 +202,6 @@ build_input_files() {
         rust-client/Cargo.toml \
         rust-client/Cargo.lock \
         rust-client/rust-toolchain.toml \
-        domains.txt \
         scripts/android_env.sh \
         scripts/native_client_provenance.sh
 
