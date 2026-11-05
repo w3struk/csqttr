@@ -216,6 +216,7 @@ pub struct RoutingReassembler {
     received_count: usize,
     finished: bool,
     oversize: Option<usize>,
+    corrupt: bool,
 }
 
 impl RoutingReassembler {
@@ -227,8 +228,13 @@ impl RoutingReassembler {
         self.oversize.take()
     }
 
+    pub fn take_corrupt_error(&mut self) -> bool {
+        std::mem::take(&mut self.corrupt)
+    }
+
     pub fn feed(&mut self, payload: &[u8]) -> Option<String> {
         self.oversize = None;
+        self.corrupt = false;
         let text = std::str::from_utf8(payload).ok()?;
         let rest = text.strip_prefix("ROUTING:")?;
         if let Some(total_str) = rest.strip_prefix("START:") {
@@ -296,9 +302,13 @@ impl RoutingReassembler {
         self.total_chunks = 0;
         self.finished = false;
 
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(b64_combined.trim())
-            .ok()?;
+        let decoded = match base64::engine::general_purpose::STANDARD.decode(b64_combined.trim()) {
+            Ok(decoded) => decoded,
+            Err(_) => {
+                self.corrupt = true;
+                return None;
+            }
+        };
         if decoded.len() >= 2 && decoded[0] == 0x1f && decoded[1] == 0x8b {
             use flate2::read::GzDecoder;
             use std::io::Read;
@@ -314,14 +324,28 @@ impl RoutingReassembler {
                     return None;
                 }
                 // A gzip header can never be valid UTF-8, so a bad inner stream is a hard reject.
-                return String::from_utf8(decompressed).ok();
+                return match String::from_utf8(decompressed) {
+                    Ok(text) => Some(text),
+                    Err(_) => {
+                        self.corrupt = true;
+                        None
+                    }
+                };
             }
+            self.corrupt = true;
+            return None;
         }
         if decoded.len() > MAX_ROUTING_PAYLOAD_BYTES {
             self.report_oversize(decoded.len());
             return None;
         }
-        String::from_utf8(decoded).ok()
+        match String::from_utf8(decoded) {
+            Ok(text) => Some(text),
+            Err(_) => {
+                self.corrupt = true;
+                None
+            }
+        }
     }
 
     fn report_oversize(&mut self, size: usize) {
@@ -1357,6 +1381,12 @@ async fn request_configuration(
                                 ),
                                 true,
                             );
+                        } else if routing_reassembler.take_corrupt_error() && emits_routing {
+                            events.error(
+                                "routing_payload_corrupt",
+                                "ROUTING: payload не декодируется (base64/gzip/UTF-8)",
+                                true,
+                            );
                         }
                         continue;
                     }
@@ -1579,6 +1609,12 @@ async fn reader_loop(
                 events.error(
                     "routing_payload_too_large",
                     &format!("ROUTING: {size} байт, предел {MAX_ROUTING_PAYLOAD_BYTES}"),
+                    true,
+                );
+            } else if routing_reassembler.take_corrupt_error() && emits_routing {
+                events.error(
+                    "routing_payload_corrupt",
+                    "ROUTING: payload не декодируется (base64/gzip/UTF-8)",
                     true,
                 );
             }
@@ -2452,6 +2488,8 @@ mod tests {
         assert_eq!(reassembler.feed(b"ROUTING:START:1"), None);
         assert_eq!(reassembler.feed(b"ROUTING:1:1:not-valid-base64-!!!"), None);
         assert_eq!(reassembler.feed(b"ROUTING:FINISH:1"), None);
+        assert!(reassembler.take_corrupt_error());
+        assert!(!reassembler.take_corrupt_error());
     }
 
     #[test]

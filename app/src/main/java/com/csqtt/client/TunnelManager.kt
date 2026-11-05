@@ -1744,6 +1744,9 @@ object TunnelManager {
     }
 
     private fun handleCriticalError(message: String, identity: ProcessIdentity) {
+        // Любая критическая ошибка терминальна для текущего процесса: следующий
+        // кадр Config не должен успеть поднять VPN до асинхронного stopLocked.
+        routingTerminal = true
         updateProcessLog(identity, "circuit_breaker", "[СТОП] $message", -1, true)
         activeScope.launch {
             startStopMutex.withLock {

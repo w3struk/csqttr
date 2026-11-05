@@ -4755,6 +4755,12 @@ fn routing_event_line(raw_json: &str) -> String {
 }
 
 pub(crate) fn validate_routing_rule(rule: &crate::model::RoutingRule) -> Result<(), String> {
+    if rule.template_ips && rule.ip_is_whitelist {
+        return Err("Готовый список RU адресов доступен только в чёрном режиме адресов".to_owned());
+    }
+    if rule.template_domains && rule.domains_is_whitelist {
+        return Err("Готовый список RU доменов доступен только в чёрном режиме доменов".to_owned());
+    }
     if rule.ips.len() > 512 {
         return Err(format!("явных адресов больше 512: {}", rule.ips.len()));
     }
@@ -6674,6 +6680,7 @@ mod tests {
         let mut rule = routing_fixture_rule(true);
         rule.template_domains = false;
         rule.template_ips = true;
+        rule.ip_is_whitelist = false;
         rule.direct_domains = (0..1024).map(|i| format!("d{i}.ru")).collect();
         rule.ips = (0..512)
             .map(|i| format!("10.{}.{}.{}/32", i / 65536, (i / 256) % 256, i % 256))
@@ -6688,12 +6695,26 @@ mod tests {
         let mut rule = routing_fixture_rule(true);
         rule.template_domains = false;
         rule.template_ips = true;
+        rule.ip_is_whitelist = false;
         rule.direct_domains = (0..1024)
             .map(|i| format!("{}{}.ru", "d".repeat(54), i))
             .collect();
         rule.ips = (0..512)
             .map(|i| format!("10.{}.{}.{}/32", i / 65536, (i / 256) % 256, i % 256))
             .collect();
+        assert!(validate_routing_rule(&rule).is_err());
+    }
+
+    #[test]
+    fn template_modes_require_the_black_list() {
+        let mut rule = routing_fixture_rule(true);
+        rule.template_ips = true;
+        rule.ip_is_whitelist = true;
+        assert!(validate_routing_rule(&rule).is_err());
+
+        let mut rule = routing_fixture_rule(true);
+        rule.template_domains = true;
+        rule.domains_is_whitelist = true;
         assert!(validate_routing_rule(&rule).is_err());
     }
 }
