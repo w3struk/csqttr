@@ -2629,6 +2629,18 @@ async fn api_import_post(
     let mut applied_dns = None;
     let mut applied_interval = None;
 
+    for (rid, rule) in &export.routing_rules {
+        if let Err(message) = crate::protocol::validate_routing_rule(rule) {
+            log_event(
+                &state.app,
+                "WARN",
+                "import",
+                &format!("routing rule {rid} rejected: {message}"),
+            );
+            return (StatusCode::BAD_REQUEST, format!("правило {rid}: {message}")).into_response();
+        }
+    }
+
     let revision = {
         let mut db = state.app.db.write().await;
         if do_clients {
@@ -4075,6 +4087,7 @@ struct RoutingRuleInfo {
     mode: String,
     packages: Vec<String>,
     template_domains: bool,
+    template_ips: bool,
     preset_apps: bool,
     direct_domains: Vec<String>,
     domains: Vec<String>,
@@ -4119,6 +4132,7 @@ async fn routing_rules_get(State(state): State<WebState>) -> Response {
             },
             packages: rule.packages.clone(),
             template_domains: rule.template_domains,
+            template_ips: rule.template_ips,
             preset_apps: rule.preset_apps,
             direct_domains: rule.direct_domains.clone(),
             domains: rule.direct_domains.clone(),
@@ -4144,15 +4158,23 @@ async fn routing_rules_get(State(state): State<WebState>) -> Response {
     Json(list).into_response()
 }
 
-const TEMPLATE_DOMAINS_TXT: &str = include_str!("../app/src/main/assets/domains.txt");
-
 async fn template_domains_get() -> impl IntoResponse {
     (
         [(
             axum::http::header::CONTENT_TYPE,
             "text/plain; charset=utf-8",
         )],
-        TEMPLATE_DOMAINS_TXT,
+        crate::routing_assets::ASSETS.domains_text.as_str(),
+    )
+}
+
+async fn template_ips_get() -> impl IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )],
+        crate::routing_assets::ASSETS.ips.text.as_str(),
     )
 }
 
@@ -4172,6 +4194,8 @@ struct CreateRoutingRuleRequest {
     packages: Vec<String>,
     #[serde(default)]
     template_domains: bool,
+    #[serde(default)]
+    template_ips: bool,
     #[serde(default = "default_preset_enabled")]
     preset_apps: bool,
     #[serde(default)]
@@ -4200,6 +4224,12 @@ struct CreateRoutingRuleRequest {
 
 fn default_preset_enabled() -> bool {
     true
+}
+
+fn routing_rule_validation_response(rule: &RoutingRule) -> Option<Response> {
+    crate::protocol::validate_routing_rule(rule)
+        .err()
+        .map(|message| (StatusCode::BAD_REQUEST, message).into_response())
 }
 
 async fn routing_rules_create(
@@ -4249,12 +4279,16 @@ async fn routing_rules_create(
         is_whitelist,
         packages: request.packages,
         template_domains: request.template_domains,
+        template_ips: request.template_ips,
         preset_apps: request.preset_apps,
         direct_domains,
         domains_is_whitelist,
         ip_is_whitelist,
         ips: request.ips,
     };
+    if let Some(response) = routing_rule_validation_response(&rule) {
+        return response;
+    }
     let revision = {
         let mut db = state.app.db.write().await;
         for g_id in &assigned_groups {
@@ -4320,20 +4354,29 @@ async fn routing_rules_update(
     } else {
         request.target_client_passwords.unwrap_or_default()
     };
-    let revision = {
-        let mut db = state.app.db.write().await;
-        let Some(rule) = db.routing_rules.get_mut(&id) else {
+    let mut candidate = {
+        let db = state.app.db.read().await;
+        let Some(rule) = db.routing_rules.get(&id) else {
             return StatusCode::NOT_FOUND.into_response();
         };
-        rule.name = name;
-        rule.is_whitelist = is_whitelist;
-        rule.packages = request.packages;
-        rule.template_domains = request.template_domains;
-        rule.preset_apps = request.preset_apps;
-        rule.direct_domains = direct_domains;
-        rule.domains_is_whitelist = domains_is_whitelist;
-        rule.ip_is_whitelist = ip_is_whitelist;
-        rule.ips = request.ips;
+        rule.clone()
+    };
+    candidate.name = name;
+    candidate.is_whitelist = is_whitelist;
+    candidate.packages = request.packages;
+    candidate.template_domains = request.template_domains;
+    candidate.template_ips = request.template_ips;
+    candidate.preset_apps = request.preset_apps;
+    candidate.direct_domains = direct_domains;
+    candidate.domains_is_whitelist = domains_is_whitelist;
+    candidate.ip_is_whitelist = ip_is_whitelist;
+    candidate.ips = request.ips;
+    if let Some(response) = routing_rule_validation_response(&candidate) {
+        return response;
+    }
+    let revision = {
+        let mut db = state.app.db.write().await;
+        db.routing_rules.insert(id.clone(), candidate);
 
         for group in db.groups.values_mut() {
             if assigned_groups.contains(&group.id) {
@@ -5429,6 +5472,7 @@ pub async fn run(
             put(routing_rules_update).delete(routing_rules_delete),
         )
         .route("/api/template-domains", get(template_domains_get))
+        .route("/api/template-ips", get(template_ips_get))
         .route("/api/preset-apps", get(preset_apps_get))
         .route("/api/logs", get(logs_get))
         .route("/api/logs/toggle", post(logs_toggle))
@@ -8372,6 +8416,7 @@ const PANEL_HTML_TEMPLATE: &str = r##"
 
         .toggle-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 16px; padding: 12px; background: var(--bg-color); border-radius: 12px; border: 1px solid var(--border); transition: background 0.3s, border-color 0.3s; }
         .toggle-row label { font-size: 14px; font-weight: 600; color: var(--text-main); margin: 0; text-transform: none; white-space: nowrap; }
+        .input-hint { font-size: 12px; color: var(--text-muted); margin: -8px 0 16px; line-height: 1.5; }
         .vk-hashes-toggle { margin-top: 10px; }
         .switch { position: relative; display: inline-block; width: 44px; height: 24px; }
         .switch input { opacity: 0; width: 0; height: 0; }
@@ -9670,11 +9715,24 @@ const PANEL_HTML_TEMPLATE: &str = r##"
         </div>
         <div class="input-group">
             <label for="ruleIpMode">Режим исключения адресов</label>
-            <select id="ruleIpMode">
+            <select id="ruleIpMode" onchange="onRuleIpModeChange()">
                 <option value="blacklist">Чёрный список</option>
                 <option value="whitelist">Белый список</option>
             </select>
         </div>
+        <div class="toggle-row" id="ruleTemplateIpsRow" style="margin-bottom: 16px;">
+            <div style="display: flex; align-items: center; gap: 8px;">
+                <label for="ruleTemplateIps" style="cursor: pointer;">Готовый список RU адресов</label>
+                <button type="button" class="btn-icon" style="padding: 2px; border: none; background: transparent; cursor: pointer; color: var(--primary); display: flex; align-items: center;" onclick="openTemplateIpsDlg()" title="Посмотреть список RU адресов">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
+                </button>
+            </div>
+            <label class="switch">
+                <input type="checkbox" id="ruleTemplateIps">
+                <span class="slider"></span>
+            </label>
+        </div>
+        <div class="input-hint">До 512 адресов; вместе с шаблонными доменами — до 1024 доменов; правило, которое не влезает в одно событие, сохранить нельзя.</div>
         <div class="input-group">
             <label for="ruleIps">Список адресов</label>
             <textarea id="ruleIps" rows="3" style="width: 100%; background: var(--surface); color: var(--text-main); border: 1px solid var(--border); border-radius: 12px; padding: 10px; font-family: monospace; font-size: 12px;" placeholder="1.2.3.4/32&#10;1.2.3.4&#10;1.2.3.4-1.2.3.255"></textarea>
@@ -9712,6 +9770,25 @@ const PANEL_HTML_TEMPLATE: &str = r##"
         <div id="templateDomainsList" style="max-height: 320px; overflow-y: auto; background: var(--bg-color); border: 1px solid var(--border); border-radius: 12px; padding: 12px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; line-height: 1.6; color: var(--text-main);"></div>
         <div class="dlg-actions" style="margin-top: 16px;">
             <button class="btn btn-primary" onclick="document.getElementById('templateDomainsDlg').close()">Понятно</button>
+        </div>
+    </dialog>
+
+    <dialog id="templateIpsDlg" style="max-width: 540px; width: min(540px, calc(100% - 24px)); max-height: 80vh; overflow-y: auto;">
+        <div class="dlg-header">
+            <h2>Список RU адресов</h2>
+            <button class="close-btn" onclick="document.getElementById('templateIpsDlg').close()">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+            </button>
+        </div>
+        <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 10px; line-height: 1.5;">
+            Эти <span id="templateIpsCount"></span> адресов направляются напрямую без VPN при включении функции:
+        </p>
+        <div style="margin-bottom: 10px;">
+            <input id="templateIpsFilter" placeholder="Быстрый поиск по адресам..." style="width: 100%; height: 38px; font-size: 13px; padding: 0 12px;" oninput="filterTemplateIps(this.value)">
+        </div>
+        <div id="templateIpsList" style="max-height: 320px; overflow-y: auto; background: var(--bg-color); border: 1px solid var(--border); border-radius: 12px; padding: 12px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; line-height: 1.6; color: var(--text-main);"></div>
+        <div class="dlg-actions" style="margin-top: 16px;">
+            <button class="btn btn-primary" onclick="document.getElementById('templateIpsDlg').close()">Понятно</button>
         </div>
     </dialog>
 
@@ -10443,6 +10520,19 @@ const PANEL_HTML_TEMPLATE: &str = r##"
                 <div class="api-card-body">
                     <p style="font-size: 12px; color: var(--text-muted);">
                         Возвращает готовые списки доменов для YouTube, Discord, Instagram, Twitter/X, ChatGPT, Spotify и др.
+                    </p>
+                </div>
+            </div>
+
+            <div class="api-card">
+                <div class="api-card-header">
+                    <span class="api-method get">GET</span>
+                    <span class="api-path">/api/template-ips</span>
+                    <span class="api-desc">Готовый список RU адресов</span>
+                </div>
+                <div class="api-card-body">
+                    <p style="font-size: 12px; color: var(--text-muted);">
+                        Возвращает нормализованный список CIDR, которые направляются напрямую без VPN при включённом тумблере «Готовый список RU адресов».
                     </p>
                 </div>
             </div>
@@ -11742,7 +11832,7 @@ const PANEL_HTML_TEMPLATE: &str = r##"
                         <span class="rule-chip">Приложений: ${appsCount}</span>
                         <span class="rule-chip">Доменов: ${domainsCount}</span>
                         <span class="rule-chip">Адресов: ${(rule.ips || []).length}</span>
-                        <span class="rule-chip">Шаблоны: ${rule.template_domains ? 'Вкл' : 'Выкл'}</span>
+                        <span class="rule-chip">Шаблоны: ${(rule.template_domains || rule.template_ips) ? ((rule.template_domains ? 'Домены' : '') + (rule.template_domains && rule.template_ips ? ' + ' : '') + (rule.template_ips ? 'Адреса' : '')) : 'Выкл'}</span>
                         <span class="rule-chip">Целей: ${targetGroups} групп, ${targetClients} клиентов</span>
                     </div>
                 </div>
@@ -11753,6 +11843,14 @@ const PANEL_HTML_TEMPLATE: &str = r##"
         function onRuleDomainsModeChange() {
             const mode = document.getElementById('ruleDomainsMode').value;
             const row = document.getElementById('ruleTemplateDomainsRow');
+            if (row) {
+                row.style.display = (mode === 'whitelist') ? 'none' : 'flex';
+            }
+        }
+
+        function onRuleIpModeChange() {
+            const mode = document.getElementById('ruleIpMode').value;
+            const row = document.getElementById('ruleTemplateIpsRow');
             if (row) {
                 row.style.display = (mode === 'whitelist') ? 'none' : 'flex';
             }
@@ -11842,6 +11940,8 @@ const PANEL_HTML_TEMPLATE: &str = r##"
             document.getElementById('ruleTemplateDomains').checked = rule ? Boolean(rule.template_domains) : false;
             document.getElementById('rulePresetApps').checked = rule ? Boolean(rule.preset_apps) : true;
             document.getElementById('ruleIpMode').value = rule ? (rule.ip_mode || (rule.ip_is_whitelist ? 'whitelist' : 'blacklist')) : 'blacklist';
+            onRuleIpModeChange();
+            document.getElementById('ruleTemplateIps').checked = rule ? Boolean(rule.template_ips) : false;
             document.getElementById('ruleIps').value = rule && rule.ips ? rule.ips.join('\n') : '';
             document.getElementById('ruleDeleteBtn').style.display = rule ? 'inline-block' : 'none';
 
@@ -11938,6 +12038,7 @@ const PANEL_HTML_TEMPLATE: &str = r##"
             const domains_mode = document.getElementById('ruleDomainsMode').value;
             const template_domains = (domains_mode === 'whitelist') ? false : document.getElementById('ruleTemplateDomains').checked;
             const ip_mode = document.getElementById('ruleIpMode').value;
+            const template_ips = (ip_mode === 'whitelist') ? false : document.getElementById('ruleTemplateIps').checked;
             const rawIps = document.getElementById('ruleIps').value.split(/[\n,]/);
             const ips = [];
             const seenIps = new Set();
@@ -11975,6 +12076,7 @@ const PANEL_HTML_TEMPLATE: &str = r##"
                     preset_apps: document.getElementById('rulePresetApps').checked,
                     ip_mode,
                     ip_is_whitelist: ip_mode === 'whitelist',
+                    template_ips,
                     ips,
                     assigned_groups: target_group_ids,
                     assigned_clients: target_client_passwords
@@ -12319,6 +12421,54 @@ const PANEL_HTML_TEMPLATE: &str = r##"
             }
             const filtered = templateDomainsCache.filter(d => d.toLowerCase().includes(q));
             renderTemplateDomainsList(filtered);
+        }
+
+        let templateIpsCache = null;
+        async function openTemplateIpsDlg() {
+            const listEl = document.getElementById('templateIpsList');
+            const countEl = document.getElementById('templateIpsCount');
+            const filterEl = document.getElementById('templateIpsFilter');
+            if (filterEl) filterEl.value = '';
+            document.getElementById('templateIpsDlg').showModal();
+            if (!templateIpsCache) {
+                listEl.innerHTML = '<div style="color: var(--text-muted); text-align: center; padding: 20px;">Загрузка...</div>';
+                try {
+                    const r = await api('/api/template-ips');
+                    if (r.ok) {
+                        const txt = await r.text();
+                        templateIpsCache = txt.split('\n')
+                            .map(s => s.trim())
+                            .filter(s => s && !s.startsWith('#'));
+                    } else {
+                        templateIpsCache = [];
+                    }
+                } catch(e) {
+                    templateIpsCache = [];
+                }
+            }
+            if (countEl) countEl.textContent = templateIpsCache.length;
+            renderTemplateIpsList(templateIpsCache);
+        }
+
+        function renderTemplateIpsList(list) {
+            const listEl = document.getElementById('templateIpsList');
+            if (!listEl) return;
+            if (!list || list.length === 0) {
+                listEl.innerHTML = '<div style="color: var(--text-muted); text-align: center; padding: 10px;">Ничего не найдено</div>';
+                return;
+            }
+            listEl.innerHTML = list.map(ip => `<div style="padding: 2px 0;">${esc(ip)}</div>`).join('');
+        }
+
+        function filterTemplateIps(value) {
+            if (!templateIpsCache) return;
+            const q = value.trim().toLowerCase();
+            if (!q) {
+                renderTemplateIpsList(templateIpsCache);
+                return;
+            }
+            const filtered = templateIpsCache.filter(ip => ip.toLowerCase().includes(q));
+            renderTemplateIpsList(filtered);
         }
 
         async function deleteRoutingRule(ruleId) {
@@ -13321,9 +13471,22 @@ mod tests {
         PWA_MANIFEST, PWA_SERVICE_WORKER, THEME_TOKENS, count_active_sessions, decrypt_csqtt_link,
         deploy_dns_profile_or_yandex, dns_provider_by_id, dns_provider_id, encrypt_csqtt_link,
         make_client_link, manual_dns, normalize_client_vk_hashes, normalize_vk_access_token,
-        process_memory, process_memory_rollup, provider_dns, validate_client_name,
-        validate_proxy_profile_name, validate_workers,
+        process_memory, process_memory_rollup, provider_dns, routing_rule_validation_response,
+        validate_client_name, validate_proxy_profile_name, validate_workers,
     };
+
+    #[test]
+    fn undeliverable_rule_is_rejected_with_400() {
+        let mut rule = crate::model::RoutingRule {
+            id: "r1".to_owned(),
+            ..Default::default()
+        };
+        rule.ips = (0..513)
+            .map(|i| format!("10.0.{}.{}/32", (i / 256) % 256, i % 256))
+            .collect();
+        let response = routing_rule_validation_response(&rule).expect("rule must be rejected");
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
 
     #[test]
     fn dns_provider_catalog_is_complete_and_has_exact_yandex_default() {

@@ -4685,8 +4685,36 @@ fn getconf_requests_routing(parts: &[&str]) -> bool {
 // (`PasswordEpochState::claim_routing_delivery`): одно решение на поколение,
 // жизненный цикл совпадает с поколением пароля.
 
-fn routing_rule_json(rule: &crate::model::RoutingRule) -> serde_json::Value {
-    serde_json::json!({
+fn merged_domains(rule: &crate::model::RoutingRule) -> (Vec<String>, usize) {
+    let mut domains = rule.direct_domains.clone();
+    if rule.template_domains {
+        for asset_domain in &crate::routing_assets::ASSETS.domains {
+            if !domains
+                .iter()
+                .any(|domain| domain.eq_ignore_ascii_case(asset_domain))
+            {
+                domains.push(asset_domain.clone());
+            }
+        }
+    }
+    let original_len = domains.len();
+    domains.truncate(1024);
+    (domains, original_len.saturating_sub(1024))
+}
+
+fn getconf_client_ips_sha<'a>(parts: &[&'a str], config_owner: bool) -> Option<&'a str> {
+    if !config_owner {
+        return None;
+    }
+    let sha = parts.get(7)?.trim();
+    (sha.len() == 64 && sha.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(sha)
+}
+
+fn routing_rule_json(
+    rule: &crate::model::RoutingRule,
+    client_ips_sha: Option<&str>,
+) -> serde_json::Value {
+    let mut json = serde_json::json!({
         "version": 3,
         "name": rule.name,
         "mode": if rule.is_whitelist { "whitelist" } else { "blacklist" },
@@ -4694,8 +4722,7 @@ fn routing_rule_json(rule: &crate::model::RoutingRule) -> serde_json::Value {
         "packages": &rule.packages,
         "domains_mode": if rule.domains_is_whitelist { "whitelist" } else { "blacklist" },
         "domains_is_whitelist": rule.domains_is_whitelist,
-        "domains": &rule.direct_domains,
-        "template_domains": rule.template_domains,
+        "domains": merged_domains(rule).0,
         "ip_mode": if rule.ip_is_whitelist { "whitelist" } else { "blacklist" },
         "ip_is_whitelist": rule.ip_is_whitelist,
         "ips": &rule.ips,
@@ -4709,7 +4736,41 @@ fn routing_rule_json(rule: &crate::model::RoutingRule) -> serde_json::Value {
         } else {
             Vec::<String>::new()
         }
-    })
+    });
+    if rule.template_ips {
+        let assets = &crate::routing_assets::ASSETS;
+        json["ips_sha"] = serde_json::Value::String(assets.ips.sha256.clone());
+        if client_ips_sha != Some(assets.ips.sha256.as_str()) {
+            json["ips_blob"] = serde_json::Value::String(assets.ips.blob_base64_gzip.clone());
+        }
+    }
+    json
+}
+
+fn routing_event_line(raw_json: &str) -> String {
+    format!(
+        "__CSQTT_EVENT__|ROUTING|{}",
+        serde_json::json!({ "routing": raw_json })
+    )
+}
+
+pub(crate) fn validate_routing_rule(rule: &crate::model::RoutingRule) -> Result<(), String> {
+    if rule.ips.len() > 512 {
+        return Err(format!("явных адресов больше 512: {}", rule.ips.len()));
+    }
+    if merged_domains(rule).1 > 0 {
+        return Err("объединённых доменов больше 1024".to_owned());
+    }
+    let raw =
+        serde_json::to_string(&routing_rule_json(rule, None)).map_err(|error| error.to_string())?;
+    let line = routing_event_line(&raw);
+    if line.len() > 65_536 {
+        return Err(format!(
+            "правило не доставляется: событие {} байт при пределе 65536",
+            line.len()
+        ));
+    }
+    Ok(())
 }
 
 async fn handle_getconf(
@@ -4762,6 +4823,7 @@ async fn handle_getconf(
     };
 
     let config_owner = getconf_requests_routing(&parts);
+    let client_ips_sha = getconf_client_ips_sha(&parts, config_owner);
 
     let Some(generation_id) = parse_generation_id(generation_text) else {
         log_getconf_result(
@@ -5120,20 +5182,35 @@ async fn handle_getconf(
         let wants_routing = config_owner || epoch.claim_routing_delivery(generation_id);
         if wants_routing {
             let mode = if config_owner { "owner" } else { "legacy" };
+            let ips_sha_state = match client_ips_sha {
+                Some(sha) if sha == crate::routing_assets::ASSETS.ips.sha256.as_str() => "hit",
+                Some(_) => "miss",
+                None => "none",
+            };
             log_event(
                 app,
                 "INFO",
                 "routing",
                 &format!(
-                    "ROUTING pass={} gen={} to={} rule={}",
+                    "ROUTING pass={} gen={} to={} rule={} ips_sha={}",
                     secret_tag(password),
                     generation_id,
                     mode,
-                    routing_rule.is_some()
+                    routing_rule.is_some(),
+                    ips_sha_state
                 ),
             );
             if let Some(rule) = routing_rule {
-                let json_val = routing_rule_json(&rule);
+                let (_, dropped_domains) = merged_domains(&rule);
+                if dropped_domains > 0 {
+                    log_event(
+                        app,
+                        "WARN",
+                        "routing",
+                        &format!("domains_truncated={dropped_domains} rule={}", rule.id),
+                    );
+                }
+                let json_val = routing_rule_json(&rule, client_ips_sha);
                 let raw_json = serde_json::to_string(&json_val).unwrap_or_default();
                 use flate2::Compression;
                 use flate2::write::GzEncoder;
@@ -6367,6 +6444,7 @@ mod tests {
             is_whitelist: true,
             packages: vec!["com.example.app".to_owned(), "com.example.two".to_owned()],
             template_domains: true,
+            template_ips: false,
             preset_apps,
             direct_domains: vec!["example.com".to_owned()],
             domains_is_whitelist: false,
@@ -6399,6 +6477,26 @@ mod tests {
     }
 
     #[test]
+    fn client_sha_is_read_only_from_the_owner_field() {
+        let owner_hit = [
+            "9000",
+            "pass",
+            "7",
+            "salt",
+            "4",
+            "10",
+            "owner",
+            "5cf0b8862ad4f3318831dcf2e94076e221320ff47d77f1a12ebe661f613f70f6",
+        ];
+        assert_eq!(getconf_client_ips_sha(&owner_hit, true), Some(owner_hit[7]));
+        assert_eq!(owner_hit[7].len(), 64); // sha256 — 64 hex, не 32
+        assert_eq!(getconf_client_ips_sha(&owner_hit[..7], true), None);
+        assert_eq!(getconf_client_ips_sha(&owner_hit, false), None); // не-owner поле не читает
+        let malformed = ["9000", "pass", "7", "salt", "4", "10", "owner", "not-a-sha"];
+        assert_eq!(getconf_client_ips_sha(&malformed, true), None);
+    }
+
+    #[test]
     fn routing_is_delivered_once_per_generation_for_legacy_clients() {
         let mut state = PasswordEpochState::default();
         assert!(state.claim_routing_delivery(7));
@@ -6426,7 +6524,7 @@ mod tests {
 
     #[test]
     fn routing_json_bumps_version_and_includes_preset_when_enabled() {
-        let json = routing_rule_json(&routing_fixture_rule(true));
+        let json = routing_rule_json(&routing_fixture_rule(true), None);
 
         assert_eq!(json["version"], 3);
         let red = json["preset_red"]
@@ -6445,7 +6543,7 @@ mod tests {
 
     #[test]
     fn routing_json_keeps_empty_preset_arrays_when_disabled() {
-        let json = routing_rule_json(&routing_fixture_rule(false));
+        let json = routing_rule_json(&routing_fixture_rule(false), None);
 
         assert_eq!(json["version"], 3);
         assert_eq!(json["preset_red"], serde_json::json!([]));
@@ -6455,7 +6553,7 @@ mod tests {
     #[test]
     fn routing_json_keeps_existing_fields_intact() {
         let rule = routing_fixture_rule(true);
-        let json = routing_rule_json(&rule);
+        let json = routing_rule_json(&rule, None);
 
         assert_eq!(json["name"], rule.name);
         assert_eq!(json["mode"], "whitelist");
@@ -6463,10 +6561,139 @@ mod tests {
         assert_eq!(json["packages"], serde_json::json!(&rule.packages));
         assert_eq!(json["domains_mode"], "blacklist");
         assert_eq!(json["domains_is_whitelist"], false);
-        assert_eq!(json["domains"], serde_json::json!(&rule.direct_domains));
-        assert_eq!(json["template_domains"], true);
+        assert!(json.get("template_domains").is_none());
+        let domains = json["domains"]
+            .as_array()
+            .expect("domains is an array")
+            .iter()
+            .map(|value| value.as_str().expect("domain is a string"))
+            .collect::<Vec<_>>();
+        assert!(domains.contains(&"example.com"));
+        assert!(domains.contains(&"vk.com"));
         assert_eq!(json["ip_mode"], "whitelist");
         assert_eq!(json["ip_is_whitelist"], true);
         assert_eq!(json["ips"], serde_json::json!(&rule.ips));
+    }
+
+    #[test]
+    fn template_domains_expands_to_the_server_asset_and_drops_the_flag() {
+        let json = routing_rule_json(&routing_fixture_rule(true), None);
+        assert!(json.get("template_domains").is_none());
+        let domains: Vec<&str> = json["domains"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect();
+        assert!(domains.contains(&"vk.com"));
+        assert!(domains.contains(&"example.com"));
+        assert!(domains.len() >= 515);
+        assert_eq!(domains.iter().filter(|d| **d == "vk.com").count(), 1);
+        assert!(domains.len() <= 1024);
+    }
+
+    #[test]
+    fn merged_domains_are_capped_at_1024_and_report_the_dropped_count() {
+        let mut rule = routing_fixture_rule(true);
+        rule.direct_domains = (0..1024).map(|i| format!("d{i}.example.com")).collect();
+        let (domains, dropped) = merged_domains(&rule);
+        assert_eq!(domains.len(), 1024);
+        assert!(dropped > 0);
+    }
+
+    #[test]
+    fn template_ips_without_client_sha_ships_sha_and_blob() {
+        let mut rule = routing_fixture_rule(true);
+        rule.template_ips = true;
+        let json = routing_rule_json(&rule, None);
+        assert_eq!(
+            json["ips_sha"],
+            crate::routing_assets::ASSETS.ips.sha256.as_str()
+        );
+        assert_eq!(
+            json["ips_blob"],
+            crate::routing_assets::ASSETS.ips.blob_base64_gzip.as_str()
+        );
+        assert_eq!(json["ips"], serde_json::json!(["10.66.67.0/24"]));
+    }
+
+    #[test]
+    fn matching_client_sha_omits_the_blob() {
+        let mut rule = routing_fixture_rule(true);
+        rule.template_ips = true;
+        let json = routing_rule_json(
+            &rule,
+            Some(crate::routing_assets::ASSETS.ips.sha256.as_str()),
+        );
+        assert!(json.get("ips_blob").is_none());
+        assert!(json.get("ips_sha").is_some());
+    }
+
+    #[test]
+    fn template_ips_off_ships_neither_sha_nor_blob() {
+        let rule = routing_fixture_rule(true);
+        let json = routing_rule_json(&rule, None);
+        assert!(json.get("ips_sha").is_none());
+        assert!(json.get("ips_blob").is_none());
+    }
+
+    #[test]
+    fn worst_case_rule_event_line_fits_the_transport_limit() {
+        let mut rule = routing_fixture_rule(true);
+        rule.template_ips = true;
+        rule.ips = (0..512)
+            .map(|i| format!("10.{}.{}.{}/32", i / 65536, (i / 256) % 256, i % 256))
+            .collect();
+        let raw = serde_json::to_string(&routing_rule_json(&rule, None)).unwrap();
+        let line = routing_event_line(&raw);
+        assert!(line.len() <= 65_536, "{}", line.len());
+    }
+
+    #[test]
+    fn validation_rejects_rules_that_cannot_be_delivered() {
+        let mut too_many_ips = routing_fixture_rule(true);
+        too_many_ips.ips = (0..513)
+            .map(|i| format!("10.0.{}.{}/32", (i / 256) % 256, i % 256))
+            .collect();
+        assert!(validate_routing_rule(&too_many_ips).is_err());
+
+        let mut too_big = routing_fixture_rule(true);
+        too_big.template_ips = true;
+        too_big.direct_domains = (0..1024).map(|i| format!("d{i}.example.com")).collect();
+        too_big.ips = (0..512)
+            .map(|i| format!("10.{}.{}.{}/32", i / 65536, (i / 256) % 256, i % 256))
+            .collect();
+        assert!(
+            validate_routing_rule(&too_big).is_err(),
+            "1024 явных + 515 шаблонных доменов > 1024"
+        );
+    }
+
+    #[test]
+    fn deliverable_maximum_passes_validation() {
+        let mut rule = routing_fixture_rule(true);
+        rule.template_domains = false;
+        rule.template_ips = true;
+        rule.direct_domains = (0..1024).map(|i| format!("d{i}.ru")).collect();
+        rule.ips = (0..512)
+            .map(|i| format!("10.{}.{}.{}/32", i / 65536, (i / 256) % 256, i % 256))
+            .collect();
+        assert!(validate_routing_rule(&rule).is_ok());
+        let raw = serde_json::to_string(&routing_rule_json(&rule, None)).unwrap();
+        assert!(routing_event_line(&raw).len() <= 65_536);
+    }
+
+    #[test]
+    fn long_domains_are_rejected_by_event_size() {
+        let mut rule = routing_fixture_rule(true);
+        rule.template_domains = false;
+        rule.template_ips = true;
+        rule.direct_domains = (0..1024)
+            .map(|i| format!("{}{}.ru", "d".repeat(54), i))
+            .collect();
+        rule.ips = (0..512)
+            .map(|i| format!("10.{}.{}.{}/32", i / 65536, (i / 256) % 256, i % 256))
+            .collect();
+        assert!(validate_routing_rule(&rule).is_err());
     }
 }
