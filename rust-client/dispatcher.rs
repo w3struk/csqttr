@@ -480,12 +480,64 @@ pub struct WorkerChannels {
 #[derive(Clone, Debug, Default)]
 pub struct DomainRoutingConfig {
     pub enabled: bool,
-    pub template_domains: bool,
     pub direct_domains: Arc<Vec<String>>,
     pub is_whitelist: bool,
-    pub ip_routing_enabled: bool,
     pub ip_is_whitelist: bool,
-    pub ip_rules: Arc<Vec<crate::sni::IpRule>>,
+    pub ip_rules: Arc<crate::sni::IpRuleSet>,
+    pub template_ip_rules: Arc<crate::sni::IpRuleSet>,
+}
+
+impl DomainRoutingConfig {
+    pub fn ip_routing_enabled(&self) -> bool {
+        self.has_ip_rules()
+    }
+
+    pub fn ip_matches(&self, ip: &IpAddr) -> bool {
+        self.ip_rules.matches(ip) || self.template_ip_rules.matches(ip)
+    }
+
+    pub fn has_ip_rules(&self) -> bool {
+        !(self.ip_rules.is_empty() && self.template_ip_rules.is_empty())
+    }
+
+    pub fn with_template_ip_rules(&self, set: crate::sni::IpRuleSet) -> Self {
+        let mut updated = self.clone();
+        updated.template_ip_rules = Arc::new(set);
+        updated
+    }
+}
+
+const MAX_IP_LIST_BYTES: usize = 1 << 20;
+
+fn is_hex_sha(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+pub(crate) fn decode_ip_list_blob(blob_b64: &str, expected_sha: &str) -> anyhow::Result<String> {
+    use base64::Engine;
+    use sha2::Digest;
+    use std::io::Read;
+
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(blob_b64.trim())
+        .map_err(|error| anyhow::anyhow!("битый base64 списка адресов: {error}"))?;
+    let mut unpacked = Vec::new();
+    flate2::read::GzDecoder::new(decoded.as_slice())
+        .take(MAX_IP_LIST_BYTES as u64 + 1)
+        .read_to_end(&mut unpacked)
+        .map_err(|error| anyhow::anyhow!("битый gzip списка адресов: {error}"))?;
+    if unpacked.len() > MAX_IP_LIST_BYTES {
+        anyhow::bail!("список адресов больше {MAX_IP_LIST_BYTES} байт");
+    }
+    let text = String::from_utf8(unpacked)
+        .map_err(|error| anyhow::anyhow!("список адресов не UTF-8: {error}"))?;
+    let actual_sha = hex::encode(sha2::Sha256::digest(text.as_bytes()));
+    if !actual_sha.eq_ignore_ascii_case(expected_sha) {
+        anyhow::bail!(
+            "sha списка адресов не совпал: ожидался {expected_sha}, получен {actual_sha}"
+        );
+    }
+    Ok(text)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1219,62 +1271,98 @@ impl Dispatcher {
             }
         }
     }
+}
 
-    pub fn update_domain_routing(&self, payload: &str) {
-        let mut enabled = false;
-        let mut template = false;
-        let mut is_whitelist = false;
-        let mut ip_routing_enabled = false;
-        let mut ip_is_whitelist = false;
-        let mut domains = Vec::new();
-        let mut ip_rules = Vec::new();
-        for part in payload.split(';') {
-            if let Some((k, v)) = part.split_once('=') {
-                match k.trim() {
-                    "enabled" => enabled = v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"),
-                    "template" => {
-                        template = v.trim() == "1" || v.trim().eq_ignore_ascii_case("true")
-                    }
-                    "whitelist" | "is_whitelist" => {
-                        is_whitelist = v.trim() == "1" || v.trim().eq_ignore_ascii_case("true")
-                    }
-                    "ip_enabled" => {
-                        ip_routing_enabled =
-                            v.trim() == "1" || v.trim().eq_ignore_ascii_case("true")
-                    }
-                    "ip_whitelist" | "ip_is_whitelist" => {
-                        ip_is_whitelist = v.trim() == "1" || v.trim().eq_ignore_ascii_case("true")
-                    }
-                    "domains" => {
-                        domains = crate::sni::parse_direct_domains(v.trim());
-                    }
-                    "ips" => {
-                        ip_rules = crate::sni::parse_ip_rules(v.trim());
-                    }
-                    _ => {}
-                }
+pub(crate) fn apply_domain_update(
+    config: &DomainRoutingConfig,
+    payload: &str,
+) -> DomainRoutingConfig {
+    let mut enabled = false;
+    let mut is_whitelist = false;
+    let mut ip_is_whitelist = false;
+    let mut domains = Vec::new();
+    let mut ip_rules = crate::sni::IpRuleSet::default();
+    for part in payload.split(';') {
+        if let Some((k, v)) = part.split_once('=') {
+            let truthy = v.trim() == "1" || v.trim().eq_ignore_ascii_case("true");
+            match k.trim() {
+                "enabled" => enabled = truthy,
+                // `template` и `ip_enabled` приходят от старого приложения; шаблон
+                // адресов теперь живёт в отдельном наборе и отдельной команде.
+                "whitelist" | "is_whitelist" => is_whitelist = truthy,
+                "ip_whitelist" | "ip_is_whitelist" => ip_is_whitelist = truthy,
+                "domains" => domains = crate::sni::parse_direct_domains(v.trim()),
+                "ips" => ip_rules = crate::sni::IpRuleSet::parse(v.trim()),
+                _ => {}
             }
         }
-        domains.truncate(1024);
-        let new_config = DomainRoutingConfig {
-            enabled,
-            template_domains: template,
-            direct_domains: Arc::new(domains.clone()),
-            is_whitelist,
-            ip_routing_enabled,
-            ip_is_whitelist,
-            ip_rules: Arc::new(ip_rules),
+    }
+    domains.truncate(1024);
+    DomainRoutingConfig {
+        enabled,
+        direct_domains: Arc::new(domains),
+        is_whitelist,
+        ip_is_whitelist,
+        ip_rules: Arc::new(ip_rules),
+        template_ip_rules: config.template_ip_rules.clone(),
+    }
+}
+
+impl Dispatcher {
+    pub fn update_template_ip_rules(&self, sha: &str, blob: Option<&str>) -> anyhow::Result<usize> {
+        let store = |set: crate::sni::IpRuleSet| {
+            let current = self.domain_routing.load();
+            let updated = current.with_template_ip_rules(set);
+            self.domain_routing.store(Arc::new(updated));
+            if let Some(relay) = &self.direct_relay {
+                relay.invalidate_route_caches();
+            }
         };
+
+        if sha.is_empty() {
+            store(crate::sni::IpRuleSet::default());
+            crate::log_error!("[КЛИЕНТ] UPDATE_IPS: шаблон очищен");
+            return Ok(0);
+        }
+        if !is_hex_sha(sha) {
+            anyhow::bail!(
+                "ожидается 64 hex-символа sha, получено {} символов",
+                sha.len()
+            );
+        }
+        let blob = blob.ok_or_else(|| anyhow::anyhow!("нет данных списка адресов"))?;
+        let text = decode_ip_list_blob(blob, sha)?;
+        let set = crate::sni::IpRuleSet::parse(&text);
+        if set.is_empty() {
+            anyhow::bail!("список адресов пуст");
+        }
+        let intervals = set.len();
+        store(set);
+        crate::log_error!(
+            "[КЛИЕНТ] UPDATE_IPS: шаблон обновлён, sha={sha}, интервалов={intervals}"
+        );
+        Ok(intervals)
+    }
+
+    pub fn update_domain_routing(&self, payload: &str) {
+        let current = self.domain_routing.load();
+        let new_config = apply_domain_update(&current, payload);
+        let enabled = new_config.enabled;
+        let domains = new_config.direct_domains.len();
+        let is_whitelist = new_config.is_whitelist;
+        let ip_is_whitelist = new_config.ip_is_whitelist;
+        let ip_rules = new_config.ip_rules.len();
+        let template_ip_rules = new_config.template_ip_rules.len();
         self.domain_routing.store(Arc::new(new_config.clone()));
         crate::log_error!(
-            "[КЛИЕНТ] Горячее обновление доменов: вкл={}, шаблоны={}, кастомных={}, ЧС/БС={}, IP вкл={}, IP ЧС/БС={}, IP правил={}",
+            "[КЛИЕНТ] Горячее обновление доменов: вкл={}, кастомных={}, ЧС/БС={}, IP вкл={}, IP ЧС/БС={}, IP правил={}, шаблонных интервалов={}",
             enabled,
-            template,
-            domains.len(),
+            domains,
             is_whitelist,
-            ip_routing_enabled,
+            new_config.ip_routing_enabled(),
             ip_is_whitelist,
-            new_config.ip_rules.len()
+            ip_rules,
+            template_ip_rules
         );
         if let Some(relay) = &self.direct_relay {
             relay.sync_domain_routing(&new_config);
@@ -1284,7 +1372,7 @@ impl Dispatcher {
     #[inline(always)]
     fn inspect_domain_routing(&self, packet: &PacketBuf) {
         let config = self.domain_routing.load();
-        if !config.enabled && !config.ip_routing_enabled {
+        if !config.enabled && !config.ip_routing_enabled() {
             return;
         }
         let slice = packet.as_slice();
@@ -1297,7 +1385,6 @@ impl Dispatcher {
                 && crate::sni::is_direct_domain_mode(
                     &domain,
                     config.is_whitelist,
-                    config.template_domains,
                     &config.direct_domains,
                 )
             {
@@ -1321,7 +1408,6 @@ impl Dispatcher {
                 && crate::sni::is_direct_domain_mode(
                     sni,
                     config.is_whitelist,
-                    config.template_domains,
                     &config.direct_domains,
                 )
                 && !self.direct_ips.load().contains(&ip)
@@ -2305,11 +2391,10 @@ mod tests {
             crate::dispatcher::DomainRoutingConfig {
                 enabled: true,
                 is_whitelist: false,
-                template_domains: false,
                 direct_domains: vec!["example.com".to_string()].into(),
-                ip_routing_enabled: false,
                 ip_is_whitelist: false,
-                ip_rules: vec![].into(),
+                ip_rules: std::sync::Arc::new(crate::sni::IpRuleSet::default()),
+                template_ip_rules: std::sync::Arc::new(crate::sni::IpRuleSet::default()),
             },
         ));
         let direct_ips = Arc::new(ArcSwap::from_pointee(HashSet::new()));
@@ -2421,5 +2506,102 @@ mod tests {
         let idx = state.select(20, 1000, now);
         assert!(idx < 20);
         assert!(state.cursor < 20);
+    }
+
+    #[test]
+    fn ip_routing_is_enabled_when_either_set_is_non_empty() {
+        let explicit = DomainRoutingConfig {
+            ip_rules: Arc::new(crate::sni::IpRuleSet::parse("1.1.1.1")),
+            ..Default::default()
+        };
+        let template = DomainRoutingConfig {
+            template_ip_rules: Arc::new(crate::sni::IpRuleSet::parse("10.0.0.0/8")),
+            ..Default::default()
+        };
+        assert!(explicit.ip_routing_enabled());
+        assert!(template.ip_routing_enabled());
+        assert!(!DomainRoutingConfig::default().ip_routing_enabled());
+        assert!(template.ip_matches(&"10.1.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn template_rules_survive_an_explicit_list_update() {
+        let before = DomainRoutingConfig {
+            template_ip_rules: Arc::new(crate::sni::IpRuleSet::parse("10.0.0.0/8")),
+            ..Default::default()
+        };
+        let after = apply_domain_update(&before, "enabled=0;ips=1.2.3.4");
+        assert!(
+            after
+                .template_ip_rules
+                .matches(&"10.0.0.1".parse().unwrap())
+        );
+        assert!(after.ip_rules.matches(&"1.2.3.4".parse().unwrap()));
+        assert!(after.ip_routing_enabled());
+    }
+
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn update_ips_replaces_only_the_template_set() {
+        let config = DomainRoutingConfig {
+            ip_rules: Arc::new(crate::sni::IpRuleSet::parse("1.1.1.1")),
+            ..Default::default()
+        };
+        let updated = config.with_template_ip_rules(crate::sni::IpRuleSet::parse("10.0.0.0/8"));
+        assert!(updated.ip_rules.matches(&"1.1.1.1".parse().unwrap()));
+        assert!(
+            updated
+                .template_ip_rules
+                .matches(&"10.0.0.1".parse().unwrap())
+        );
+        assert!(updated.ip_routing_enabled());
+    }
+
+    #[test]
+    fn clearing_the_template_keeps_explicit_rules() {
+        let config = DomainRoutingConfig {
+            ip_rules: Arc::new(crate::sni::IpRuleSet::parse("1.1.1.1")),
+            template_ip_rules: Arc::new(crate::sni::IpRuleSet::parse("10.0.0.0/8")),
+            ..Default::default()
+        };
+        let cleared = config.with_template_ip_rules(crate::sni::IpRuleSet::default());
+        assert!(cleared.ip_rules.matches(&"1.1.1.1".parse().unwrap()));
+        assert!(cleared.template_ip_rules.is_empty());
+        assert!(cleared.ip_routing_enabled());
+    }
+
+    #[test]
+    fn blob_sha_mismatch_is_rejected() {
+        use base64::Engine;
+        let blob = base64::engine::general_purpose::STANDARD.encode(gzip(b"10.0.0.0/8\n"));
+        assert!(decode_ip_list_blob(&blob, &"0".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn corrupted_blob_is_rejected() {
+        use base64::Engine;
+        use sha2::Digest;
+        let sha = hex::encode(sha2::Sha256::digest(b"anything"));
+        assert!(decode_ip_list_blob("not-base64!", &sha).is_err());
+        let encoded = base64::engine::general_purpose::STANDARD.encode(b"not gzip");
+        assert!(decode_ip_list_blob(&encoded, &sha).is_err());
+    }
+
+    #[test]
+    fn a_matching_blob_is_decoded() {
+        use base64::Engine;
+        use sha2::Digest;
+        let text = "10.0.0.0/8\n192.168.0.0/16\n";
+        let sha = hex::encode(sha2::Sha256::digest(text.as_bytes()));
+        let blob = base64::engine::general_purpose::STANDARD.encode(gzip(text.as_bytes()));
+        assert_eq!(decode_ip_list_blob(&blob, &sha).unwrap(), text);
     }
 }

@@ -24,6 +24,7 @@ pub struct StreamRepairCommand {
     pub worker_ids: Vec<u16>,
 }
 
+#[expect(clippy::too_many_arguments)]
 pub fn config_request(
     local_port: &str,
     password: &str,
@@ -32,6 +33,7 @@ pub fn config_request(
     worker_id: usize,
     desired_count: Option<usize>,
     config_owner: bool,
+    routing_ips_sha: Option<&str>,
 ) -> String {
     let desired_count = desired_count.map_or_else(String::new, |value| value.to_string());
     let base = format!(
@@ -41,11 +43,21 @@ pub fn config_request(
         // Только config-owner просит сервер прислать решение о маршрутизации:
         // остальные воркеры получают голый TUNCONF. Поле добавлено в конец,
         // поэтому старый сервер его игнорирует, а новый без поля обслуживает
-        // клиента по-прежнему — один раз на поколение.
-        format!("{base}|owner")
+        // клиента по-прежнему — один раз на поколение. Восьмое поле — sha
+        // закешированного адресного списка; не-owner его не читает и не получает.
+        match routing_ips_sha {
+            Some(sha) => format!("{base}|owner|{sha}"),
+            None => format!("{base}|owner"),
+        }
     } else {
         base
     }
+}
+
+pub fn parse_routing_ips_sha(value: &str) -> Option<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    (normalized.len() == 64 && normalized.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then_some(normalized)
 }
 
 pub fn parse_config_response(response: &[u8]) -> Result<ConfigResponse> {
@@ -177,20 +189,64 @@ mod tests {
 
     #[test]
     fn request_matches_go_contract() {
-        let req1 = config_request("9000", "pass1234567890ab", 7, "salt", 4, None, false);
+        let req1 = config_request("9000", "pass1234567890ab", 7, "salt", 4, None, false, None);
         assert_eq!(req1, "GETCONF:9000|pass1234567890ab|7|salt|4|");
 
-        let req2 = config_request("9000", "pass1234567890ab", 7, "salt", 4, Some(36), false);
+        let req2 = config_request(
+            "9000",
+            "pass1234567890ab",
+            7,
+            "salt",
+            4,
+            Some(36),
+            false,
+            None,
+        );
         assert_eq!(req2, "GETCONF:9000|pass1234567890ab|7|salt|4|36");
     }
 
     #[test]
     fn config_owner_marks_its_request() {
-        let owner = config_request("9000", "pass", 7, "salt", 1, Some(10), true);
+        let owner = config_request("9000", "pass", 7, "salt", 1, Some(10), true, None);
         assert_eq!(owner, "GETCONF:9000|pass|7|salt|1|10|owner");
 
-        let worker = config_request("9000", "pass", 7, "salt", 2, Some(10), false);
+        let worker = config_request("9000", "pass", 7, "salt", 2, Some(10), false, None);
         assert_eq!(worker, "GETCONF:9000|pass|7|salt|2|10");
+    }
+
+    #[test]
+    fn owner_with_a_cached_sha_appends_an_eighth_field() {
+        let sha = "5cf0b8862ad4f3318831dcf2e94076e221320ff47d77f1a12ebe661f613f70f6";
+        assert_eq!(
+            config_request("9000", "pass", 7, "salt", 4, Some(10), true, Some(sha)),
+            format!("GETCONF:9000|pass|7|salt|4|10|owner|{sha}")
+        );
+        assert_eq!(
+            config_request("9000", "pass", 7, "salt", 4, Some(10), true, None),
+            "GETCONF:9000|pass|7|salt|4|10|owner"
+        );
+        assert_eq!(
+            config_request("9000", "pass", 7, "salt", 4, Some(10), false, Some(sha)),
+            "GETCONF:9000|pass|7|salt|4|10"
+        );
+    }
+
+    #[test]
+    fn malformed_sha_is_dropped_instead_of_sent() {
+        assert_eq!(parse_routing_ips_sha("not-a-sha"), None);
+        assert_eq!(
+            parse_routing_ips_sha(
+                "5CF0B8862AD4F3318831DCF2E94076E221320FF47D77F1A12EBE661F613F70F6"
+            )
+            .map(|value| value.len()),
+            Some(64)
+        );
+        assert_eq!(
+            parse_routing_ips_sha(
+                "5CF0B8862AD4F3318831DCF2E94076E221320FF47D77F1A12EBE661F613F70F6"
+            ),
+            Some("5cf0b8862ad4f3318831dcf2e94076e221320ff47d77f1a12ebe661f613f70f6".to_owned())
+        );
     }
 
     #[test]
@@ -324,7 +380,7 @@ mod tests {
 
     #[test]
     fn test_two_stage_handshake_requests_and_responses() {
-        let req1 = config_request("45000", "pass123", 789, "salt99", 1, None, false);
+        let req1 = config_request("45000", "pass123", 789, "salt99", 1, None, false, None);
         assert_eq!(req1, "GETCONF:45000|pass123|789|salt99|1|");
 
         let req2 = workers_request("pass123", 25);

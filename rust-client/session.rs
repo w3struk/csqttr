@@ -94,6 +94,7 @@ pub struct SessionConfig {
     pub server_stream_repair: Arc<AtomicBool>,
     pub repair: Arc<RepairState>,
     pub configured_workers: usize,
+    pub routing_ips_sha: Option<Arc<str>>,
 }
 
 pub struct SessionRuntime {
@@ -122,6 +123,7 @@ fn build_registration_payload(config: &SessionConfig) -> Bytes {
         config.id,
         Some(config.configured_workers.max(1)),
         config.get_config,
+        config.routing_ips_sha.as_deref(),
     ))
 }
 
@@ -213,6 +215,7 @@ pub struct RoutingReassembler {
     chunks: Vec<Option<String>>,
     received_count: usize,
     finished: bool,
+    oversize: Option<usize>,
 }
 
 impl RoutingReassembler {
@@ -220,7 +223,12 @@ impl RoutingReassembler {
         Self::default()
     }
 
+    pub fn take_oversize_error(&mut self) -> Option<usize> {
+        self.oversize.take()
+    }
+
     pub fn feed(&mut self, payload: &[u8]) -> Option<String> {
+        self.oversize = None;
         let text = std::str::from_utf8(payload).ok()?;
         let rest = text.strip_prefix("ROUTING:")?;
         if let Some(total_str) = rest.strip_prefix("START:") {
@@ -302,7 +310,7 @@ impl RoutingReassembler {
                 .read_to_end(&mut decompressed);
             if read.is_ok() {
                 if decompressed.len() > MAX_ROUTING_PAYLOAD_BYTES {
-                    report_routing_payload_too_large(decompressed.len());
+                    self.report_oversize(decompressed.len());
                     return None;
                 }
                 // A gzip header can never be valid UTF-8, so a bad inner stream is a hard reject.
@@ -310,19 +318,20 @@ impl RoutingReassembler {
             }
         }
         if decoded.len() > MAX_ROUTING_PAYLOAD_BYTES {
-            report_routing_payload_too_large(decoded.len());
+            self.report_oversize(decoded.len());
             return None;
         }
         String::from_utf8(decoded).ok()
     }
-}
 
-fn report_routing_payload_too_large(size: usize) {
-    crate::log_error!(
-        "[СЕССИЯ] Правило маршрутизации слишком велико (>{} байт, получено {}), событие отброшено",
-        MAX_ROUTING_PAYLOAD_BYTES,
-        size
-    );
+    fn report_oversize(&mut self, size: usize) {
+        crate::log_error!(
+            "[СЕССИЯ] Правило маршрутизации слишком велико (>{} байт, получено {}), событие отброшено",
+            MAX_ROUTING_PAYLOAD_BYTES,
+            size
+        );
+        self.oversize = Some(size);
+    }
 }
 
 struct ReaderRuntime {
@@ -1334,10 +1343,20 @@ async fn request_configuration(
                             }
                             continue;
                         }
-                        if let Some(json) = routing_reassembler.feed(packet.as_slice())
+                        if let Some(json) = routing_reassembler.feed(packet.as_slice()) {
+                            if emits_routing {
+                                events.routing(&json);
+                            }
+                        } else if let Some(size) = routing_reassembler.take_oversize_error()
                             && emits_routing
                         {
-                            events.routing(&json);
+                            events.error(
+                                "routing_payload_too_large",
+                                &format!(
+                                    "ROUTING: {size} байт, предел {MAX_ROUTING_PAYLOAD_BYTES}"
+                                ),
+                                true,
+                            );
                         }
                         continue;
                     }
@@ -1550,10 +1569,18 @@ async fn reader_loop(
                 }
                 continue;
             }
-            if let Some(json) = routing_reassembler.feed(packet.as_slice())
+            if let Some(json) = routing_reassembler.feed(packet.as_slice()) {
+                if emits_routing {
+                    events.routing(&json);
+                }
+            } else if let Some(size) = routing_reassembler.take_oversize_error()
                 && emits_routing
             {
-                events.routing(&json);
+                events.error(
+                    "routing_payload_too_large",
+                    &format!("ROUTING: {size} байт, предел {MAX_ROUTING_PAYLOAD_BYTES}"),
+                    true,
+                );
             }
             continue;
         }
@@ -1687,6 +1714,7 @@ mod tests {
             server_stream_repair: Arc::new(AtomicBool::new(false)),
             repair: RepairState::new(18),
             configured_workers: 18,
+            routing_ips_sha: None,
         };
         assert_eq!(
             select_turn_address(&addresses, &config).unwrap(),
@@ -1715,6 +1743,7 @@ mod tests {
             server_stream_repair: Arc::new(AtomicBool::new(false)),
             repair: RepairState::new(9),
             configured_workers: 18,
+            routing_ips_sha: None,
         };
         assert_eq!(
             build_registration_payload(&config).as_ref(),
@@ -2445,6 +2474,33 @@ mod tests {
             None
         );
         assert_eq!(reassembler.feed(b"ROUTING:FINISH:1"), None);
+    }
+
+    #[test]
+    fn oversized_routing_chunk_is_fatal_too() {
+        use base64::Engine;
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+
+        let bomb = "a".repeat(MAX_ROUTING_PAYLOAD_BYTES + 10);
+        let mut enc = GzEncoder::new(Vec::new(), Compression::best());
+        enc.write_all(bomb.as_bytes()).unwrap();
+        let compressed = enc.finish().unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&compressed);
+
+        let mut reassembler = RoutingReassembler::new();
+        assert_eq!(reassembler.feed(b"ROUTING:START:1"), None);
+        assert_eq!(
+            reassembler.feed(format!("ROUTING:1:1:{b64}").as_bytes()),
+            None
+        );
+        assert_eq!(reassembler.feed(b"ROUTING:FINISH:1"), None);
+        assert_eq!(
+            reassembler.take_oversize_error(),
+            Some(MAX_ROUTING_PAYLOAD_BYTES + 1)
+        );
+        assert_eq!(reassembler.take_oversize_error(), None);
     }
 
     #[test]

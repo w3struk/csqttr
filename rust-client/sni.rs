@@ -1,6 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::sync::{LazyLock, RwLock};
+use std::sync::RwLock;
 use std::time::Instant;
 
 pub fn extract_tls_sni(payload: &[u8]) -> Option<&str> {
@@ -210,35 +210,6 @@ pub fn extract_dns_info(payload: &[u8]) -> Option<(String, bool, Vec<IpAddr>)> {
     }
 }
 
-pub static TEMPLATE_DOMAINS_RAW: &str = include_str!("../domains.txt");
-
-pub static TEMPLATE_DOMAINS_SET: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
-    let mut set = HashSet::with_capacity(512);
-    for line in TEMPLATE_DOMAINS_RAW.lines() {
-        let trimmed = line.trim();
-        if !trimmed.is_empty() && !trimmed.starts_with('#') {
-            set.insert(trimmed);
-        }
-    }
-    set
-});
-
-pub fn is_template_domain(sni: &str) -> bool {
-    let host = sni.trim_end_matches('.').to_ascii_lowercase();
-    if TEMPLATE_DOMAINS_SET.contains(host.as_str()) {
-        return true;
-    }
-    let mut cursor = 0;
-    while let Some(pos) = host[cursor..].find('.') {
-        let sub = &host[cursor + pos + 1..];
-        if TEMPLATE_DOMAINS_SET.contains(sub) {
-            return true;
-        }
-        cursor += pos + 1;
-    }
-    false
-}
-
 pub fn is_domain_in_list(sni: &str, direct_domains: &[String]) -> bool {
     let sni_trimmed = sni.trim_end_matches('.');
     let sni_bytes = sni_trimmed.as_bytes();
@@ -261,98 +232,98 @@ pub fn is_domain_in_list(sni: &str, direct_domains: &[String]) -> bool {
     false
 }
 
-pub fn is_direct_domain(sni: &str, template_domains: bool, direct_domains: &[String]) -> bool {
-    let sni_trimmed = sni.trim_end_matches('.');
-    if template_domains && is_template_domain(sni_trimmed) {
-        return true;
-    }
-    is_domain_in_list(sni_trimmed, direct_domains)
+pub fn is_direct_domain(sni: &str, direct_domains: &[String]) -> bool {
+    is_domain_in_list(sni.trim_end_matches('.'), direct_domains)
 }
 
-pub fn is_direct_domain_mode(
-    sni: &str,
-    is_whitelist: bool,
-    template_domains: bool,
-    direct_domains: &[String],
-) -> bool {
+pub fn is_direct_domain_mode(sni: &str, is_whitelist: bool, direct_domains: &[String]) -> bool {
     let sni_trimmed = sni.trim_end_matches('.');
     if is_whitelist {
         !is_domain_in_list(sni_trimmed, direct_domains)
     } else {
-        is_direct_domain(sni_trimmed, template_domains, direct_domains)
+        is_direct_domain(sni_trimmed, direct_domains)
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum IpRule {
-    Single(Ipv4Addr),
-    Cidr(Ipv4Addr, u8),
-    Range(u32, u32),
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IpRuleSet {
+    ranges: Vec<(u32, u32)>,
 }
 
-impl IpRule {
-    pub fn matches(&self, ip: &IpAddr) -> bool {
-        match (self, ip) {
-            (IpRule::Single(rule_ip), IpAddr::V4(addr)) => rule_ip == addr,
-            (IpRule::Cidr(rule_ip, prefix_len), IpAddr::V4(addr)) => {
-                if *prefix_len == 0 {
-                    return true;
-                }
-                if *prefix_len > 32 {
-                    return false;
-                }
-                let mask = !((1u32 << (32 - prefix_len)) - 1);
-                (u32::from(*addr) & mask) == (u32::from(*rule_ip) & mask)
+impl IpRuleSet {
+    pub fn parse(input: &str) -> Self {
+        let mut ranges = Vec::new();
+        for token in input.split(|c: char| c.is_whitespace() || c == ',' || c == ';') {
+            let cleaned = token
+                .trim()
+                .trim_matches(|c: char| c == ',' || c == ';' || c == '"' || c == '\'');
+            if cleaned.is_empty() {
+                continue;
             }
-            (IpRule::Range(start, end), IpAddr::V4(addr)) => {
-                let val = u32::from(*addr);
-                val >= *start && val <= *end
-            }
-            _ => false,
-        }
-    }
-}
-
-pub fn parse_ip_rules(input: &str) -> Vec<IpRule> {
-    let mut rules = Vec::new();
-    for token in input.split(|c: char| c.is_whitespace() || c == ',' || c == ';') {
-        let cleaned = token
-            .trim()
-            .trim_matches(|c: char| c == ',' || c == ';' || c == '"' || c == '\'');
-        if cleaned.is_empty() {
-            continue;
-        }
-        if let Some((ip_str, prefix_str)) = cleaned.split_once('/') {
-            if let Ok(ip) = ip_str.trim().parse::<Ipv4Addr>()
-                && let Ok(prefix) = prefix_str.trim().parse::<u8>()
-                && prefix <= 32
-            {
-                let rule = IpRule::Cidr(ip, prefix);
-                if !rules.contains(&rule) {
-                    rules.push(rule);
+            if let Some((ip_str, prefix_str)) = cleaned.split_once('/') {
+                if let Ok(ip) = ip_str.trim().parse::<Ipv4Addr>()
+                    && let Ok(prefix) = prefix_str.trim().parse::<u8>()
+                    && prefix <= 32
+                {
+                    ranges.push(cidr_bounds(u32::from(ip), prefix));
                 }
-            }
-        } else if let Some((start_str, end_str)) = cleaned.split_once('-') {
-            if let Ok(ip1) = start_str.trim().parse::<Ipv4Addr>()
-                && let Ok(ip2) = end_str.trim().parse::<Ipv4Addr>()
-            {
-                let start = u32::from(ip1);
-                let end = u32::from(ip2);
-                if start <= end {
-                    let rule = IpRule::Range(start, end);
-                    if !rules.contains(&rule) {
-                        rules.push(rule);
+            } else if let Some((start_str, end_str)) = cleaned.split_once('-') {
+                if let Ok(ip1) = start_str.trim().parse::<Ipv4Addr>()
+                    && let Ok(ip2) = end_str.trim().parse::<Ipv4Addr>()
+                {
+                    let start = u32::from(ip1);
+                    let end = u32::from(ip2);
+                    if start <= end {
+                        ranges.push((start, end));
                     }
                 }
-            }
-        } else if let Ok(ip) = cleaned.parse::<Ipv4Addr>() {
-            let rule = IpRule::Single(ip);
-            if !rules.contains(&rule) {
-                rules.push(rule);
+            } else if let Ok(ip) = cleaned.parse::<Ipv4Addr>() {
+                let value = u32::from(ip);
+                ranges.push((value, value));
             }
         }
+
+        ranges.sort_unstable();
+        let mut merged: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
+        for (start, end) in ranges {
+            if let Some(last) = merged.last_mut()
+                && start <= last.1.saturating_add(1)
+            {
+                last.1 = last.1.max(end);
+                continue;
+            }
+            merged.push((start, end));
+        }
+        Self { ranges: merged }
     }
-    rules
+
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.ranges.len()
+    }
+
+    pub fn matches(&self, ip: &IpAddr) -> bool {
+        let IpAddr::V4(v4) = ip else {
+            return false;
+        };
+        let value = u32::from(*v4);
+        let index = self.ranges.partition_point(|(_, end)| *end < value);
+        self.ranges
+            .get(index)
+            .is_some_and(|(start, _)| *start <= value)
+    }
+}
+
+fn cidr_bounds(ip: u32, prefix: u8) -> (u32, u32) {
+    if prefix == 0 {
+        return (0, u32::MAX);
+    }
+    let mask = !((1u32 << (32 - prefix)) - 1);
+    let network = ip & mask;
+    (network, network | !mask)
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -367,25 +338,27 @@ pub fn evaluate_route(
     domain: Option<&str>,
     domain_routing_enabled: bool,
     domain_is_whitelist: bool,
-    template_domains: bool,
     direct_domains: &[String],
     ip_routing_enabled: bool,
     ip_is_whitelist: bool,
-    ip_rules: &[IpRule],
+    ip_rules: &IpRuleSet,
+    template_ip_rules: &IpRuleSet,
 ) -> RouteVerdict {
     if !domain_routing_enabled && !ip_routing_enabled {
         return RouteVerdict::Tunnel;
     }
 
+    let ip_matches = ip_rules.matches(dst_ip) || template_ip_rules.matches(dst_ip);
+
     if domain_routing_enabled
         && !domain_is_whitelist
         && let Some(d) = domain
-        && is_direct_domain(d, template_domains, direct_domains)
+        && is_direct_domain(d, direct_domains)
     {
         return RouteVerdict::Direct;
     }
 
-    if ip_routing_enabled && !ip_is_whitelist && ip_rules.iter().any(|r| r.matches(dst_ip)) {
+    if ip_routing_enabled && !ip_is_whitelist && ip_matches {
         return RouteVerdict::Direct;
     }
 
@@ -397,12 +370,14 @@ pub fn evaluate_route(
         return RouteVerdict::Tunnel;
     }
 
-    if ip_routing_enabled && ip_is_whitelist && ip_rules.iter().any(|r| r.matches(dst_ip)) {
+    if ip_routing_enabled && ip_is_whitelist && ip_matches {
         return RouteVerdict::Tunnel;
     }
 
     let has_whitelist = (domain_routing_enabled && domain_is_whitelist)
-        || (ip_routing_enabled && ip_is_whitelist && !ip_rules.is_empty());
+        || (ip_routing_enabled
+            && ip_is_whitelist
+            && !(ip_rules.is_empty() && template_ip_rules.is_empty()));
 
     if has_whitelist {
         RouteVerdict::Direct
@@ -688,31 +663,18 @@ pub fn extract_src_addr(packet: &[u8]) -> Option<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::any;
 
     #[test]
     fn test_direct_domain_matching() {
         let custom = vec!["discord.com".to_string(), "telegram.org".to_string()];
-        assert!(is_direct_domain("discord.com", false, &custom));
-        assert!(is_direct_domain("cdn.discord.com", false, &custom));
-        assert!(is_direct_domain("telegram.org", false, &custom));
-        assert!(is_direct_domain("api.telegram.org", false, &custom));
-        assert!(!is_direct_domain("google.com", false, &custom));
-        assert!(!is_direct_domain("yandex.ru", false, &custom));
-        assert!(is_direct_domain("yandex.net", true, &custom));
-        assert!(!is_direct_domain("yandex.net", false, &custom));
-    }
-
-    #[test]
-    fn test_template_domains_matching() {
-        assert!(is_template_domain("yandex.net"));
-        assert!(is_template_domain("speed.yandex.net"));
-        assert!(is_template_domain("static.yastatic.net"));
-        assert!(is_template_domain("vk.com"));
-        assert!(is_template_domain("m.vk.com"));
-        assert!(is_template_domain("api.vk.me"));
-        assert!(is_template_domain("wildberries.ru"));
-        assert!(!is_template_domain("google.com"));
-        assert!(!is_template_domain("netflix.com"));
+        assert!(is_direct_domain("discord.com", &custom));
+        assert!(is_direct_domain("cdn.discord.com", &custom));
+        assert!(is_direct_domain("telegram.org", &custom));
+        assert!(is_direct_domain("api.telegram.org", &custom));
+        assert!(!is_direct_domain("google.com", &custom));
+        assert!(!is_direct_domain("yandex.ru", &custom));
+        assert!(!is_direct_domain("yandex.net", &custom));
     }
 
     #[test]
@@ -933,94 +895,46 @@ mod tests {
     #[test]
     fn test_domain_whitelist_inversion_direct_routing() {
         let white_domains = vec!["special.com".to_string(), "vpn-only.org".to_string()];
-        assert!(!is_direct_domain_mode(
-            "special.com",
-            true,
-            false,
-            &white_domains
-        ));
+        assert!(!is_direct_domain_mode("special.com", true, &white_domains));
         assert!(!is_direct_domain_mode(
             "sub.special.com",
             true,
-            false,
             &white_domains
         ));
-        assert!(!is_direct_domain_mode(
-            "vpn-only.org",
-            true,
-            false,
-            &white_domains
-        ));
-        assert!(is_direct_domain_mode(
-            "google.com",
-            true,
-            false,
-            &white_domains
-        ));
-        assert!(is_direct_domain_mode(
-            "yandex.ru",
-            true,
-            false,
-            &white_domains
-        ));
+        assert!(!is_direct_domain_mode("vpn-only.org", true, &white_domains));
+        assert!(is_direct_domain_mode("google.com", true, &white_domains));
+        assert!(is_direct_domain_mode("yandex.ru", true, &white_domains));
     }
 
     #[test]
     fn test_domain_blacklist_direct_routing() {
         let black_domains = vec!["blocked.com".to_string(), "direct.org".to_string()];
-        assert!(is_direct_domain_mode(
-            "blocked.com",
-            false,
-            false,
-            &black_domains
-        ));
+        assert!(is_direct_domain_mode("blocked.com", false, &black_domains));
         assert!(is_direct_domain_mode(
             "sub.blocked.com",
             false,
-            false,
             &black_domains
         ));
-        assert!(!is_direct_domain_mode(
-            "normal.com",
-            false,
-            false,
-            &black_domains
-        ));
+        assert!(!is_direct_domain_mode("normal.com", false, &black_domains));
     }
 
-    #[test]
-    fn test_ip_rules_parsing_cidr_single_and_range() {
-        let rules_str = "1.2.3.4, 10.0.0.0/8; 192.168.1.1-192.168.1.50, invalid-ip, 999.999.999.999, 10.0.0.1/33";
-        let rules = parse_ip_rules(rules_str);
-        assert_eq!(rules.len(), 3);
-        assert_eq!(rules[0], IpRule::Single(Ipv4Addr::new(1, 2, 3, 4)));
-        assert_eq!(rules[1], IpRule::Cidr(Ipv4Addr::new(10, 0, 0, 0), 8));
-        assert_eq!(
-            rules[2],
-            IpRule::Range(
-                u32::from(Ipv4Addr::new(192, 168, 1, 1)),
-                u32::from(Ipv4Addr::new(192, 168, 1, 50))
-            )
-        );
-    }
-
-    fn ip_verdict(ip: &IpAddr, enabled: bool, whitelist: bool, rules: &[IpRule]) -> RouteVerdict {
+    fn ip_verdict(ip: &IpAddr, enabled: bool, whitelist: bool, rules: &IpRuleSet) -> RouteVerdict {
         evaluate_route(
             ip,
             None,
-            false,
             false,
             false,
             &[],
             enabled,
             whitelist,
             rules,
+            &IpRuleSet::default(),
         )
     }
 
     #[test]
     fn test_ip_direct_mode_blacklist_and_whitelist() {
-        let rules = parse_ip_rules("1.1.1.1, 10.0.0.0/24, 172.16.0.10-172.16.0.20");
+        let rules = IpRuleSet::parse("1.1.1.1, 10.0.0.0/24, 172.16.0.10-172.16.0.20");
         let ip_1_1_1_1 = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
         let ip_10_0_0_50 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 50));
         let ip_172_16_0_15 = IpAddr::V4(Ipv4Addr::new(172, 16, 0, 15));
@@ -1068,7 +982,7 @@ mod tests {
 
     #[test]
     fn test_ip_edge_cases_cidr_0_and_32_and_invalid_ranges() {
-        let rules_cidr0 = parse_ip_rules("0.0.0.0/0");
+        let rules_cidr0 = IpRuleSet::parse("0.0.0.0/0");
         let ip1 = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
         let ip2 = IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255));
         assert_eq!(
@@ -1080,7 +994,7 @@ mod tests {
             RouteVerdict::Direct
         );
 
-        let rules_cidr32 = parse_ip_rules("192.168.1.100/32");
+        let rules_cidr32 = IpRuleSet::parse("192.168.1.100/32");
         let ip_match = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100));
         let ip_no_match = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 101));
         assert_eq!(
@@ -1092,7 +1006,7 @@ mod tests {
             RouteVerdict::Tunnel
         );
 
-        let invalid_and_valid = parse_ip_rules("10.0.0.20-10.0.0.10 8.8.8.8");
+        let invalid_and_valid = IpRuleSet::parse("10.0.0.20-10.0.0.10 8.8.8.8");
         let ip_mid = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 15));
         assert_eq!(
             ip_verdict(&ip_mid, true, false, &invalid_and_valid),
@@ -1116,8 +1030,27 @@ mod tests {
 
     #[test]
     fn test_evaluate_route_universal_matrix() {
-        let ip_rules = parse_ip_rules("1.1.1.1, 10.0.0.0/8, 172.16.0.0/16");
+        let ip_rules = IpRuleSet::parse("1.1.1.1, 10.0.0.0/8, 172.16.0.0/16");
+        let template = IpRuleSet::default();
         let direct_domains = vec!["vk.com".to_string(), "yandex.ru".to_string()];
+        let route = |ip: &IpAddr,
+                     domain: Option<&str>,
+                     domains: bool,
+                     whitelist: bool,
+                     ips: bool,
+                     ip_whitelist: bool| {
+            evaluate_route(
+                ip,
+                domain,
+                domains,
+                whitelist,
+                &direct_domains,
+                ips,
+                ip_whitelist,
+                &ip_rules,
+                &template,
+            )
+        };
 
         let ip_1_1_1_1 = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
         let ip_10_1_2_3 = IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3));
@@ -1125,252 +1058,79 @@ mod tests {
         let ip_77_88_8_8 = IpAddr::V4(Ipv4Addr::new(77, 88, 8, 8));
 
         assert_eq!(
-            evaluate_route(
-                &ip_1_1_1_1,
-                Some("vk.com"),
-                false,
-                false,
-                false,
-                &[],
-                false,
-                false,
-                &[]
-            ),
-            RouteVerdict::Tunnel
-        );
-
-        assert_eq!(
-            evaluate_route(
-                &ip_8_8_8_8,
-                Some("vk.com"),
-                true,
-                false,
-                false,
-                &direct_domains,
-                true,
-                true,
-                &ip_rules
-            ),
-            RouteVerdict::Direct
-        );
-        assert_eq!(
-            evaluate_route(
-                &ip_77_88_8_8,
-                Some("gosuslugi.ru"),
-                true,
-                false,
-                false,
-                &direct_domains,
-                true,
-                true,
-                &ip_rules
-            ),
-            RouteVerdict::Direct
-        );
-        assert_eq!(
-            evaluate_route(
-                &ip_1_1_1_1,
-                Some("google.com"),
-                true,
-                false,
-                false,
-                &direct_domains,
-                true,
-                true,
-                &ip_rules
-            ),
+            route(&ip_1_1_1_1, Some("vk.com"), false, false, false, false),
             RouteVerdict::Tunnel
         );
         assert_eq!(
-            evaluate_route(
-                &ip_10_1_2_3,
-                None,
-                true,
-                false,
-                false,
-                &direct_domains,
-                true,
-                true,
-                &ip_rules
-            ),
+            route(&ip_8_8_8_8, Some("vk.com"), true, false, true, true),
+            RouteVerdict::Direct
+        );
+        assert_eq!(
+            route(&ip_77_88_8_8, Some("gosuslugi.ru"), true, false, true, true),
+            RouteVerdict::Direct
+        );
+        assert_eq!(
+            route(&ip_1_1_1_1, Some("google.com"), true, false, true, true),
             RouteVerdict::Tunnel
         );
         assert_eq!(
-            evaluate_route(
-                &ip_8_8_8_8,
-                Some("cloudflare.com"),
-                true,
-                false,
-                false,
-                &direct_domains,
-                true,
-                true,
-                &ip_rules
-            ),
-            RouteVerdict::Direct
-        );
-        assert_eq!(
-            evaluate_route(
-                &ip_8_8_8_8,
-                None,
-                true,
-                false,
-                false,
-                &direct_domains,
-                true,
-                true,
-                &ip_rules
-            ),
-            RouteVerdict::Direct
-        );
-        assert_eq!(
-            evaluate_route(
-                &ip_1_1_1_1,
-                Some("vk.com"),
-                true,
-                false,
-                false,
-                &direct_domains,
-                true,
-                true,
-                &ip_rules
-            ),
-            RouteVerdict::Direct
-        );
-
-        assert_eq!(
-            evaluate_route(
-                &ip_8_8_8_8,
-                Some("vk.com"),
-                true,
-                false,
-                false,
-                &direct_domains,
-                true,
-                false,
-                &ip_rules
-            ),
-            RouteVerdict::Direct
-        );
-        assert_eq!(
-            evaluate_route(
-                &ip_1_1_1_1,
-                Some("google.com"),
-                true,
-                false,
-                false,
-                &direct_domains,
-                true,
-                false,
-                &ip_rules
-            ),
-            RouteVerdict::Direct
-        );
-        assert_eq!(
-            evaluate_route(
-                &ip_8_8_8_8,
-                Some("google.com"),
-                true,
-                false,
-                false,
-                &direct_domains,
-                true,
-                false,
-                &ip_rules
-            ),
-            RouteVerdict::Tunnel
-        );
-
-        assert_eq!(
-            evaluate_route(
-                &ip_8_8_8_8,
-                Some("vk.com"),
-                true,
-                true,
-                false,
-                &direct_domains,
-                true,
-                true,
-                &ip_rules
-            ),
+            route(&ip_10_1_2_3, None, true, false, true, true),
             RouteVerdict::Tunnel
         );
         assert_eq!(
-            evaluate_route(
-                &ip_1_1_1_1,
-                Some("unlisted.com"),
-                true,
-                true,
-                false,
-                &direct_domains,
-                true,
-                true,
-                &ip_rules
-            ),
-            RouteVerdict::Tunnel
-        );
-        assert_eq!(
-            evaluate_route(
-                &ip_8_8_8_8,
-                Some("unlisted.com"),
-                true,
-                true,
-                false,
-                &direct_domains,
-                true,
-                true,
-                &ip_rules
-            ),
-            RouteVerdict::Direct
-        );
-
-        assert_eq!(
-            evaluate_route(
-                &ip_1_1_1_1,
-                Some("vk.com"),
-                true,
-                true,
-                false,
-                &direct_domains,
-                true,
-                false,
-                &ip_rules
-            ),
+            route(&ip_8_8_8_8, Some("cloudflare.com"), true, false, true, true),
             RouteVerdict::Direct
         );
         assert_eq!(
-            evaluate_route(
-                &ip_8_8_8_8,
-                Some("vk.com"),
-                true,
-                true,
-                false,
-                &direct_domains,
-                true,
-                false,
-                &ip_rules
-            ),
+            route(&ip_8_8_8_8, None, true, false, true, true),
+            RouteVerdict::Direct
+        );
+        assert_eq!(
+            route(&ip_1_1_1_1, Some("vk.com"), true, false, true, true),
+            RouteVerdict::Direct
+        );
+        assert_eq!(
+            route(&ip_8_8_8_8, Some("vk.com"), true, false, true, false),
+            RouteVerdict::Direct
+        );
+        assert_eq!(
+            route(&ip_1_1_1_1, Some("google.com"), true, false, true, false),
+            RouteVerdict::Direct
+        );
+        assert_eq!(
+            route(&ip_8_8_8_8, Some("google.com"), true, false, true, false),
             RouteVerdict::Tunnel
         );
         assert_eq!(
-            evaluate_route(
-                &ip_8_8_8_8,
-                Some("unlisted.com"),
-                true,
-                true,
-                false,
-                &direct_domains,
-                true,
-                false,
-                &ip_rules
-            ),
+            route(&ip_8_8_8_8, Some("vk.com"), true, true, true, true),
+            RouteVerdict::Tunnel
+        );
+        assert_eq!(
+            route(&ip_1_1_1_1, Some("unlisted.com"), true, true, true, true),
+            RouteVerdict::Tunnel
+        );
+        assert_eq!(
+            route(&ip_8_8_8_8, Some("unlisted.com"), true, true, true, true),
+            RouteVerdict::Direct
+        );
+        assert_eq!(
+            route(&ip_1_1_1_1, Some("vk.com"), true, true, true, false),
+            RouteVerdict::Direct
+        );
+        assert_eq!(
+            route(&ip_8_8_8_8, Some("vk.com"), true, true, true, false),
+            RouteVerdict::Tunnel
+        );
+        assert_eq!(
+            route(&ip_8_8_8_8, Some("unlisted.com"), true, true, true, false),
             RouteVerdict::Direct
         );
     }
 
     #[test]
     fn test_evaluate_route_user_reported_scenario() {
-        let ip_rules = parse_ip_rules("193.106.141.229");
+        let ip_rules = IpRuleSet::parse("193.106.141.229");
+        let template = IpRuleSet::default();
         let direct_domains = vec!["notion.so".to_string()];
 
         let ping_eu_ip = IpAddr::V4(Ipv4Addr::new(193, 106, 141, 229));
@@ -1383,11 +1143,11 @@ mod tests {
                 Some("yandex.ru"),
                 true,
                 true,
-                false,
                 &direct_domains,
                 true,
                 true,
-                &ip_rules
+                &ip_rules,
+                &template,
             ),
             RouteVerdict::Direct,
             "yandex.ru must go Direct when not in whitelists"
@@ -1398,43 +1158,41 @@ mod tests {
                 None,
                 true,
                 true,
-                false,
                 &direct_domains,
                 true,
                 true,
-                &ip_rules
+                &ip_rules,
+                &template,
             ),
             RouteVerdict::Direct,
             "yandex IP must go Direct when not in IP whitelist"
         );
-
         assert_eq!(
             evaluate_route(
                 &notion_ip,
                 Some("notion.so"),
                 true,
                 true,
-                false,
                 &direct_domains,
                 true,
                 true,
-                &ip_rules
+                &ip_rules,
+                &template,
             ),
             RouteVerdict::Tunnel,
             "notion.so must go Tunnel because it is in domain whitelist"
         );
-
         assert_eq!(
             evaluate_route(
                 &ping_eu_ip,
                 Some("ping.eu"),
                 true,
                 true,
-                false,
                 &direct_domains,
                 true,
                 true,
-                &ip_rules
+                &ip_rules,
+                &template,
             ),
             RouteVerdict::Tunnel,
             "ping.eu must go Tunnel because its IP is in IP whitelist"
@@ -1445,14 +1203,127 @@ mod tests {
                 None,
                 true,
                 true,
-                false,
                 &direct_domains,
                 true,
                 true,
-                &ip_rules
+                &ip_rules,
+                &template,
             ),
             RouteVerdict::Tunnel,
             "ping.eu IP with None domain must go Tunnel because it matches IP whitelist"
         );
+    }
+
+    #[test]
+    fn evaluate_route_matches_the_union_of_explicit_and_template_rules() {
+        let explicit = IpRuleSet::parse("1.1.1.1");
+        let template = IpRuleSet::parse("10.0.0.0/8");
+        let verdict = |ip: &str| {
+            evaluate_route(
+                &ip.parse().unwrap(),
+                None,
+                false,
+                false,
+                &[],
+                true,
+                false,
+                &explicit,
+                &template,
+            )
+        };
+        assert_eq!(verdict("10.1.1.1"), RouteVerdict::Direct);
+        assert_eq!(verdict("1.1.1.1"), RouteVerdict::Direct);
+        assert_eq!(verdict("8.8.8.8"), RouteVerdict::Tunnel);
+    }
+
+    #[test]
+    fn a_trailing_dot_and_subdomain_still_match_the_explicit_domain_list() {
+        let direct = vec!["example.com".to_string()];
+        assert!(is_direct_domain("example.com.", &direct));
+        assert!(is_direct_domain("www.example.com", &direct));
+        assert!(is_direct_domain_mode("api.example.com.", false, &direct));
+        assert!(!is_direct_domain_mode("api.example.com.", true, &direct));
+    }
+
+    #[test]
+    fn ip_rule_set_merges_ranges_and_searches_like_a_linear_scan() {
+        let set = IpRuleSet::parse("10.0.0.0/8, 10.1.2.3, 192.168.1.1-192.168.1.50, 192.168.1.51");
+        assert!(set.matches(&"10.1.2.3".parse().unwrap()));
+        assert!(set.matches(&"192.168.1.50".parse().unwrap()));
+        assert!(set.matches(&"192.168.1.51".parse().unwrap()));
+        assert!(!set.matches(&"11.0.0.1".parse().unwrap()));
+        assert!(!set.matches(&"::1".parse().unwrap()));
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn ip_rule_set_treats_garbage_as_an_empty_set() {
+        assert!(IpRuleSet::parse("").is_empty());
+        assert!(IpRuleSet::parse("   ").is_empty());
+        assert!(IpRuleSet::parse("not-an-ip").is_empty());
+        assert!(IpRuleSet::parse("10.0.0.0/33").is_empty());
+        assert!(IpRuleSet::parse("10.0.0.20-10.0.0.10").is_empty());
+    }
+
+    fn cidr_bounds_for_test(ip: u32, prefix: u8) -> (u32, u32) {
+        if prefix == 0 {
+            return (0, u32::MAX);
+        }
+        let mask = !((1u32 << (32 - prefix)) - 1);
+        let network = ip & mask;
+        (network, network | !mask)
+    }
+
+    fn format_proptest_rule(start: u32, end: u32) -> String {
+        if start == end {
+            return Ipv4Addr::from(start).to_string();
+        }
+        for prefix in 0..=32u8 {
+            if cidr_bounds_for_test(start, prefix) == (start, end) {
+                return format!("{}/{}", Ipv4Addr::from(start), prefix);
+            }
+        }
+        format!("{}-{}", Ipv4Addr::from(start), Ipv4Addr::from(end))
+    }
+
+    fn arbitrary_interval() -> impl proptest::prelude::Strategy<Value = (u32, u32)> {
+        use proptest::prelude::*;
+        prop_oneof![
+            any::<u32>().prop_map(|value| (value, value)),
+            (any::<u32>(), any::<u32>()).prop_map(|(a, b)| if a <= b { (a, b) } else { (b, a) }),
+            (any::<u32>(), 0u8..=32).prop_map(|(base, prefix)| cidr_bounds_for_test(base, prefix)),
+        ]
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn ip_rule_set_matches_a_linear_oracle(
+            rules in proptest::collection::vec(arbitrary_interval(), 0..16),
+            probes in proptest::collection::vec(any::<u32>(), 0..32),
+        ) {
+            let text = rules
+                .iter()
+                .map(|&(start, end)| format_proptest_rule(start, end))
+                .collect::<Vec<_>>()
+                .join(",");
+            let set = IpRuleSet::parse(&text);
+            let mut values = probes;
+            for (start, end) in &rules {
+                values.push(*start);
+                values.push(*end);
+                values.push(start.wrapping_sub(1));
+                values.push(end.wrapping_add(1));
+            }
+            for value in values {
+                let expected = rules.iter().any(|(start, end)| *start <= value && value <= *end);
+                proptest::prop_assert_eq!(
+                    set.matches(&IpAddr::V4(Ipv4Addr::from(value))),
+                    expected,
+                    "value {} text {}",
+                    value,
+                    text
+                );
+            }
+        }
     }
 }
