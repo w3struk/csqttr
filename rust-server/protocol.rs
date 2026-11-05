@@ -629,6 +629,10 @@ impl PasswordEpochSlot {
 pub struct PasswordEpochState {
     generation_id: u64,
     session_salt: String,
+    /// Поколение, которому решение о маршрутизации уже отправлено (только для
+    /// клиентов без метки config-owner). Живёт вместе с epoch-слотом, поэтому
+    /// свипер чистит его автоматически.
+    routing_delivered: Option<u64>,
 }
 
 impl PasswordEpochState {
@@ -636,6 +640,7 @@ impl PasswordEpochState {
         Self {
             generation_id,
             session_salt,
+            routing_delivered: None,
         }
     }
 
@@ -643,9 +648,22 @@ impl PasswordEpochState {
         if generation_id != self.generation_id || session_salt != self.session_salt {
             self.generation_id = generation_id;
             self.session_salt = session_salt.to_owned();
+            self.routing_delivered = None;
             PasswordEpochDecision::Replaced
         } else {
             PasswordEpochDecision::Current
+        }
+    }
+
+    /// Старые клиенты без метки `owner` получают решение один раз на поколение.
+    /// Новый клиент эту карту не использует: ему решение шлётся в каждом его
+    /// запросе.
+    fn claim_routing_delivery(&mut self, generation_id: u64) -> bool {
+        if self.routing_delivered == Some(generation_id) {
+            false
+        } else {
+            self.routing_delivered = Some(generation_id);
+            true
         }
     }
 
@@ -4633,6 +4651,40 @@ fn purge_replaced_worker_sessions(
     }
 }
 
+/// Маркер «у этого подключения правила маршрутизации нет».
+///
+/// Один `ROUTING:`-префикс с рессемблером: старый клиент видит обычный
+/// `ROUTING:`-пакет, `RoutingReassembler::feed` его не разбирает и молча
+/// отбрасывает, поэтому маркер безопасен для смешанных версий. Новый клиент
+/// распознаёт его до рессемблера и шлёт в приложение `ROUTING_ABSENT`, по
+/// которому приложение очищает ранее полученное правило.
+///
+/// Без маркера отсутствие правила неотличимо от «в конфиге правила нет»:
+/// после отвязки правила оператором приложение держало бы старый whitelist.
+pub const ROUTING_ABSENT: &[u8] = b"ROUTING:ABSENT";
+
+/// Просит ли этот GETCONF решение о маршрутизации.
+///
+/// Решение нужно только config-owner'у: событие `CONFIG` в приложение шлёт
+/// именно он, и план VPN собирается из его ответа. Рассылка правила каждому
+/// воркеру давала шесть приоритетных пакетов на каждый `GETCONF`: при 80–100
+/// воркерах очередь UDP-TX (1024 слота) переполнялась, `TUNCONF` не доходил,
+/// клиент повторял запрос с первым таймаутом 400 мс — лавина.
+///
+/// Поле `owner` стоит седьмым: старый сервер его игнорирует, а клиент без
+/// поля получает прежнюю доставку — один раз на поколение.
+fn getconf_requests_routing(parts: &[&str]) -> bool {
+    parts
+        .get(2)
+        .and_then(|value| parse_generation_id(value.trim()))
+        .is_some()
+        && parts.get(6).is_some_and(|value| value.trim() == "owner")
+}
+
+// Прежняя доставка для клиентов без метки `owner` живёт в epoch-слоте
+// (`PasswordEpochState::claim_routing_delivery`): одно решение на поколение,
+// жизненный цикл совпадает с поколением пароля.
+
 fn routing_rule_json(rule: &crate::model::RoutingRule) -> serde_json::Value {
     serde_json::json!({
         "version": 3,
@@ -4708,6 +4760,8 @@ async fn handle_getconf(
             parts.get(6).copied().unwrap_or("").trim(),
         )
     };
+
+    let config_owner = getconf_requests_routing(&parts);
 
     let Some(generation_id) = parse_generation_id(generation_text) else {
         log_getconf_result(
@@ -5056,49 +5110,75 @@ async fn handle_getconf(
             },
         )?;
     }
-    writer.write(response.as_bytes()).await?;
-    if !reject_session
-        && worker_id <= 1
-        && let Some(rule) = routing_rule
-    {
-        let json_val = routing_rule_json(&rule);
-        let raw_json = serde_json::to_string(&json_val).unwrap_or_default();
-        use flate2::Compression;
-        use flate2::write::GzEncoder;
-        use std::io::Write;
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        let payload_bytes = if encoder.write_all(raw_json.as_bytes()).is_ok()
-            && let Ok(finish) = encoder.finish()
-        {
-            finish
-        } else {
-            raw_json.into_bytes()
-        };
-        use base64::Engine;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(&payload_bytes);
-        let chunk_size = 650;
-        let total_chunks = encoded.len().div_ceil(chunk_size);
-        let total_chunks = if total_chunks == 0 { 1 } else { total_chunks };
+    // Решение о маршрутизации уходит только тому, кто его применит:
+    // config-owner'у (он помечает GETCONF полем `owner`) либо — для старых
+    // клиентов без метки — одному воркеру на поколение. Рассылка каждому
+    // воркеру давала шесть приоритетных пакетов на каждый GETCONF; при 80–100
+    // воркерах очередь UDP-TX (1024 слота) переполнялась, TUNCONF не доходил,
+    // клиент повторял запрос — лавина.
+    if !reject_session && response.starts_with("TUNCONF:") {
+        let wants_routing = config_owner || epoch.claim_routing_delivery(generation_id);
+        if wants_routing {
+            let mode = if config_owner { "owner" } else { "legacy" };
+            log_event(
+                app,
+                "INFO",
+                "routing",
+                &format!(
+                    "ROUTING pass={} gen={} to={} rule={}",
+                    secret_tag(password),
+                    generation_id,
+                    mode,
+                    routing_rule.is_some()
+                ),
+            );
+            if let Some(rule) = routing_rule {
+                let json_val = routing_rule_json(&rule);
+                let raw_json = serde_json::to_string(&json_val).unwrap_or_default();
+                use flate2::Compression;
+                use flate2::write::GzEncoder;
+                use std::io::Write;
+                let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+                let payload_bytes = if encoder.write_all(raw_json.as_bytes()).is_ok()
+                    && let Ok(finish) = encoder.finish()
+                {
+                    finish
+                } else {
+                    raw_json.into_bytes()
+                };
+                use base64::Engine;
+                let encoded = base64::engine::general_purpose::STANDARD.encode(&payload_bytes);
+                let chunk_size = 650;
+                let total_chunks = encoded.len().div_ceil(chunk_size);
+                let total_chunks = if total_chunks == 0 { 1 } else { total_chunks };
 
-        let _ = writer
-            .write(format!("ROUTING:START:{total_chunks}").as_bytes())
-            .await;
-        for i in 1..=total_chunks {
-            let start = (i - 1) * chunk_size;
-            let end = std::cmp::min(i * chunk_size, encoded.len());
-            let chunk = if start < encoded.len() {
-                &encoded[start..end]
-            } else {
-                ""
-            };
-            let _ = writer
-                .write(format!("ROUTING:{i}:{total_chunks}:{chunk}").as_bytes())
-                .await;
+                let _ = writer
+                    .write(format!("ROUTING:START:{total_chunks}").as_bytes())
+                    .await;
+                for i in 1..=total_chunks {
+                    let start = (i - 1) * chunk_size;
+                    let end = std::cmp::min(i * chunk_size, encoded.len());
+                    let chunk = if start < encoded.len() {
+                        &encoded[start..end]
+                    } else {
+                        ""
+                    };
+                    let _ = writer
+                        .write(format!("ROUTING:{i}:{total_chunks}:{chunk}").as_bytes())
+                        .await;
+                }
+                let _ = writer
+                    .write(format!("ROUTING:FINISH:{total_chunks}").as_bytes())
+                    .await;
+            } else if config_owner {
+                let _ = writer.write(ROUTING_ABSENT).await;
+            }
         }
-        let _ = writer
-            .write(format!("ROUTING:FINISH:{total_chunks}").as_bytes())
-            .await;
     }
+    // Правило уходит до TUNCONF: приложение собирает VPN-план из ответа
+    // конфигурации, и если правило приходит следом, первый коннект после
+    // очистки правила падает в локальном режиме (гонка «план раньше правила»).
+    writer.write(response.as_bytes()).await?;
     drop(epoch);
     if reject_session {
         drop_exact_session(app, session);
@@ -6293,6 +6373,55 @@ mod tests {
             ip_is_whitelist: true,
             ips: vec!["10.66.67.0/24".to_owned()],
         }
+    }
+
+    #[test]
+    fn routing_absent_marker_is_a_routing_control_packet() {
+        // Маркер должен остаться в семействе `ROUTING:`: клиент считает такие
+        // пакеты управляющими и не отдаёт их в поток данных, а старый
+        // рессемблер молча отбрасывает неразобранный формат.
+        assert!(ROUTING_ABSENT.starts_with(b"ROUTING:"));
+        assert!(should_flush_udp_immediately(ROUTING_ABSENT));
+    }
+
+    #[test]
+    fn only_the_owner_request_asks_for_routing() {
+        assert!(getconf_requests_routing(&[
+            "9000", "pass", "7", "salt", "4", "10", "owner"
+        ]));
+        assert!(!getconf_requests_routing(&[
+            "9000", "pass", "7", "salt", "4", "10"
+        ]));
+        // Старый формат: parts[6] — desired_count, а не метка.
+        assert!(!getconf_requests_routing(&[
+            "9000", "token", "pass", "7", "salt", "4", "10"
+        ]));
+    }
+
+    #[test]
+    fn routing_is_delivered_once_per_generation_for_legacy_clients() {
+        let mut state = PasswordEpochState::default();
+        assert!(state.claim_routing_delivery(7));
+        assert!(!state.claim_routing_delivery(7));
+        // Новое поколение сбрасывает отметку доставки.
+        state.admit(8, "new-salt");
+        assert!(state.claim_routing_delivery(8));
+        assert!(!state.claim_routing_delivery(8));
+    }
+
+    #[test]
+    fn epoch_claim_resets_only_when_the_epoch_is_replaced() {
+        let mut state = PasswordEpochState::new(7, "salt".to_owned());
+        assert!(state.claim_routing_delivery(7));
+        assert!(!state.claim_routing_delivery(7));
+
+        // Тот же generation и salt — epoch не заменён, повторной доставки нет.
+        state.admit(7, "salt");
+        assert!(!state.claim_routing_delivery(7));
+
+        // Смена соли — новый epoch, решение доставляется снова.
+        state.admit(7, "other-salt");
+        assert!(state.claim_routing_delivery(7));
     }
 
     #[test]

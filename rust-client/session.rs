@@ -121,6 +121,7 @@ fn build_registration_payload(config: &SessionConfig) -> Bytes {
         &config.salt,
         config.id,
         Some(config.configured_workers.max(1)),
+        config.get_config,
     ))
 }
 
@@ -331,6 +332,9 @@ struct ReaderRuntime {
     shutdown: Arc<ShutdownCoordinator>,
     config_tx: mpsc::Sender<String>,
     routing_reassembler: RoutingReassembler,
+    /// Эмитить ли события маршрутизации: только config-owner, иначе решение,
+    /// разосланное всем воркерам, применилось бы в приложении многократно.
+    emits_routing: bool,
     scale_notify: Option<Arc<tokio::sync::Notify>>,
     target_workers: Option<Arc<AtomicUsize>>,
     configured_workers: usize,
@@ -1195,6 +1199,7 @@ async fn run_allocated_session(
             shutdown: runtime.shutdown.clone(),
             config_tx: runtime.config_tx.clone(),
             routing_reassembler,
+            emits_routing: config.get_config,
             scale_notify: runtime.scale_notify.clone(),
             target_workers: runtime.target_workers.clone(),
             configured_workers: runtime.configured_workers,
@@ -1286,6 +1291,10 @@ async fn request_configuration(
     scale: WorkerScale<'_>,
 ) -> Result<bool> {
     let request = build_registration_payload(config);
+    // Событие о маршрутизации эмитит только config-owner: сервер отдаёт решение
+    // каждому воркеру (owner выбирается на клиенте и не обязан быть первым),
+    // и без этого гейта приложение получало бы по событию с каждого воркера.
+    let emits_routing = config.get_config;
     'attempts: for (attempt, timeout_ms) in CONFIG_RESPONSE_TIMEOUT_MS.into_iter().enumerate() {
         if !config.srtp_mode.uses_dtls()
             && config.client_wrap_key != [0; 32]
@@ -1319,7 +1328,15 @@ async fn request_configuration(
                         continue;
                     }
                     if packet.as_slice().starts_with(b"ROUTING:") {
-                        if let Some(json) = routing_reassembler.feed(packet.as_slice()) {
+                        if packet.as_slice() == crate::protocol::ROUTING_ABSENT {
+                            if emits_routing {
+                                events.routing_absent();
+                            }
+                            continue;
+                        }
+                        if let Some(json) = routing_reassembler.feed(packet.as_slice())
+                            && emits_routing
+                        {
                             events.routing(&json);
                         }
                         continue;
@@ -1474,6 +1491,7 @@ async fn reader_loop(
         shutdown,
         config_tx,
         mut routing_reassembler,
+        emits_routing,
         scale_notify,
         target_workers,
         configured_workers,
@@ -1526,7 +1544,15 @@ async fn reader_loop(
             continue;
         }
         if packet.as_slice().starts_with(b"ROUTING:") {
-            if let Some(json) = routing_reassembler.feed(packet.as_slice()) {
+            if packet.as_slice() == crate::protocol::ROUTING_ABSENT {
+                if emits_routing {
+                    events.routing_absent();
+                }
+                continue;
+            }
+            if let Some(json) = routing_reassembler.feed(packet.as_slice())
+                && emits_routing
+            {
                 events.routing(&json);
             }
             continue;
@@ -1692,7 +1718,7 @@ mod tests {
         };
         assert_eq!(
             build_registration_payload(&config).as_ref(),
-            b"GETCONF:9000|pass1234|7|generation-id|1|18"
+            b"GETCONF:9000|pass1234|7|generation-id|1|18|owner"
         );
     }
 
@@ -2383,6 +2409,12 @@ mod tests {
         );
         let res = reassembler.feed(format!("ROUTING:1:3:{}", part1).as_bytes());
         assert_eq!(res, Some(original.to_string()));
+    }
+
+    #[test]
+    fn test_routing_reassembler_ignores_absent_marker() {
+        let mut reassembler = RoutingReassembler::new();
+        assert_eq!(reassembler.feed(crate::protocol::ROUTING_ABSENT), None);
     }
 
     #[test]

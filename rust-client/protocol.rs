@@ -5,6 +5,10 @@ use crate::wire_protocol::PATH_ECHO_PREFIX;
 pub const PANEL_RESTART_NOTICE: &[u8] = b"\xffCSQTT_PANEL_RESTART_V1\x00\x91\x7d\x03\xa8";
 pub const STREAM_REPAIR_PREFIX: &[u8] = b"\xffCSQTT_STREAM_REPAIR_V1";
 pub const STREAM_ALIVE_PREFIX: &[u8] = b"\xffCSQTT_STREAM_ALIVE_V1";
+/// `ROUTING:ABSENT` — у подключения нет правила маршрутизации. Лежит в
+/// семействе `ROUTING:`, поэтому считается управляющим пакетом; рессемблер
+/// такой формат не разбирает, и старые клиенты его молча отбрасывают.
+pub const ROUTING_ABSENT: &[u8] = b"ROUTING:ABSENT";
 const MAX_STREAM_WORKERS: u16 = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,9 +31,21 @@ pub fn config_request(
     salt: &str,
     worker_id: usize,
     desired_count: Option<usize>,
+    config_owner: bool,
 ) -> String {
     let desired_count = desired_count.map_or_else(String::new, |value| value.to_string());
-    format!("GETCONF:{local_port}|{password}|{generation_id}|{salt}|{worker_id}|{desired_count}")
+    let base = format!(
+        "GETCONF:{local_port}|{password}|{generation_id}|{salt}|{worker_id}|{desired_count}"
+    );
+    if config_owner {
+        // Только config-owner просит сервер прислать решение о маршрутизации:
+        // остальные воркеры получают голый TUNCONF. Поле добавлено в конец,
+        // поэтому старый сервер его игнорирует, а новый без поля обслуживает
+        // клиента по-прежнему — один раз на поколение.
+        format!("{base}|owner")
+    } else {
+        base
+    }
 }
 
 pub fn parse_config_response(response: &[u8]) -> Result<ConfigResponse> {
@@ -161,11 +177,20 @@ mod tests {
 
     #[test]
     fn request_matches_go_contract() {
-        let req1 = config_request("9000", "pass1234567890ab", 7, "salt", 4, None);
+        let req1 = config_request("9000", "pass1234567890ab", 7, "salt", 4, None, false);
         assert_eq!(req1, "GETCONF:9000|pass1234567890ab|7|salt|4|");
 
-        let req2 = config_request("9000", "pass1234567890ab", 7, "salt", 4, Some(36));
+        let req2 = config_request("9000", "pass1234567890ab", 7, "salt", 4, Some(36), false);
         assert_eq!(req2, "GETCONF:9000|pass1234567890ab|7|salt|4|36");
+    }
+
+    #[test]
+    fn config_owner_marks_its_request() {
+        let owner = config_request("9000", "pass", 7, "salt", 1, Some(10), true);
+        assert_eq!(owner, "GETCONF:9000|pass|7|salt|1|10|owner");
+
+        let worker = config_request("9000", "pass", 7, "salt", 2, Some(10), false);
+        assert_eq!(worker, "GETCONF:9000|pass|7|salt|2|10");
     }
 
     #[test]
@@ -299,7 +324,7 @@ mod tests {
 
     #[test]
     fn test_two_stage_handshake_requests_and_responses() {
-        let req1 = config_request("45000", "pass123", 789, "salt99", 1, None);
+        let req1 = config_request("45000", "pass123", 789, "salt99", 1, None, false);
         assert_eq!(req1, "GETCONF:45000|pass123|789|salt99|1|");
 
         let req2 = workers_request("pass123", 25);

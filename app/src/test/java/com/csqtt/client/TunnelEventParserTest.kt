@@ -128,6 +128,12 @@ class TunnelEventParserTest {
     }
 
     @Test
+    fun routingAbsentEventIsParsed() {
+        val event = TunnelEventParser.parse("__CSQTT_EVENT__|ROUTING_ABSENT|{}")
+        assertTrue(event is TunnelEventParser.Event.RoutingAbsent)
+    }
+
+    @Test
     fun detailedPerfEventsAreIgnored() {
         assertNull(
             TunnelEventParser.parse(

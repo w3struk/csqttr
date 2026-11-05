@@ -648,23 +648,22 @@ fun ExceptionsTab(
                             softWrap = false,
                             overflow = TextOverflow.Ellipsis,
                         )
-                        val domainsStatusText = if (serverRule != null) {
-                            when {
-                                serverRule.domainsIsWhite ->
-                                    "Правило сервера: белый список, ${serverRule.domains.size} доменов в туннеле"
-                                serverRule.templateDomains && serverRule.domains.isNotEmpty() ->
-                                    "Правило сервера: чёрный список, ${templateDomains.size} готовых + " +
-                                        "${serverRule.domains.size} своих исключено"
-                                serverRule.templateDomains ->
-                                    "Правило сервера: чёрный список, ${templateDomains.size} исключено " +
-                                        "(Готовый список RU)"
-                                serverRule.domains.isEmpty() ->
-                                    "Правило сервера: чёрный список, 0 доменов исключено"
-                                else ->
-                                    "Правило сервера: чёрный список, ${serverRule.domains.size} исключено"
-                            }
-                        } else {
-                            ""
+                        // Внутри `if (serverRuleActive)` K2 смарт-кастит `serverRule`
+                        // до не-null через сам флаг, поэтому отдельная проверка здесь
+                        // была бы константной.
+                        val domainsStatusText = when {
+                            serverRule.domainsIsWhite ->
+                                "Правило сервера: белый список, ${serverRule.domains.size} доменов в туннеле"
+                            serverRule.templateDomains && serverRule.domains.isNotEmpty() ->
+                                "Правило сервера: чёрный список, ${templateDomains.size} готовых + " +
+                                    "${serverRule.domains.size} своих исключено"
+                            serverRule.templateDomains ->
+                                "Правило сервера: чёрный список, ${templateDomains.size} исключено " +
+                                    "(Готовый список RU)"
+                            serverRule.domains.isEmpty() ->
+                                "Правило сервера: чёрный список, 0 доменов исключено"
+                            else ->
+                                "Правило сервера: чёрный список, ${serverRule.domains.size} исключено"
                         }
                         Text(
                             text = domainsStatusText,
@@ -729,14 +728,10 @@ fun ExceptionsTab(
                             softWrap = false,
                             overflow = TextOverflow.Ellipsis,
                         )
-                        val ipsStatusText = if (serverRule != null) {
-                            if (serverRule.ipIsWhite) {
-                                "Правило сервера: белый список, ${serverRule.ips.size} в туннеле"
-                            } else {
-                                "Правило сервера: чёрный список, ${serverRule.ips.size} исключено"
-                            }
+                        val ipsStatusText = if (serverRule.ipIsWhite) {
+                            "Правило сервера: белый список, ${serverRule.ips.size} в туннеле"
                         } else {
-                            ""
+                            "Правило сервера: чёрный список, ${serverRule.ips.size} исключено"
                         }
                         Text(
                             text = ipsStatusText,

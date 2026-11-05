@@ -482,16 +482,19 @@ object TunnelManager {
                             handleCriticalError("Сервер передал некорректное правило маршрутизации", identity)
                             return@launch
                         }
-                        val activeConf = config.value
-                        var clientIp = ""
-                        var dns = ""
-                        if (activeConf != null && activeConf.startsWith("TUNCONF:")) {
-                            val parts = activeConf.substring("TUNCONF:".length).split(":")
-                            clientIp = parts.getOrNull(0)?.trim().orEmpty()
-                            dns = parts.getOrNull(1)?.trim().orEmpty()
-                        }
+                        val (clientIp, dns) = RoutingConfigPolicy.tunnelEndpoints(config.value)
                         applyServerRoutingRule(rule, clientIp, dns)
                     }
+                }
+            }
+            is TunnelEventParser.Event.RoutingAbsent -> {
+                // Сервер явно сказал, что правила у этого подключения нет:
+                // очищаем ранее полученное, иначе после отвязки правила на
+                // сервере приложение продолжало бы применять старый whitelist.
+                activeScope.launch(Dispatchers.Main) {
+                    if (!isCurrent(identity)) return@launch
+                    val (clientIp, dns) = RoutingConfigPolicy.tunnelEndpoints(config.value)
+                    applyServerRoutingRule(null, clientIp, dns)
                 }
             }
             is TunnelEventParser.Event.Workers -> {
@@ -672,8 +675,12 @@ object TunnelManager {
                 return
             }
         }
-        if (newServerRule != null || activeServerRoutingRule.value != null) {
-            applyServerRoutingRule(newServerRule, clientIp, dns)
+        // В TUNCONF правила обычно нет (оно приходит отдельным событием ROUTING),
+        // поэтому null здесь означает «в конфиге правила нет», а не «правило снято».
+        // Иначе уже полученное правило затиралось бы при каждом подключении.
+        val ruleToApply = RoutingConfigPolicy.ruleToApply(newServerRule, activeServerRoutingRule.value)
+        if (ruleToApply != null) {
+            applyServerRoutingRule(ruleToApply, clientIp, dns)
         }
 
         activeContext()?.let { ctx ->

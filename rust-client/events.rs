@@ -70,6 +70,13 @@ impl Events {
         self.emit("ROUTING", || serde_json::json!({"routing": routing_json}));
     }
 
+    /// Сервер прислал `ROUTING:ABSENT`: правила у этого подключения нет.
+    /// Приложение по этому событию очищает ранее полученное правило — иначе
+    /// после отвязки правила на сервере оно оставалось бы в памяти.
+    pub fn routing_absent(&self) {
+        self.emit("ROUTING_ABSENT", || serde_json::json!({}));
+    }
+
     pub fn workers(&self, workers: u32) {
         self.emit("WORKERS", || serde_json::json!({"workers": workers}));
     }
