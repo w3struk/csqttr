@@ -4834,6 +4834,57 @@ fn routing_delivery_decision(
     }
 }
 
+/// Готовые строки доставки чанкованного правила: `START`, каждый чанк ДВАЖДЫ,
+/// `FINISH`. Построение вынесено из async-цикла, чтобы дублирование было
+/// юнит-тестируемым, а цикл только писал то, что ему дали.
+///
+/// Почему чанки дублируются. Избыточность раньше давал сам запрос: клиент слал
+/// `GETCONF` дважды, сервер отвечал двумя последовательностями, и рессемблер
+/// клиента дедуплицировал чанки по `seq` — у каждого чанка было ДВА шанса
+/// дойти, эффективная доставка `(1 − p²)^N`. После подавления дубля на коннект
+/// уходит одна последовательность, и при p ≈ 2–3 % на датаграмму полный blob
+/// (N ≈ 46) холодного старта перестал добираться: два retry и fatal
+/// `routing_payload_incomplete`. Дублированный `GETCONF` ничего не лечит,
+/// потому что повтор гасится окном, — поэтому второй шанс возвращаем на уровень
+/// чанка: две одинаковые строки подряд.
+///
+/// Второго события на клиенте это НЕ даёт: `RoutingReassembler::feed` пропускает
+/// чанк, если `chunks[seq - 1]` уже занят, а хвост после успешной сборки отсекает
+/// `assembled_total`. `START` и `FINISH` остаются по одному: второй `FINISH`
+/// после сборки был бы проигнорирован, но надёжности он не добавляет (чанки уже
+/// покрыты дублями), а лишний приоритетный пакет — стоит.
+///
+/// Цена: датаграмм на доставку становится `2 * N + 2` вместо `N + 2`, и все они
+/// под `should_flush_udp_immediately` (префикс `ROUTING:`) — то есть каждый
+/// уходит вне общей очереди как приоритетный. Это ожидаемо и даёт тот же порядок,
+/// что был до введения окна подавления (две полные последовательности =
+/// `2 * N + 4`, теперь на два пакета меньше), поэтому лимиты очереди UDP-TX
+/// (1024 слота) пересчитывать не нужно.
+///
+/// При изменении `chunk_size`, предела `MAX_ROUTING_PAYLOAD_BYTES` или числа
+/// чанков перепроверить это место: удвоенное число пакетов — размен на
+/// надёжность холодного старта, а не бесплатная страховка.
+fn routing_delivery_lines(encoded: &str, chunk_size: usize) -> Vec<String> {
+    let total_chunks = encoded.len().div_ceil(chunk_size);
+    let total_chunks = if total_chunks == 0 { 1 } else { total_chunks };
+    let mut lines = Vec::with_capacity(total_chunks * 2 + 2);
+    lines.push(format!("ROUTING:START:{total_chunks}"));
+    for i in 1..=total_chunks {
+        let start = (i - 1) * chunk_size;
+        let end = std::cmp::min(i * chunk_size, encoded.len());
+        let chunk = if start < encoded.len() {
+            &encoded[start..end]
+        } else {
+            ""
+        };
+        let line = format!("ROUTING:{i}:{total_chunks}:{chunk}");
+        lines.push(line.clone());
+        lines.push(line);
+    }
+    lines.push(format!("ROUTING:FINISH:{total_chunks}"));
+    lines
+}
+
 fn merged_domains(rule: &crate::model::RoutingRule) -> (Vec<String>, usize) {
     let mut domains = rule.direct_domains.clone();
     if rule.template_domains {
@@ -5401,27 +5452,11 @@ async fn handle_getconf(
                 use base64::Engine;
                 let encoded = base64::engine::general_purpose::STANDARD.encode(&payload_bytes);
                 let chunk_size = 650;
-                let total_chunks = encoded.len().div_ceil(chunk_size);
-                let total_chunks = if total_chunks == 0 { 1 } else { total_chunks };
-
-                let _ = writer
-                    .write(format!("ROUTING:START:{total_chunks}").as_bytes())
-                    .await;
-                for i in 1..=total_chunks {
-                    let start = (i - 1) * chunk_size;
-                    let end = std::cmp::min(i * chunk_size, encoded.len());
-                    let chunk = if start < encoded.len() {
-                        &encoded[start..end]
-                    } else {
-                        ""
-                    };
-                    let _ = writer
-                        .write(format!("ROUTING:{i}:{total_chunks}:{chunk}").as_bytes())
-                        .await;
+                // Цикл только пишет готовые строки: `START`, каждый чанк дважды,
+                // `FINISH` — зачем именно так, см. `routing_delivery_lines`.
+                for line in routing_delivery_lines(&encoded, chunk_size) {
+                    let _ = writer.write(line.as_bytes()).await;
                 }
-                let _ = writer
-                    .write(format!("ROUTING:FINISH:{total_chunks}").as_bytes())
-                    .await;
             }
         } else if delivery.absent {
             // Вне окна подавления: вторая копия дубля обязана получить маркер
@@ -6945,6 +6980,160 @@ mod tests {
                 chunks: false,
                 absent: false
             }
+        );
+    }
+
+    /// Разбор `ROUTING:<seq>:<total>:<chunk>` — для проверок формы доставки.
+    fn routing_chunk_line_parts(line: &str) -> (usize, usize, String) {
+        let rest = line
+            .strip_prefix("ROUTING:")
+            .expect("чанк-строка обязана начинаться с ROUTING:");
+        let mut parts = rest.splitn(3, ':');
+        let seq = parts
+            .next()
+            .expect("seq")
+            .parse()
+            .expect("seq обязан быть числом");
+        let total = parts
+            .next()
+            .expect("total")
+            .parse()
+            .expect("total обязан быть числом");
+        (seq, total, parts.next().expect("chunk").to_owned())
+    }
+
+    /// Только чанк-строки, без `START`/`FINISH`, в порядке отправки.
+    fn routing_sent_chunks(lines: &[String]) -> Vec<(usize, usize, String)> {
+        lines
+            .iter()
+            .filter(|line| {
+                !line.starts_with("ROUTING:START:") && !line.starts_with("ROUTING:FINISH:")
+            })
+            .map(|line| routing_chunk_line_parts(line))
+            .collect()
+    }
+
+    /// Избыточность возвращена на уровень чанка: каждый чанк уходит дважды, а
+    /// `START` и `FINISH` — по одному, чтобы на доставку по-прежнему приходило
+    /// ровно одно событие.
+    #[test]
+    fn every_chunk_is_sent_twice_while_start_and_finish_are_sent_once() {
+        // 12 символов при chunk_size = 4 → ровно N = 3.
+        let lines = routing_delivery_lines("Ab1Cd2Ef3Gh4", 4);
+
+        // 1 START + 6 чанк-строк + 1 FINISH.
+        assert_eq!(lines.len(), 8);
+        assert_eq!(lines.first().expect("START обязан быть"), "ROUTING:START:3");
+        assert_eq!(
+            lines.last().expect("FINISH обязан быть"),
+            "ROUTING:FINISH:3"
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with("ROUTING:START:"))
+                .count(),
+            1,
+            "START не дублируется"
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with("ROUTING:FINISH:"))
+                .count(),
+            1,
+            "FINISH не дублируется"
+        );
+
+        let chunks = routing_sent_chunks(&lines);
+        let seqs: Vec<usize> = chunks.iter().map(|(seq, _, _)| *seq).collect();
+        assert_eq!(
+            seqs,
+            vec![1, 1, 2, 2, 3, 3],
+            "копии идут подряд парами, порядок seq не меняется"
+        );
+        for (_, total, _) in &chunks {
+            assert_eq!(
+                *total, 3,
+                "total обязан остаться одинаковым во всех строках"
+            );
+        }
+        for pair in chunks.chunks(2) {
+            assert_eq!(
+                pair[0], pair[1],
+                "две копии одного чанка обязаны быть побайтово равны"
+            );
+        }
+        assert_eq!(chunks[0].2, "Ab1C");
+        assert_eq!(chunks[4].2, "3Gh4");
+    }
+
+    /// N = 1 (короткий payload): ровно два чанк-датаграмма между START и
+    /// FINISH — то есть один чанк и его копия, не больше и не меньше.
+    #[test]
+    fn single_chunk_delivery_is_start_then_two_copies_then_finish() {
+        assert_eq!(
+            routing_delivery_lines("Ab1C", 650),
+            vec![
+                "ROUTING:START:1".to_owned(),
+                "ROUTING:1:1:Ab1C".to_owned(),
+                "ROUTING:1:1:Ab1C".to_owned(),
+                "ROUTING:FINISH:1".to_owned(),
+            ]
+        );
+
+        // Прежнее поведение для пустого payload сохранено: total = 1, пустой
+        // чанк, и он тоже отправляется дважды.
+        let empty = routing_delivery_lines("", 650);
+        assert_eq!(empty.len(), 4);
+        assert_eq!(empty[1], "ROUTING:1:1:");
+        assert_eq!(empty[2], "ROUTING:1:1:");
+    }
+
+    /// Дубли не должны ломать склейку base64: клиент хранит чанки по `seq` и
+    /// отбрасывает занятую ячейку (`chunks[seq - 1].is_some()`), поэтому склейка
+    /// по первому вхождению обязана дать исходный `encoded` байт в байт.
+    #[test]
+    fn deduplicated_copies_concatenate_back_to_the_original_payload() {
+        // Полные N чанков без хвостового неполного — как живой прогон с blob'ом.
+        let chunk_size = 650;
+        let chunk_count = 46;
+        let encoded: String = (0..chunk_count * chunk_size)
+            .map(|k| char::from(b'A' + (k % 26) as u8))
+            .collect();
+
+        let lines = routing_delivery_lines(&encoded, chunk_size);
+        assert_eq!(lines.len(), chunk_count * 2 + 2);
+
+        // Ровно та логика, что в рессемблере: первую увиденную копию `seq`
+        // сохраняем, вторую выбрасываем.
+        let mut seen: HashSet<usize> = HashSet::new();
+        let mut by_seq: Vec<(usize, String)> = Vec::new();
+        for (seq, _total, chunk) in routing_sent_chunks(&lines) {
+            if seen.insert(seq) {
+                by_seq.push((seq, chunk));
+            }
+        }
+        assert_eq!(
+            by_seq.len(),
+            chunk_count,
+            "дубли не должны плодить новые ячейки сборки"
+        );
+        by_seq.sort_by_key(|(seq, _)| *seq);
+        let glued: String = by_seq.iter().map(|(_, chunk)| chunk.as_str()).collect();
+        assert_eq!(
+            glued, encoded,
+            "склейка дедуплицированных копий обязана совпасть"
+        );
+
+        use base64::Engine;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(glued.trim())
+            .expect("склейка копий обязана оставаться валидным base64");
+        assert_eq!(
+            decoded.len(),
+            encoded.len() / 4 * 3,
+            "полный блок base64 без padding декодируется целиком"
         );
     }
 
