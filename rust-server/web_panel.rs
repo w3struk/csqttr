@@ -9713,6 +9713,7 @@ const PANEL_HTML_TEMPLATE: &str = r##"
                 <span class="slider"></span>
             </label>
         </div>
+        <div class="input-hint">Вместе с готовым списком RU — до 1024 доменов; правило, которое не влезает в одно событие, сохранить нельзя.</div>
         <div class="input-group">
             <label for="ruleIpMode">Режим исключения адресов</label>
             <select id="ruleIpMode" onchange="onRuleIpModeChange()">
@@ -9720,6 +9721,11 @@ const PANEL_HTML_TEMPLATE: &str = r##"
                 <option value="whitelist">Белый список</option>
             </select>
         </div>
+        <div class="input-group">
+            <label for="ruleIps">Список адресов</label>
+            <textarea id="ruleIps" rows="3" style="width: 100%; background: var(--surface); color: var(--text-main); border: 1px solid var(--border); border-radius: 12px; padding: 10px; font-family: monospace; font-size: 12px;" placeholder="1.2.3.4/32&#10;1.2.3.4&#10;1.2.3.4-1.2.3.255"></textarea>
+        </div>
+        <div class="input-hint">До 512 адресов.</div>
         <div class="toggle-row" id="ruleTemplateIpsRow" style="margin-bottom: 16px;">
             <div style="display: flex; align-items: center; gap: 8px;">
                 <label for="ruleTemplateIps" style="cursor: pointer;">Готовый список RU адресов</label>
@@ -9731,11 +9737,6 @@ const PANEL_HTML_TEMPLATE: &str = r##"
                 <input type="checkbox" id="ruleTemplateIps">
                 <span class="slider"></span>
             </label>
-        </div>
-        <div class="input-hint">До 512 адресов; вместе с шаблонными доменами — до 1024 доменов; правило, которое не влезает в одно событие, сохранить нельзя.</div>
-        <div class="input-group">
-            <label for="ruleIps">Список адресов</label>
-            <textarea id="ruleIps" rows="3" style="width: 100%; background: var(--surface); color: var(--text-main); border: 1px solid var(--border); border-radius: 12px; padding: 10px; font-family: monospace; font-size: 12px;" placeholder="1.2.3.4/32&#10;1.2.3.4&#10;1.2.3.4-1.2.3.255"></textarea>
         </div>
         <div class="input-group">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; flex-wrap: wrap; gap: 6px;">
@@ -13617,6 +13618,37 @@ mod tests {
         assert!(PANEL_HTML.contains("text-size-adjust: none"));
         assert!(PANEL_HTML.contains(".toggle-row label"));
         assert!(PANEL_HTML.contains("white-space: nowrap"));
+    }
+
+    #[test]
+    fn routing_rule_dialog_reads_mode_then_list_then_hint_then_template_in_both_blocks() {
+        let html = PANEL_HTML.as_str();
+        let expected_order = [
+            "id=\"ruleDomainsMode\"",
+            "id=\"ruleDomains\"",
+            "id=\"ruleTemplateDomainsRow\"",
+            "Вместе с готовым списком RU — до 1024 доменов;",
+            "id=\"ruleIpMode\"",
+            "id=\"ruleIps\"",
+            "До 512 адресов.",
+            "id=\"ruleTemplateIpsRow\"",
+            "Применить правило к:",
+        ];
+        let mut previous = 0usize;
+        for marker in expected_order {
+            let at = html
+                .find(marker)
+                .unwrap_or_else(|| panic!("в разметке панели нет маркера {marker}"));
+            assert!(
+                at > previous,
+                "маркер {marker} стоит раньше предыдущего блока разметки"
+            );
+            previous = at;
+        }
+        assert!(
+            !html.contains("До 512 адресов;"),
+            "единый хинт про лимиты должен быть разбит на доменный и адресный"
+        );
     }
 
     #[test]
