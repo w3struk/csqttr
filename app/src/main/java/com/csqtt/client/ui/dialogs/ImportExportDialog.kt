@@ -66,8 +66,11 @@ fun ImportExportDialog(
 
     var includeTunnel by rememberSaveable { mutableStateOf(true) }
     var includeDeploy by rememberSaveable { mutableStateOf(true) }
-    var includeExceptions by rememberSaveable { mutableStateOf(true) }
     var includeSettings by rememberSaveable { mutableStateOf(true) }
+
+    // Один предикат на все четыре кнопки: добавление или удаление пункта не требует править
+    // их синхронно в четырёх местах.
+    val hasSelection = includeTunnel || includeDeploy || includeSettings
 
     var isProcessing by remember { mutableStateOf(false) }
 
@@ -86,7 +89,6 @@ fun ImportExportDialog(
                         jsonString = jsonText,
                         includeTunnel = includeTunnel,
                         includeDeploy = includeDeploy,
-                        includeExceptions = includeExceptions,
                         includeSettings = includeSettings
                     )
                     if (ok) {
@@ -191,11 +193,6 @@ fun ImportExportDialog(
                         onCheckedChange = { includeDeploy = it }
                     )
                     ConfigOptionRow(
-                        title = "Маршрут",
-                        checked = includeExceptions,
-                        onCheckedChange = { includeExceptions = it }
-                    )
-                    ConfigOptionRow(
                         title = "Настройки",
                         checked = includeSettings,
                         onCheckedChange = { includeSettings = it }
@@ -215,7 +212,6 @@ fun ImportExportDialog(
                                         val json = settingsStore.exportConfigJson(
                                             includeTunnel = includeTunnel,
                                             includeDeploy = includeDeploy,
-                                            includeExceptions = includeExceptions,
                                             includeSettings = includeSettings
                                         )
                                         clipboardManager.setText(AnnotatedString(json))
@@ -227,7 +223,7 @@ fun ImportExportDialog(
                                     }
                                 }
                             },
-                            enabled = !isProcessing && (includeTunnel || includeDeploy || includeExceptions || includeSettings),
+                            enabled = !isProcessing && hasSelection,
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .height(CsqttSizes.ControlHeight),
@@ -258,7 +254,6 @@ fun ImportExportDialog(
                                         val json = settingsStore.exportConfigJson(
                                             includeTunnel = includeTunnel,
                                             includeDeploy = includeDeploy,
-                                            includeExceptions = includeExceptions,
                                             includeSettings = includeSettings
                                         )
                                         val savedPath = saveJsonToDownloads(context, json)
@@ -274,7 +269,7 @@ fun ImportExportDialog(
                                     }
                                 }
                             },
-                            enabled = !isProcessing && (includeTunnel || includeDeploy || includeExceptions || includeSettings),
+                            enabled = !isProcessing && hasSelection,
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .height(CsqttSizes.ControlHeight),
@@ -310,7 +305,7 @@ fun ImportExportDialog(
                                     Toast.makeText(context, "Буфер обмена пуст", Toast.LENGTH_SHORT).show()
                                 }
                             },
-                            enabled = !isProcessing && (includeTunnel || includeDeploy || includeExceptions || includeSettings),
+                            enabled = !isProcessing && hasSelection,
                             modifier = Modifier
                                 .weight(1f)
                                 .height(CsqttSizes.ControlHeight),
@@ -333,7 +328,7 @@ fun ImportExportDialog(
 
                         OutlinedButton(
                             onClick = { filePickerLauncher.launch("application/json") },
-                            enabled = !isProcessing && (includeTunnel || includeDeploy || includeExceptions || includeSettings),
+                            enabled = !isProcessing && hasSelection,
                             modifier = Modifier
                                 .weight(1f)
                                 .height(CsqttSizes.ControlHeight),

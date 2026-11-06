@@ -1359,7 +1359,6 @@ class SettingsStore(context: Context) {
     suspend fun exportConfigJson(
         includeTunnel: Boolean,
         includeDeploy: Boolean,
-        includeExceptions: Boolean,
         includeSettings: Boolean
     ): String {
         val prefs = dataStore.data.first()
@@ -1411,14 +1410,8 @@ class SettingsStore(context: Context) {
             root.put("deploy", deploy)
         }
 
-        if (includeExceptions) {
-            val exc = JSONObject()
-            exc.put("excluded_apps", prefs[getProfileKey(EXCLUDED_APPS, p)] ?: "")
-            exc.put("whitelist_apps", prefs[getProfileKey(WHITELIST_APPS, p)] ?: "")
-            exc.put("is_whitelist", prefs[getProfileKey(IS_WHITELIST, p)] ?: false)
-            root.put("exceptions", exc)
-        }
-
+        // Списки приложений в этот резерв не выносятся: их копирование живёт отдельной
+        // карточкой «Импорт и экспорт правил» со своим форматом.
         if (includeSettings) {
             val settings = JSONObject()
             settings.put("theme_mode", prefs[THEME_MODE] ?: "system")
@@ -1441,7 +1434,6 @@ class SettingsStore(context: Context) {
         jsonString: String,
         includeTunnel: Boolean,
         includeDeploy: Boolean,
-        includeExceptions: Boolean,
         includeSettings: Boolean
     ): Boolean {
         return runCatching {
@@ -1495,12 +1487,8 @@ class SettingsStore(context: Context) {
                     if (deploy.has("secret_path_enabled")) mutable[DEPLOY_SECRET_PATH_ENABLED] = deploy.getBoolean("secret_path_enabled")
                     if (deploy.has("secret_path_uuid")) mutable[DEPLOY_SECRET_PATH_UUID] = deploy.getString("secret_path_uuid")
                 }
-                if (includeExceptions && root.has("exceptions")) {
-                    val exc = root.getJSONObject("exceptions")
-                    if (exc.has("excluded_apps")) mutable[getProfileKey(EXCLUDED_APPS, p)] = exc.getString("excluded_apps")
-                    if (exc.has("whitelist_apps")) mutable[getProfileKey(WHITELIST_APPS, p)] = exc.getString("whitelist_apps")
-                    if (exc.has("is_whitelist")) mutable[getProfileKey(IS_WHITELIST, p)] = exc.getBoolean("is_whitelist")
-                }
+                // Старые резервы с секцией исключений здесь молча игнорируются: списки
+                // приложений переносятся только карточкой «Импорт и экспорт правил».
                 if (includeSettings && root.has("settings")) {
                     val s = root.getJSONObject("settings")
                     if (s.has("theme_mode")) mutable[THEME_MODE] = s.getString("theme_mode")
