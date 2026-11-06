@@ -402,6 +402,9 @@ struct ReaderRuntime {
     scale_notify: Option<Arc<tokio::sync::Notify>>,
     target_workers: Option<Arc<AtomicUsize>>,
     configured_workers: usize,
+    /// Канал в writer: повторный GETCONF, если `ROUTING` не собрался.
+    writer_tx: mpsc::Sender<WriterCommand>,
+    routing_request: Bytes,
 }
 
 pub struct ShutdownCoordinator {
@@ -1187,6 +1190,7 @@ async fn run_allocated_session(
     let incarnation_id = NEXT_INCARNATION_ID.fetch_add(1, Ordering::Relaxed).max(1);
     let config_tx = config.get_config.then(|| runtime.config_tx.clone());
     let mut routing_reassembler = RoutingReassembler::new();
+    let routing_retry_request = build_registration_payload(&config);
     let config_delivered = match request_configuration(
         &mut writer_transport,
         &mut reader_transport,
@@ -1267,6 +1271,8 @@ async fn run_allocated_session(
             scale_notify: runtime.scale_notify.clone(),
             target_workers: runtime.target_workers.clone(),
             configured_workers: runtime.configured_workers,
+            writer_tx: writer_command_tx.clone(),
+            routing_request: routing_retry_request,
         },
         session_cancel.clone(),
     ));
@@ -1575,8 +1581,12 @@ async fn reader_loop(
         scale_notify,
         target_workers,
         configured_workers,
+        writer_tx,
+        routing_request,
     } = runtime;
     let mut dropped_non_ip = 0u64;
+    let mut routing_retries = 0u32;
+    const MAX_ROUTING_RETRIES: u32 = 2;
     let mut reassembly_tick = tokio::time::interval(std::time::Duration::from_millis(500));
     reassembly_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -1585,11 +1595,26 @@ async fn reader_loop(
             _ = cancel.cancelled() => return Ok(()),
             _ = reassembly_tick.tick() => {
                 if routing_reassembler.take_incomplete() && emits_routing {
-                    events.error(
-                        "routing_payload_incomplete",
-                        "ROUTING: не все чанки получены, правило отброшено",
-                        true,
-                    );
+                    if routing_retries < MAX_ROUTING_RETRIES {
+                        routing_retries += 1;
+                        crate::log_error!(
+                            "[КЛИЕНТ] ROUTING не собран, повторный GETCONF #{}",
+                            routing_retries
+                        );
+                        if send_writer_bytes(&writer_tx, &routing_request).await.is_err() {
+                            events.error(
+                                "routing_payload_incomplete",
+                                "ROUTING: не все чанки получены, повторный GETCONF не отправлен",
+                                true,
+                            );
+                        }
+                    } else {
+                        events.error(
+                            "routing_payload_incomplete",
+                            "ROUTING: не все чанки получены после повторов, правило отброшено",
+                            true,
+                        );
+                    }
                 }
                 continue;
             }
@@ -1639,12 +1664,14 @@ async fn reader_loop(
             if packet.as_slice() == crate::protocol::ROUTING_ABSENT {
                 if emits_routing {
                     events.routing_absent();
+                    routing_retries = 0;
                 }
                 continue;
             }
             if let Some(json) = routing_reassembler.feed(packet.as_slice()) {
                 if emits_routing {
                     events.routing(&json);
+                    routing_retries = 0;
                 }
             } else if let Some(size) = routing_reassembler.take_oversize_error()
                 && emits_routing
