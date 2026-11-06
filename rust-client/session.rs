@@ -227,6 +227,27 @@ pub const MAX_ROUTING_CHUNKS: usize = 8192;
 /// with the full bundled RU preset is ~3.8 KB, so 256 KiB leaves a wide margin.
 pub const MAX_ROUTING_PAYLOAD_BYTES: usize = 262_144;
 
+/// Счётчики последней НЕзавершённой сборки `ROUTING` — для диагностики потери
+/// датаграмм.
+///
+/// Отдаются только когда дедлайн сработал, то есть когда сборка начата, но за
+/// `REASSEMBLY_TIMEOUT` не закрылась. Различают два принципиально разных отказа,
+/// которые раньше выглядели одинаково: не дошёл почти ничего (`received` ≈ 0) и
+/// дошла почти вся последовательность (`received` = `total − k`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IncompleteRouting {
+    /// Сколько уникальных чанков лежат в сборке на момент срыва.
+    pub received: usize,
+    /// Сколько чанков обещала доставка (`START`, `FINISH` и голый чанк задают
+    /// его одинаково). При сработавшем дедлайне он заведомо `> 0`: deadline
+    /// взводится только из ветвей, которые уже разобрали `total`.
+    pub total: usize,
+    /// Был ли получен `FINISH`: `true` при недостающих чанках означает «хвост
+    /// доставки дошёл, не хватает середины», `false` — «посреди потока всё
+    /// встало».
+    pub finish_seen: bool,
+}
+
 #[derive(Default)]
 pub struct RoutingReassembler {
     total_chunks: usize,
@@ -263,19 +284,23 @@ impl RoutingReassembler {
     /// Сколько ждать недостающие чанки `ROUTING`, прежде чем считать правило потерянным.
     const REASSEMBLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
-    /// true, если `ROUTING` начался, но за отведённое время не собрался.
-    /// Сбрасывает состояние, чтобы ошибка не повторялась.
-    pub fn take_incomplete(&mut self) -> bool {
+    /// Some(счётчики), если `ROUTING` начался, но за отведённое время не
+    /// собрался. Сбрасывает состояние, чтобы ошибка не повторялась; счётчики
+    /// снимаются ДО сброса.
+    pub fn take_incomplete(&mut self) -> Option<IncompleteRouting> {
         self.take_incomplete_at(std::time::Instant::now())
     }
 
-    fn take_incomplete_at(&mut self, now: std::time::Instant) -> bool {
-        let Some(deadline) = self.deadline else {
-            return false;
-        };
+    fn take_incomplete_at(&mut self, now: std::time::Instant) -> Option<IncompleteRouting> {
+        let deadline = self.deadline?;
         if now < deadline {
-            return false;
+            return None;
         }
+        let incomplete = IncompleteRouting {
+            received: self.received_count,
+            total: self.total_chunks,
+            finish_seen: self.finished,
+        };
         self.deadline = None;
         self.chunks.clear();
         self.total_chunks = 0;
@@ -284,7 +309,7 @@ impl RoutingReassembler {
         // Сборка не состоялась — следующая доставка (повторный `GETCONF`) может
         // приехать и без `START`, recovery-путь оставляем открытым.
         self.assembled_total = None;
-        true
+        Some(incomplete)
     }
 
     pub fn feed(&mut self, payload: &[u8]) -> Option<String> {
@@ -1696,11 +1721,32 @@ async fn reader_loop(
             biased;
             _ = cancel.cancelled() => return Ok(()),
             _ = reassembly_tick.tick() => {
-                if routing_reassembler.take_incomplete() && emits_routing {
+                if let Some(incomplete) = routing_reassembler.take_incomplete()
+                    && emits_routing
+                {
+                    // Снимок TURN-приёмника на момент срыва. При нехватке пакета
+                    // в пуле и при переполнении входящей SPSC-очереди драйвер
+                    // молча роняет ChannelData (`process_deficit_packet`,
+                    // `TrySendError::Full` в turn.rs) — такой пакет не доходит до
+                    // рессемблера и не виден ни в одном другом месте. Числа
+                    // накопительные за жизнь аллокации, не за доставку.
+                    let pool_drops = transport.receiver.ingress_pool_deficit_drops();
+                    let queue_drops = transport.receiver.ingress_queue_full_drops();
                     if routing_retries < MAX_ROUTING_RETRIES {
                         routing_retries += 1;
+                        // Цифры решают, что именно лечить: 0 из N — не доходит
+                        // поток пакетов целиком, N-несколько из N — теряются
+                        // отдельные датаграммы. Но drops — накопительные за всё
+                        // соединение, и через то же кольцо идёт media-трафик:
+                        // сравнивать надо ПРИРОСТ между срабатываниями watchdog,
+                        // а не абсолютное значение.
                         crate::log_error!(
-                            "[КЛИЕНТ] ROUTING не собран, повторный GETCONF #{}",
+                            "[КЛИЕНТ] ROUTING не собран (получено {} из {}, finish={}, pool_drops={}, queue_drops={}), повторный GETCONF #{}",
+                            incomplete.received,
+                            incomplete.total,
+                            incomplete.finish_seen,
+                            pool_drops,
+                            queue_drops,
                             routing_retries
                         );
                         // Повтор уходит ДВУМЯ копиями, как первый GETCONF: одна
@@ -1716,14 +1762,28 @@ async fn reader_loop(
                         {
                             events.error(
                                 "routing_payload_incomplete",
-                                "ROUTING: не все чанки получены, повторный GETCONF не отправлен",
+                                &format!(
+                                    "ROUTING: не все чанки получены ({} из {}, finish={}, pool_drops={}, queue_drops={}), повторный GETCONF не отправлен",
+                                    incomplete.received,
+                                    incomplete.total,
+                                    incomplete.finish_seen,
+                                    pool_drops,
+                                    queue_drops
+                                ),
                                 true,
                             );
                         }
                     } else {
                         events.error(
                             "routing_payload_incomplete",
-                            "ROUTING: не все чанки получены после повторов, правило отброшено",
+                            &format!(
+                                "ROUTING: не все чанки получены после повторов ({} из {}, finish={}, pool_drops={}, queue_drops={}), правило отброшено",
+                                incomplete.received,
+                                incomplete.total,
+                                incomplete.finish_seen,
+                                pool_drops,
+                                queue_drops
+                            ),
                             true,
                         );
                     }
@@ -2688,13 +2748,30 @@ mod tests {
         assert_eq!(reassembler.feed(b"ROUTING:START:2"), None);
         assert_eq!(reassembler.feed(b"ROUTING:1:2:AAAA"), None);
         let start = std::time::Instant::now();
-        assert!(!reassembler.take_incomplete_at(start));
-        assert!(reassembler.take_incomplete_at(
-            start + RoutingReassembler::REASSEMBLY_TIMEOUT + std::time::Duration::from_millis(1)
-        ));
-        assert!(!reassembler.take_incomplete_at(
-            start + RoutingReassembler::REASSEMBLY_TIMEOUT + std::time::Duration::from_millis(2)
-        ));
+        assert!(reassembler.take_incomplete_at(start).is_none());
+        // Срыв обязан назвать цифры: сколько дошло, сколько ждали, был ли FINISH.
+        assert_eq!(
+            reassembler.take_incomplete_at(
+                start
+                    + RoutingReassembler::REASSEMBLY_TIMEOUT
+                    + std::time::Duration::from_millis(1)
+            ),
+            Some(IncompleteRouting {
+                received: 1,
+                total: 2,
+                finish_seen: false,
+            })
+        );
+        // Состояние сброшено — повторного срыва на тех же счётчиках нет.
+        assert!(
+            reassembler
+                .take_incomplete_at(
+                    start
+                        + RoutingReassembler::REASSEMBLY_TIMEOUT
+                        + std::time::Duration::from_millis(2)
+                )
+                .is_none()
+        );
     }
 
     /// Разбить `payload` на `parts` чанков ровно в той форме, что шлёт сервер:
@@ -2752,9 +2829,12 @@ mod tests {
 
         let now = std::time::Instant::now();
         assert!(
-            !reassembler.take_incomplete_at(
-                now + RoutingReassembler::REASSEMBLY_TIMEOUT + std::time::Duration::from_millis(1)
-            ),
+            reassembler
+                .take_incomplete_at(
+                    now + RoutingReassembler::REASSEMBLY_TIMEOUT
+                        + std::time::Duration::from_millis(1)
+                )
+                .is_none(),
             "хвост второй доставки не имеет права считаться потерянным правилом"
         );
     }
@@ -2776,9 +2856,12 @@ mod tests {
 
         let now = std::time::Instant::now();
         assert!(
-            !reassembler.take_incomplete_at(
-                now + RoutingReassembler::REASSEMBLY_TIMEOUT + std::time::Duration::from_millis(1)
-            ),
+            reassembler
+                .take_incomplete_at(
+                    now + RoutingReassembler::REASSEMBLY_TIMEOUT
+                        + std::time::Duration::from_millis(1)
+                )
+                .is_none(),
             "после двух собранных доставок нечего считать неполным"
         );
     }
@@ -2792,10 +2875,50 @@ mod tests {
         assert_eq!(reassembler.feed(b"ROUTING:FINISH:4"), None);
 
         let now = std::time::Instant::now();
-        assert!(!reassembler.take_incomplete_at(now));
-        assert!(reassembler.take_incomplete_at(
-            now + RoutingReassembler::REASSEMBLY_TIMEOUT + std::time::Duration::from_millis(1)
-        ));
+        assert!(reassembler.take_incomplete_at(now).is_none());
+        // Это и есть профиль «не дошло ничего»: FINISH есть, чанков нет.
+        assert_eq!(
+            reassembler.take_incomplete_at(
+                now + RoutingReassembler::REASSEMBLY_TIMEOUT + std::time::Duration::from_millis(1)
+            ),
+            Some(IncompleteRouting {
+                received: 0,
+                total: 4,
+                finish_seen: true,
+            })
+        );
+    }
+
+    /// Диагностические счётчики считают УНИКАЛЬНЫЕ чанки. Копия `seq` приходит
+    /// не только от дублирования на сервере (сейчас его нет): повтор `GETCONF`
+    /// после окна подавления даёт вторую полную последовательность, а старый
+    /// билд сервера до сих пор шлёт каждый чанк дважды. Если бы копия попадала в
+    /// `received`, диагностика выдавала бы «получено 92 из 46» вместо ответа на
+    /// вопрос, сколько реально не дошло.
+    #[test]
+    fn incomplete_counters_count_unique_chunks_not_arrived_lines() {
+        let mut reassembler = RoutingReassembler::new();
+        assert_eq!(reassembler.feed(b"ROUTING:START:3"), None);
+        for seq in [1, 1, 2, 2] {
+            assert_eq!(
+                reassembler.feed(format!("ROUTING:{seq}:3:AAAA").as_bytes()),
+                None
+            );
+        }
+        assert_eq!(reassembler.feed(b"ROUTING:FINISH:3"), None);
+
+        let now = std::time::Instant::now();
+        assert_eq!(
+            reassembler.take_incomplete_at(
+                now + RoutingReassembler::REASSEMBLY_TIMEOUT + std::time::Duration::from_millis(1)
+            ),
+            Some(IncompleteRouting {
+                received: 2,
+                total: 3,
+                finish_seen: true,
+            }),
+            "копии чанка не имеют права удваивать received"
+        );
     }
 
     /// Watchdog-повтор `GETCONF` обязан ставиться ДУБЛИРОВАННОЙ командой:
