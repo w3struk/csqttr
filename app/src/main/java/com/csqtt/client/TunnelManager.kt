@@ -116,7 +116,6 @@ object TunnelManager {
     private var crashRestartStreak = 0
     private const val WORKER_ZERO_CONFIRMATION_MS = 4_000L
     private const val PANEL_SERVER_RESTART_DELAY_MS = 4_000L
-    private const val STARTUP_DIAGNOSTIC_MS = 30_000L
     private const val CRASH_RESTART_STABLE_MS = 30_000L
     private const val CRASH_RESTART_MAX_DELAY_MS = 60_000L
     private const val VPN_START_RETRY_MS = 10_000L
@@ -140,15 +139,25 @@ object TunnelManager {
         val unavailableManualHashes = mutableSetOf<String>()
     }
 
+    /**
+     * Неизменяемая запись pending-буфера: слияние повторяющейся постановки
+     * создаёт новую запись через `copy`, поэтому ни одно поле — включая
+     * `terminal` — не может быть изменено постфактум.
+     */
     private data class PendingLog(
         val identity: ProcessIdentity?,
         val key: String,
-        var message: String,
+        val message: String,
         val priority: Int,
         val isError: Boolean,
         val level: LogLevel?,
-        var count: Int,
-        var timestampMillis: Long,
+        val count: Int,
+        val timestampMillis: Long,
+        /** Причина терминальной остановки: обязана дожить до флаша, даже когда
+         *  поколение уже инвалидировано (`TunnelLogPolicy.acceptsPendingLog`).
+         *  Передаётся явно и только из `updateTerminalStopLog`: значение по
+         *  умолчанию здесь спрятало бы ошибку «забыл терминальный признак». */
+        val terminal: Boolean,
     )
 
     private const val LOG_UI_FLUSH_MS = 120L
@@ -818,6 +827,16 @@ object TunnelManager {
                     updateLog(logKey, message, 2, false)
                     terminateProcessLocked(processIdentity)
                     currentParams = newParams
+                    // Принудительный флаш перед запуском нового процесса — тот же,
+                    // что в start(). У этого пути нет маркера сессии, поэтому
+                    // причина остановки прошлого процесса, оставшаяся в
+                    // pending-буфере, ушла бы в журнал уже после строк нового
+                    // («Процесс запущен», DTLS) и читалась бы как причина новой
+                    // сессии. `logs`/`unreadErrorCount` мутируются только на Main,
+                    // поэтому флаш — через withContext(Main), как и в start();
+                    // Mutex.withLock на Main приостанавливается, а не блокирует
+                    // поток, так что встречной блокировки здесь нет.
+                    withContext(Dispatchers.Main) { flushPendingLogs() }
                     startProcessLocked(appContext, newParams, epoch)
                 }
             } finally {
@@ -901,7 +920,7 @@ object TunnelManager {
         isError: Boolean = false,
         level: LogLevel? = null,
     ) {
-        updateLogForProcess(null, key, message, priority, isError, level)
+        updateLogForProcess(null, key, message, priority, isError, level, terminal = false)
     }
 
     private fun updateProcessLog(
@@ -912,7 +931,25 @@ object TunnelManager {
         isError: Boolean = false,
         level: LogLevel? = null,
     ) {
-        updateLogForProcess(identity, key, message, priority, isError, level)
+        updateLogForProcess(identity, key, message, priority, isError, level, terminal = false)
+    }
+
+    /**
+     * Единственная точка, где в буфер попадает причина терминальной остановки:
+     * набор полей приходит из `TunnelLogPolicy.terminalStopEntry`, а `terminal`
+     * обязанный аргумент — никакого пути «забыл флаг» через обычный
+     * `updateProcessLog` (там он жёстко `false`).
+     */
+    private fun updateTerminalStopLog(identity: ProcessIdentity, entry: TunnelLogPolicy.TerminalStopEntry) {
+        updateLogForProcess(
+            identity = identity,
+            key = entry.key,
+            message = entry.message,
+            priority = entry.priority,
+            isError = entry.isError,
+            level = null,
+            terminal = entry.terminal,
+        )
     }
 
     private fun updateLogForProcess(
@@ -922,26 +959,53 @@ object TunnelManager {
         priority: Int,
         isError: Boolean,
         level: LogLevel?,
+        terminal: Boolean,
     ) {
-        if (identity != null && !isCurrent(identity)) return
+        // Оба гейта pending-буфера — один предикат. На постановке terminal-запись
+        // проходит по тому же правилу, что и на флаше: причина фатальной
+        // остановки не должна теряться, если процесс уже остановлен или
+        // перезапускается (остановка пользователем, переключение транспорта,
+        // гибель процесса).
+        val identityKnown = identity != null
+        val identityCurrent = identity?.let(::isCurrent) == true
+        if (!TunnelLogPolicy.acceptsPendingLog(identityKnown, identityCurrent, terminal)) return
         if (!isLoggingEnabled && !TunnelLogPolicy.isAllowedWhenInactiveLogging(key, isError, level)) return
         val cleanMessage = withoutLogStickers(message).take(MAX_LOG_MESSAGE_LENGTH)
         if (cleanMessage.isEmpty()) return
-        val pendingKey = "${identity?.generation ?: 0L}:$key:$priority:$isError:${level?.name.orEmpty()}"
+        val pendingKey = TunnelLogPolicy.pendingLogKey(
+            generation = identity?.generation,
+            key = key,
+            priority = priority,
+            isError = isError,
+            levelName = level?.name,
+        )
         val timestamp = System.currentTimeMillis()
         synchronized(pendingLogLock) {
             val pending = pendingLogs[pendingKey]
             if (pending == null) {
                 if (pendingLogs.size >= MAX_PENDING_LOGS) {
-                    pendingLogs.remove(pendingLogs.entries.first().key)
+                    // Жертву выбирает политика: терминальные причины не вытесняются
+                    // первыми, иначе сброс буфера обнулил бы весь обход гейта.
+                    val victim = TunnelLogPolicy.evictionKey(
+                        pendingLogs.entries.map { it.key to it.value.terminal },
+                    )
+                    if (victim != null) pendingLogs.remove(victim)
                 }
-                pendingLogs[pendingKey] = PendingLog(identity, key, cleanMessage, priority, isError, level, 1, timestamp)
+                pendingLogs[pendingKey] =
+                    PendingLog(identity, key, cleanMessage, priority, isError, level, 1, timestamp, terminal)
             } else {
+                // Запись неизменяемая: повторная постановка создаёт новую версию
+                // той же строки (текст, время, счётчик), а terminal наследуется
+                // по правилу `mergedTerminal` — существующая терминальная строка
+                // не деградирует и не повышает чужую. remove+insert держит
+                // порядок постановки в буфере.
                 pendingLogs.remove(pendingKey)
-                pending.message = cleanMessage
-                pending.count += 1
-                pending.timestampMillis = timestamp
-                pendingLogs[pendingKey] = pending
+                pendingLogs[pendingKey] = pending.copy(
+                    message = cleanMessage,
+                    count = pending.count + 1,
+                    timestampMillis = timestamp,
+                    terminal = TunnelLogPolicy.mergedTerminal(pending.terminal, terminal),
+                )
             }
             scheduleLogFlushLocked()
         }
@@ -967,7 +1031,12 @@ object TunnelManager {
 
     private fun applyPendingLog(pending: PendingLog) {
         val identity = pending.identity
-        if (identity != null && !isCurrent(identity)) return
+        val identityKnown = identity != null
+        val identityCurrent = identity?.let(::isCurrent) == true
+        // Без исключения для terminal-записей причина фатальной остановки сюда
+        // никогда не доходит: stopLocked инвалидирует identity раньше, чем
+        // срабатывает отложенный на LOG_UI_FLUSH_MS флаш.
+        if (!TunnelLogPolicy.acceptsPendingLog(identityKnown, identityCurrent, pending.terminal)) return
         val incoming = LogEntry(
             key = pending.key,
             message = pending.message,
@@ -1233,7 +1302,7 @@ object TunnelManager {
         activeWorkers.value = 0
         resetWorkerRecoveryState()
         startLogReader(identity)
-        scheduleStartupDiagnostic(identity)
+        scheduleStartupDiagnostic(identity, effectiveAuthMode)
         config.value
             ?.trim()
             ?.takeIf { it.startsWith("TUNCONF:") }
@@ -1245,27 +1314,34 @@ object TunnelManager {
             }
     }
 
-    private fun scheduleStartupDiagnostic(identity: ProcessIdentity) {
+    /**
+     * Одно отложенное замечание о медленном старте. Решение целиком в
+     * `StartupDiagnosticPolicy`: раньше оно на 30-й секунде обвиняло VK и
+     * отправляло пользователя проверять токен с капчей, которых в этом режиме
+     * нет. `authMode` — то же значение, что ушло в argv `-vk-auth-mode`, поэтому
+     * подсказка не расходится с реальным режимом авторизации.
+     */
+    private fun scheduleStartupDiagnostic(identity: ProcessIdentity, authMode: String) {
         activeScope.launch {
-            delay(STARTUP_DIAGNOSTIC_MS)
-            if (!isCurrent(identity) || activeWorkers.value > 0) return@launch
-            when (identity.startupProgress.stage()) {
-                TunnelStartupStage.WAITING_FOR_CREDENTIALS -> updateProcessLog(
-                    identity,
-                    "startup_waiting_credentials",
-                    "[ДИАГНОСТИКА] Rust-клиент запущен, но VK не выдал TURN-креды: проверьте сеть, токен и капчу",
-                    98,
-                    true,
-                )
-                TunnelStartupStage.WAITING_FOR_TURN_OR_PEER -> updateProcessLog(
-                    identity,
-                    "startup_waiting_turn",
-                    "[ДИАГНОСТИКА] TURN-креды получены, но ни один allocation/handshake с сервером не завершился",
-                    98,
-                    true,
-                )
-                TunnelStartupStage.READY -> Unit
+            delay(StartupDiagnosticPolicy.NOTICE_AFTER_MS)
+            if (!isCurrent(identity)) return@launch
+            // processStartedAtMs выставлен startUptimeTimer() перед запуском этой
+            // корутины; если он вдруг сброшен, считаем, что ждали ровно порог.
+            val startedAt = processStartedAtMs
+            val waitedMs = if (startedAt > 0L) {
+                SystemClock.elapsedRealtime() - startedAt
+            } else {
+                StartupDiagnosticPolicy.NOTICE_AFTER_MS
             }
+            val notice = StartupDiagnosticPolicy.notice(
+                stage = identity.startupProgress.stage(),
+                authMode = authMode,
+                waitedMs = waitedMs,
+                activeWorkers = activeWorkers.value,
+            ) ?: return@launch
+            // isError берётся из Notice: диагностика — не ошибка, она не должна
+            // ни красить строку, ни поднимать счётчик непрочитанных.
+            updateProcessLog(identity, notice.key, notice.message, notice.priority, notice.isError)
         }
     }
 
@@ -1738,6 +1814,11 @@ object TunnelManager {
             startStopMutex.withLock {
                 if (!lifecycleState.canStart(epoch) || process != null) return@withLock
                 restartJob = null
+                // Тот же порядок, что в start() и на transport-restart: маркера
+                // сессии у этого пути нет, поэтому строку `[СТОП]` причин
+                // предыдущего процесса надо выгрузить в журнал до запуска
+                // нового, а не полагаться на то, успел ли отложенный флаш.
+                withContext(Dispatchers.Main) { flushPendingLogs() }
                 startProcessLocked(context, params, epoch)
             }
         }
@@ -1747,7 +1828,11 @@ object TunnelManager {
         // Любая критическая ошибка терминальна для текущего процесса: следующий
         // кадр Config не должен успеть поднять VPN до асинхронного stopLocked.
         routingTerminal = true
-        updateProcessLog(identity, "circuit_breaker", "[СТОП] $message", -1, true)
+        // Ключ, текст, приоритет и признак terminal — из одной точки
+        // (`TunnelLogPolicy.terminalStopEntry`); terminal-запись переживает
+        // инвалидацию identity на обоих гейтах, иначе причина остановки исчезает
+        // из in-app журнала, который пользователь копирует в отчёт.
+        updateTerminalStopLog(identity, TunnelLogPolicy.terminalStopEntry(message))
         activeScope.launch {
             startStopMutex.withLock {
                 if (!isCurrent(identity)) return@withLock
