@@ -629,10 +629,63 @@ impl PasswordEpochSlot {
 pub struct PasswordEpochState {
     generation_id: u64,
     session_salt: String,
-    /// Поколение, которому решение о маршрутизации уже отправлено (только для
-    /// клиентов без метки config-owner). Живёт вместе с epoch-слотом, поэтому
-    /// свипер чистит его автоматически.
-    routing_delivered: Option<u64>,
+    /// Какая сессия-владелец и когда получала чанкованное решение
+    /// (`None` — ещё не уезжало). Гасит только повтор её же `GETCONF` внутри
+    /// окна дубля. Живёт вместе с epoch-слотом, поэтому свипер чистит его
+    /// автоматически.
+    owner_routing_delivered: Option<RoutingDeliveryMark>,
+    /// Поколение, которому решение воркеру без метки `owner` уже отдали
+    /// (`None` — ни одному). Строгое «один раз на поколение», без времени:
+    /// отметка независима от доставки владельцу, чтобы config-owner не мог
+    /// лишать legacy-клиент его единственного решения.
+    worker_delivered_generation: Option<u64>,
+}
+
+/// Отметка о доставке чанкованного решения `ROUTING` config-owner'у за
+/// текущее поколение.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RoutingDeliveryMark {
+    generation_id: u64,
+    /// Сессия, получившая решение как config-owner: подавляется только повтор
+    /// той же сессии, чужая доставка владельца правила не лишает.
+    session_id: u64,
+    /// Монотонный момент доставки: нужен только для окна подавления дубля
+    /// `GETCONF`, строгая отметка поколения от него не зависит.
+    delivered_at: std::time::Instant,
+}
+
+/// Сколько секунд повторный `GETCONF` той же сессии не получает чанкованное
+/// правило.
+///
+/// Клиент намеренно дублирует `GETCONF` (`send_bytes_duplicate`), и обе копии
+/// доходят до сервера подряд — без подавления на один коннект уезжают две
+/// последовательности `ROUTING`, а хвост второй ломает `RoutingReassembler`
+/// (ложный фатальный `routing_payload_incomplete`).
+///
+/// Окно касается только чанков: `ROUTING:ABSENT` уходит на каждый запрос
+/// config-owner'а (`routing_delivery_decision`).
+///
+/// 1 с выбрана потому, что она одновременно:
+/// - много больше микросекундного разрыва между двумя копиями одного дубля —
+///   обе склеиваются в одну доставку;
+/// - много меньше клиентского повторного `GETCONF` при незавершённой сборке
+///   (`REASSEMBLY_TIMEOUT` 3 с + тик watchdog 500 мс ≈ 3.5 с) — легальная
+///   потеря чанка по-прежнему получает новую доставку, а не отказ.
+const ROUTING_DUPLICATE_DELIVERY_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Кто просит решение о маршрутизации.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoutingRequester {
+    /// config-owner — единственный, кто применяет правило и шлёт событие в
+    /// приложение. Повтор его же `GETCONF` подавляется только внутри окна
+    /// дубля и только для чанкованного правила, чтобы не потерять легальный
+    /// retry потерянного чанка. Отметка воркера на него не влияет.
+    ConfigOwner { session_id: u64 },
+    /// Воркер без метки `owner` (в том числе старый клиент): решение ему
+    /// отдаётся строго один раз на поколение — рассылка каждому воркеру
+    /// переполняет очередь UDP-TX. Отметка для этого независима от доставки
+    /// config-owner'у.
+    Worker,
 }
 
 impl PasswordEpochState {
@@ -640,7 +693,8 @@ impl PasswordEpochState {
         Self {
             generation_id,
             session_salt,
-            routing_delivered: None,
+            owner_routing_delivered: None,
+            worker_delivered_generation: None,
         }
     }
 
@@ -648,22 +702,69 @@ impl PasswordEpochState {
         if generation_id != self.generation_id || session_salt != self.session_salt {
             self.generation_id = generation_id;
             self.session_salt = session_salt.to_owned();
-            self.routing_delivered = None;
+            self.owner_routing_delivered = None;
+            self.worker_delivered_generation = None;
             PasswordEpochDecision::Replaced
         } else {
             PasswordEpochDecision::Current
         }
     }
 
-    /// Старые клиенты без метки `owner` получают решение один раз на поколение.
-    /// Новый клиент эту карту не использует: ему решение шлётся в каждом его
-    /// запросе.
-    fn claim_routing_delivery(&mut self, generation_id: u64) -> bool {
-        if self.routing_delivered == Some(generation_id) {
-            false
-        } else {
-            self.routing_delivered = Some(generation_id);
-            true
+    /// Берёт ли этот запрос доставку чанкованного решения о маршрутизации.
+    ///
+    /// Две независимые отметки, и смешивать их нельзя:
+    /// - config-owner получает решение в каждом своём запросе, кроме повтора
+    ///   той же сессии в окне дубля `GETCONF`
+    ///   (см. `ROUTING_DUPLICATE_DELIVERY_WINDOW`);
+    /// - воркер без метки `owner` — строго один раз на поколение, независимо
+    ///   от того, успел ли получить решение config-owner того же поколения.
+    ///
+    /// Обе отметки живут вместе с поколением: `admit` при смене
+    /// `generation`/`salt` сбрасывает их, и доставка разрешается заново.
+    ///
+    /// Отказ здесь гасит только чанкованное правило: `ROUTING:ABSENT`
+    /// доставляется независимо от ответа (см. `routing_delivery_decision`).
+    fn claim_routing_delivery(&mut self, generation_id: u64, requester: RoutingRequester) -> bool {
+        self.claim_routing_delivery_at(generation_id, requester, std::time::Instant::now())
+    }
+
+    fn claim_routing_delivery_at(
+        &mut self,
+        generation_id: u64,
+        requester: RoutingRequester,
+        now: std::time::Instant,
+    ) -> bool {
+        match requester {
+            // Подавляется только повтор этой же сессии внутри окна дубля:
+            // чужая доставка (другой воркер, другое подключение) не имеет
+            // права лишать config-owner правила.
+            RoutingRequester::ConfigOwner { session_id } => {
+                let duplicate = self.owner_routing_delivered.is_some_and(|mark| {
+                    mark.generation_id == generation_id
+                        && mark.session_id == session_id
+                        && now
+                            .checked_duration_since(mark.delivered_at)
+                            .is_some_and(|elapsed| elapsed < ROUTING_DUPLICATE_DELIVERY_WINDOW)
+                });
+                if duplicate {
+                    return false;
+                }
+                self.owner_routing_delivered = Some(RoutingDeliveryMark {
+                    generation_id,
+                    session_id,
+                    delivered_at: now,
+                });
+                true
+            }
+            // Клиент без метки `owner`: одно решение на поколение, отметка не
+            // «протухает» и не зависит от того, что получил владелец.
+            RoutingRequester::Worker => {
+                if self.worker_delivered_generation == Some(generation_id) {
+                    return false;
+                }
+                self.worker_delivered_generation = Some(generation_id);
+                true
+            }
         }
     }
 
@@ -4681,9 +4782,57 @@ fn getconf_requests_routing(parts: &[&str]) -> bool {
         && parts.get(6).is_some_and(|value| value.trim() == "owner")
 }
 
-// Прежняя доставка для клиентов без метки `owner` живёт в epoch-слоте
-// (`PasswordEpochState::claim_routing_delivery`): одно решение на поколение,
-// жизненный цикл совпадает с поколением пароля.
+// Обе доставки живут в epoch-слоте (`PasswordEpochState::claim_routing_delivery`),
+// но у каждой — своя отметка: клиент без метки `owner` — строго одно решение на
+// поколение (`worker_delivered_generation`), config-owner — в каждом своём
+// запросе, кроме повтора той же сессии внутри окна дубля `GETCONF`
+// (`owner_routing_delivered`, `ROUTING_DUPLICATE_DELIVERY_WINDOW`). Отметки не
+// пересекаются: доставка владельцу не съедает слот воркера и наоборот. Обе
+// сбрасывает `admit` при смене `generation`/`salt`.
+// Окно подавления относится только к чанкованному правилу — см.
+// `routing_delivery_decision`.
+
+/// Что уезжает на этот `GETCONF`: чанкованное правило, маркер его отсутствия
+/// или ничего.
+///
+/// Ветки намеренно имеют РАЗНУЮ реакцию на окно подавления дубля, и это надо
+/// читать вместе с `claim_routing_delivery`:
+///
+/// - `chunks` — единственная ветка, которую окно вообще защищает: клиент
+///   дублирует `GETCONF`, и две последовательности `ROUTING:i:N` подряд
+///   сбивали `RoutingReassembler` и роняли туннель ложным
+///   `routing_payload_incomplete`.
+/// - `absent` — под подавление попадать НЕ должна. `ROUTING:ABSENT` — одиночный
+///   датаграмм: клиент распознаёт его до рессемблера, он не чанкуется, не
+///   подтверждается и не порождает клиентский повтор `GETCONF` (повтор
+///   вызывается только незавершённой сборкой чанков). Его потеря значит, что
+///   приложение не узнает об отвязке правила и продолжит применять снятый
+///   whitelist молча, без единого события — ровно тот тихий fail-open, ради
+///   которого маркер и вводился. Повтор маркера безвреден: он идемпотентен и
+///   на клиенте, и в приложении.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RoutingDeliveryDecision {
+    /// Шлём `ROUTING:START` → чанки → `ROUTING:FINISH`.
+    chunks: bool,
+    /// Шлём одиночный `ROUTING:ABSENT`.
+    absent: bool,
+}
+
+/// Развязка: `claimed` — ответ окна подавления (`claim_routing_delivery`),
+/// `config_owner` — метка `owner` в запросе, `has_rule` — есть ли правило у
+/// этих учётных данных.
+fn routing_delivery_decision(
+    config_owner: bool,
+    has_rule: bool,
+    claimed: bool,
+) -> RoutingDeliveryDecision {
+    RoutingDeliveryDecision {
+        chunks: claimed && has_rule,
+        // Отсутствие правила сообщается на каждый запрос владельца — окно
+        // подавления дубля его не трогает.
+        absent: config_owner && !has_rule,
+    }
+}
 
 fn merged_domains(rule: &crate::model::RoutingRule) -> (Vec<String>, usize) {
     let mut domains = rule.direct_domains.clone();
@@ -5179,20 +5328,38 @@ async fn handle_getconf(
         )?;
     }
     // Решение о маршрутизации уходит только тому, кто его применит:
-    // config-owner'у (он помечает GETCONF полем `owner`) либо — для старых
-    // клиентов без метки — одному воркеру на поколение. Рассылка каждому
-    // воркеру давала шесть приоритетных пакетов на каждый GETCONF; при 80–100
-    // воркерах очередь UDP-TX (1024 слота) переполнялась, TUNCONF не доходил,
-    // клиент повторял запрос — лавина.
+    // config-owner'у (он помечает GETCONF полем `owner`) и — для старых
+    // клиентов без метки, в том же поколении и по своей отметке — одному
+    // воркеру. Рассылка каждому воркеру давала шесть приоритетных пакетов на
+    // каждый GETCONF; при 80–100 воркерах очередь UDP-TX (1024 слота)
+    // переполнялась, TUNCONF не доходил, клиент повторял запрос — лавина.
+    //
+    // Обе ветки проходят через `claim_routing_delivery`: клиент намеренно
+    // дублирует GETCONF, и раньше на одно подключение уезжали две полные
+    // последовательности ROUTING. Хвост второй доставки сбивал
+    // RoutingReassembler на клиенте и ронял туннель ложным
+    // routing_payload_incomplete. Подавление гасит именно их — чанки правила;
+    // `ROUTING:ABSENT` уезжает мимо окна (см. `routing_delivery_decision`).
     if !reject_session && response.starts_with("TUNCONF:") {
-        let wants_routing = config_owner || epoch.claim_routing_delivery(generation_id);
-        if wants_routing {
+        let requester = if config_owner {
+            RoutingRequester::ConfigOwner {
+                session_id: session.id,
+            }
+        } else {
+            RoutingRequester::Worker
+        };
+        let claimed = epoch.claim_routing_delivery(generation_id, requester);
+        let has_rule = routing_rule.is_some();
+        let delivery = routing_delivery_decision(config_owner, has_rule, claimed);
+        if delivery.chunks || delivery.absent {
             let mode = if config_owner { "owner" } else { "legacy" };
             let ips_sha_state = match client_ips_sha {
                 Some(sha) if sha == crate::routing_assets::ASSETS.ips.sha256.as_str() => "hit",
                 Some(_) => "miss",
                 None => "none",
             };
+            // Ровно одна строка на фактическую доставку: `rule=true` — ушло
+            // чанкованное правило, `rule=false` — ушёл `ROUTING:ABSENT`.
             log_event(
                 app,
                 "INFO",
@@ -5202,10 +5369,12 @@ async fn handle_getconf(
                     secret_tag(password),
                     generation_id,
                     mode,
-                    routing_rule.is_some(),
+                    has_rule,
                     ips_sha_state
                 ),
             );
+        }
+        if delivery.chunks {
             if let Some(rule) = routing_rule {
                 let (_, dropped_domains) = merged_domains(&rule);
                 if dropped_domains > 0 {
@@ -5253,9 +5422,12 @@ async fn handle_getconf(
                 let _ = writer
                     .write(format!("ROUTING:FINISH:{total_chunks}").as_bytes())
                     .await;
-            } else if config_owner {
-                let _ = writer.write(ROUTING_ABSENT).await;
             }
+        } else if delivery.absent {
+            // Вне окна подавления: вторая копия дубля обязана получить маркер
+            // снова, иначе потеря одного датаграмма оставила бы приложение на
+            // уже снятом правиле без единого события.
+            let _ = writer.write(ROUTING_ABSENT).await;
         }
     }
     // Правило уходит до TUNCONF: приложение собирает VPN-план из ответа
@@ -6505,27 +6677,275 @@ mod tests {
     #[test]
     fn routing_is_delivered_once_per_generation_for_legacy_clients() {
         let mut state = PasswordEpochState::default();
-        assert!(state.claim_routing_delivery(7));
-        assert!(!state.claim_routing_delivery(7));
+        assert!(state.claim_routing_delivery(7, RoutingRequester::Worker));
+        assert!(!state.claim_routing_delivery(7, RoutingRequester::Worker));
         // Новое поколение сбрасывает отметку доставки.
         state.admit(8, "new-salt");
-        assert!(state.claim_routing_delivery(8));
-        assert!(!state.claim_routing_delivery(8));
+        assert!(state.claim_routing_delivery(8, RoutingRequester::Worker));
+        assert!(!state.claim_routing_delivery(8, RoutingRequester::Worker));
     }
 
     #[test]
     fn epoch_claim_resets_only_when_the_epoch_is_replaced() {
         let mut state = PasswordEpochState::new(7, "salt".to_owned());
-        assert!(state.claim_routing_delivery(7));
-        assert!(!state.claim_routing_delivery(7));
+        assert!(state.claim_routing_delivery(7, RoutingRequester::Worker));
+        assert!(!state.claim_routing_delivery(7, RoutingRequester::Worker));
 
         // Тот же generation и salt — epoch не заменён, повторной доставки нет.
         state.admit(7, "salt");
-        assert!(!state.claim_routing_delivery(7));
+        assert!(!state.claim_routing_delivery(7, RoutingRequester::Worker));
 
         // Смена соли — новый epoch, решение доставляется снова.
         state.admit(7, "other-salt");
-        assert!(state.claim_routing_delivery(7));
+        assert!(state.claim_routing_delivery(7, RoutingRequester::Worker));
+    }
+
+    /// Корень дефекта доставки: клиент дублирует `GETCONF`, и на одно подключение
+    /// приезжали две последовательности `ROUTING`. Вторая копия запроса того же
+    /// config-owner обязана получить только `TUNCONF`.
+    #[test]
+    fn owner_routing_delivery_is_suppressed_only_inside_the_duplicate_window() {
+        let mut state = PasswordEpochState::default();
+        let now = std::time::Instant::now();
+        let owner = RoutingRequester::ConfigOwner { session_id: 11 };
+
+        assert!(state.claim_routing_delivery_at(7, owner, now));
+        // Back-to-back копия дубля — склеивается.
+        assert!(!state.claim_routing_delivery_at(
+            7,
+            owner,
+            now + ROUTING_DUPLICATE_DELIVERY_WINDOW / 2
+        ));
+        // Повторный `GETCONF` клиента при незавершённой сборке приходит не
+        // раньше ~3.5 с (3 с idle-дедлайн + тик watchdog 500 мс): окно обязано
+        // пропустить его, иначе законная потеря чанка станет фатальной.
+        assert!(state.claim_routing_delivery_at(
+            7,
+            owner,
+            now + ROUTING_DUPLICATE_DELIVERY_WINDOW + std::time::Duration::from_millis(1)
+        ));
+        // Другое подключение того же поколения (переподключение владельца) —
+        // не «повтор дубля», ему доставляем.
+        assert!(state.claim_routing_delivery_at(
+            7,
+            RoutingRequester::ConfigOwner { session_id: 12 },
+            now + ROUTING_DUPLICATE_DELIVERY_WINDOW + std::time::Duration::from_millis(2)
+        ));
+    }
+
+    /// Смена поколения или соли сбрасывает и owner-отметку: окно не переживает
+    /// замену эпохи.
+    #[test]
+    fn owner_routing_delivery_resets_with_the_epoch() {
+        let mut state = PasswordEpochState::new(7, "salt".to_owned());
+        let now = std::time::Instant::now();
+        let owner = RoutingRequester::ConfigOwner { session_id: 11 };
+
+        assert!(state.claim_routing_delivery_at(7, owner, now));
+        assert!(!state.claim_routing_delivery_at(7, owner, now));
+
+        state.admit(7, "other-salt");
+        assert!(state.claim_routing_delivery_at(7, owner, now));
+
+        state.admit(8, "other-salt");
+        assert!(state.claim_routing_delivery_at(8, owner, now));
+    }
+
+    /// Отметка воркера не имеет права лишать правила config-owner'а: именно он
+    /// применяет его и шлёт событие в приложение.
+    #[test]
+    fn owner_is_not_starved_by_a_worker_delivery() {
+        let mut state = PasswordEpochState::default();
+        let now = std::time::Instant::now();
+
+        assert!(state.claim_routing_delivery_at(7, RoutingRequester::Worker, now));
+        assert!(state.claim_routing_delivery_at(
+            7,
+            RoutingRequester::ConfigOwner { session_id: 21 },
+            now
+        ));
+        // ...но повтор той же сессии уже не получит второй ROUTING.
+        assert!(!state.claim_routing_delivery_at(
+            7,
+            RoutingRequester::ConfigOwner { session_id: 21 },
+            now + ROUTING_DUPLICATE_DELIVERY_WINDOW / 2
+        ));
+    }
+
+    /// Исходный дефект (дубль `GETCONF`) не требовал трогать legacy-ветку:
+    /// доставка config-owner'у живёт в своей отметке и НЕ съедает единственный
+    /// слот воркера без метки `owner` того же поколения.
+    #[test]
+    fn owner_delivery_does_not_consume_the_worker_slot_of_the_generation() {
+        let mut state = PasswordEpochState::default();
+        let now = std::time::Instant::now();
+        let owner = RoutingRequester::ConfigOwner { session_id: 31 };
+
+        assert!(state.claim_routing_delivery_at(7, owner, now));
+        // Первый воркер того же поколения получает своё решение.
+        assert!(state.claim_routing_delivery_at(7, RoutingRequester::Worker, now));
+        // ...но по-прежнему строго один раз на поколение: второй воркер того же
+        // поколения его не получает, и истечение окна дубля его не оживляет.
+        assert!(!state.claim_routing_delivery_at(7, RoutingRequester::Worker, now));
+        assert!(!state.claim_routing_delivery_at(
+            7,
+            RoutingRequester::Worker,
+            now + ROUTING_DUPLICATE_DELIVERY_WINDOW * 4
+        ));
+
+        // Смена поколения сбрасывает обе отметки, а не только «последнюю».
+        state.admit(8, "salt-8");
+        assert!(state.claim_routing_delivery_at(8, RoutingRequester::Worker, now));
+        assert!(state.claim_routing_delivery_at(8, owner, now));
+    }
+
+    /// Обратный порядок в том же поколении: оба получают своё, и ни одна
+    /// отметка не зависит от времени доставки другой.
+    #[test]
+    fn owner_and_worker_both_get_their_delivery_in_the_same_generation() {
+        let mut state = PasswordEpochState::default();
+        let now = std::time::Instant::now();
+
+        assert!(state.claim_routing_delivery_at(7, RoutingRequester::Worker, now));
+        assert!(state.claim_routing_delivery_at(
+            7,
+            RoutingRequester::ConfigOwner { session_id: 32 },
+            now + ROUTING_DUPLICATE_DELIVERY_WINDOW * 4
+        ));
+        // Отметка воркера не «протухает» от времени и не меняется владельцем:
+        // второй воркер того же поколения по-прежнему ни с чем.
+        assert!(!state.claim_routing_delivery_at(
+            7,
+            RoutingRequester::Worker,
+            now + ROUTING_DUPLICATE_DELIVERY_WINDOW * 8
+        ));
+    }
+
+    /// Ветки доставки решения реагируют на окно подавления РАЗНО: оно гасит
+    /// чанки правила и не имеет права гасить `ROUTING:ABSENT`.
+    #[test]
+    fn duplicate_window_suppresses_chunks_but_never_absent() {
+        // config-owner, правило есть: первая копия дубля получает всё.
+        assert_eq!(
+            routing_delivery_decision(true, true, true),
+            RoutingDeliveryDecision {
+                chunks: true,
+                absent: false
+            }
+        );
+        // ...а подавленная повторная копия — ни одного чанка `ROUTING:`.
+        assert_eq!(
+            routing_delivery_decision(true, true, false),
+            RoutingDeliveryDecision {
+                chunks: false,
+                absent: false
+            }
+        );
+        // config-owner, правила нет: ABSENT уходит и на первую, и на вторую
+        // копию — ответ окна подавления на него не влияет.
+        assert_eq!(
+            routing_delivery_decision(true, false, true),
+            RoutingDeliveryDecision {
+                chunks: false,
+                absent: true
+            }
+        );
+        assert_eq!(
+            routing_delivery_decision(true, false, false),
+            RoutingDeliveryDecision {
+                chunks: false,
+                absent: true
+            }
+        );
+        // Воркер без метки `owner`: правило — строго одна доставка на
+        // поколение, а ABSENT ему не отправляется вовсе (он его не применяет).
+        assert_eq!(
+            routing_delivery_decision(false, true, true),
+            RoutingDeliveryDecision {
+                chunks: true,
+                absent: false
+            }
+        );
+        assert_eq!(
+            routing_delivery_decision(false, true, false),
+            RoutingDeliveryDecision {
+                chunks: false,
+                absent: false
+            }
+        );
+        assert_eq!(
+            routing_delivery_decision(false, false, true),
+            RoutingDeliveryDecision {
+                chunks: false,
+                absent: false
+            }
+        );
+    }
+
+    /// Инвариант развязки: ветки исключают друг друга, `chunks` полностью
+    /// управляется окном подавления, а `absent` — нет.
+    #[test]
+    fn routing_delivery_branches_are_exclusive_and_absent_ignores_the_window() {
+        for config_owner in [false, true] {
+            for has_rule in [false, true] {
+                for claimed in [false, true] {
+                    let decision = routing_delivery_decision(config_owner, has_rule, claimed);
+                    assert!(
+                        !(decision.chunks && decision.absent),
+                        "чанки и ABSENT одновременно: owner={config_owner} \
+                         rule={has_rule} claimed={claimed}"
+                    );
+                    assert_eq!(
+                        decision.chunks,
+                        claimed && has_rule,
+                        "окно подавления должно управлять чанками"
+                    );
+                    assert_eq!(
+                        decision.absent,
+                        config_owner && !has_rule,
+                        "окно подавления не имеет права управлять ABSENT"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Сквозная связка с настоящим окном подавления: отказ `claim` убирает
+    /// чанки, но не убирает маркер отсутствия правила — потеря одиночного
+    /// датаграмма иначе осталась бы тихим fail-open.
+    #[test]
+    fn owner_duplicate_request_drops_chunks_but_keeps_absent() {
+        let now = std::time::Instant::now();
+        let owner = RoutingRequester::ConfigOwner { session_id: 41 };
+        let repeat = now + ROUTING_DUPLICATE_DELIVERY_WINDOW / 2;
+
+        // Снятое правило: оба запроса config-owner'а доставляют ABSENT.
+        let mut state = PasswordEpochState::default();
+        let first = state.claim_routing_delivery_at(7, owner, now);
+        let second = state.claim_routing_delivery_at(7, owner, repeat);
+        assert!(first && !second, "окно обязано подавить повтор чанков");
+        let absent_first = routing_delivery_decision(true, false, first);
+        let absent_second = routing_delivery_decision(true, false, second);
+        assert!(absent_first.absent && !absent_first.chunks);
+        assert!(absent_second.absent && !absent_second.chunks);
+
+        // То же окно при наличии правила: повтор не получает ничего.
+        let mut state = PasswordEpochState::default();
+        let chunked_first =
+            routing_delivery_decision(true, true, state.claim_routing_delivery_at(7, owner, now));
+        let chunked_second = routing_delivery_decision(
+            true,
+            true,
+            state.claim_routing_delivery_at(7, owner, repeat),
+        );
+        assert!(chunked_first.chunks && !chunked_first.absent);
+        assert_eq!(
+            chunked_second,
+            RoutingDeliveryDecision {
+                chunks: false,
+                absent: false
+            }
+        );
     }
 
     #[test]
