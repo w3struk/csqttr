@@ -410,7 +410,7 @@ internal fun AppListDialog(
                 // The preset sections are rendered as elements of the list below,
                 // not as a fixed column above it: they have to scroll with the
                 // apps and must not take height away from them (the preset holds
-                // 172 red packages, dozens of which can be installed).
+                // 174 red packages, dozens of which can be installed).
 
                 when {
                     !isMigrationReady || isAppsLoading -> {

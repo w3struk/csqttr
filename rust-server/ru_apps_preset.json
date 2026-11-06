@@ -141,6 +141,7 @@
     { "package": "ru.mosgorpass", "name": "Московский транспорт" },
     { "package": "ru.yandex.yandexmaps", "name": "Яндекс Карты" },
     { "package": "ru.yandex.yandexnavi", "name": "Яндекс Навигатор" },
+    { "package": "ru.yandex.mobile.gasstations", "name": "Яндекс Заправки" },
     { "package": "ru.dublgis.dgismobile", "name": "2ГИС" },
     { "package": "com.carshering", "name": "Делимобиль" },
     { "package": "youdrive.today", "name": "Ситидрайв" },
@@ -177,6 +178,7 @@
     { "package": "ru.mts.mymts", "name": "Мой МТС" },
     { "package": "ru.beeline.services", "name": "билайн" },
     { "package": "ru.megafon.mlk", "name": "МегаФон" },
+    { "package": "com.dartit.RTcabinet", "name": "Мой Ростелеком" },
 
     { "package": "ru.broker.my", "name": "БКС Мир инвестиций" },
     { "package": "ru.bcs.bcsbank", "name": "БКС Банк" },
