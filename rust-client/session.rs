@@ -217,6 +217,7 @@ pub struct RoutingReassembler {
     finished: bool,
     oversize: Option<usize>,
     corrupt: bool,
+    deadline: Option<std::time::Instant>,
 }
 
 impl RoutingReassembler {
@@ -230,6 +231,30 @@ impl RoutingReassembler {
 
     pub fn take_corrupt_error(&mut self) -> bool {
         std::mem::take(&mut self.corrupt)
+    }
+
+    /// Сколько ждать недостающие чанки `ROUTING`, прежде чем считать правило потерянным.
+    const REASSEMBLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+    /// true, если `ROUTING` начался, но за отведённое время не собрался.
+    /// Сбрасывает состояние, чтобы ошибка не повторялась.
+    pub fn take_incomplete(&mut self) -> bool {
+        self.take_incomplete_at(std::time::Instant::now())
+    }
+
+    fn take_incomplete_at(&mut self, now: std::time::Instant) -> bool {
+        let Some(deadline) = self.deadline else {
+            return false;
+        };
+        if now < deadline {
+            return false;
+        }
+        self.deadline = None;
+        self.chunks.clear();
+        self.total_chunks = 0;
+        self.received_count = 0;
+        self.finished = false;
+        true
     }
 
     pub fn feed(&mut self, payload: &[u8]) -> Option<String> {
@@ -248,6 +273,7 @@ impl RoutingReassembler {
                 self.received_count = 0;
                 self.finished = false;
             }
+            self.deadline = Some(std::time::Instant::now() + Self::REASSEMBLY_TIMEOUT);
             return None;
         }
         if let Some(total_str) = rest.strip_prefix("FINISH:") {
@@ -285,6 +311,10 @@ impl RoutingReassembler {
             self.chunks[seq - 1] = Some(chunk_data.to_string());
             self.received_count += 1;
         }
+        // Таймаут — по затишью, а не по общему времени: 41+ чанк на медленном
+        // TURN-канале может идти дольше нескольких секунд, но пока чанки
+        // приходят, сборка продолжается. Сбрасываем дедлайн на каждом чанке.
+        self.deadline = Some(std::time::Instant::now() + Self::REASSEMBLY_TIMEOUT);
         if self.finished && self.received_count == self.total_chunks && self.total_chunks > 0 {
             return self.assemble();
         }
@@ -292,6 +322,7 @@ impl RoutingReassembler {
     }
 
     fn assemble(&mut self) -> Option<String> {
+        self.deadline = None;
         use base64::Engine;
         let mut b64_combined = String::new();
         for chunk in &self.chunks {
@@ -1546,10 +1577,22 @@ async fn reader_loop(
         configured_workers,
     } = runtime;
     let mut dropped_non_ip = 0u64;
+    let mut reassembly_tick = tokio::time::interval(std::time::Duration::from_millis(500));
+    reassembly_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         let packet = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Ok(()),
+            _ = reassembly_tick.tick() => {
+                if routing_reassembler.take_incomplete() && emits_routing {
+                    events.error(
+                        "routing_payload_incomplete",
+                        "ROUTING: не все чанки получены, правило отброшено",
+                        true,
+                    );
+                }
+                continue;
+            }
             result = transport.recv() => result?,
         };
         if is_panel_restart_notice(packet.as_slice()) {
@@ -2490,6 +2533,21 @@ mod tests {
         assert_eq!(reassembler.feed(b"ROUTING:FINISH:1"), None);
         assert!(reassembler.take_corrupt_error());
         assert!(!reassembler.take_corrupt_error());
+    }
+
+    #[test]
+    fn test_routing_reassembler_incomplete_times_out() {
+        let mut reassembler = RoutingReassembler::new();
+        assert_eq!(reassembler.feed(b"ROUTING:START:2"), None);
+        assert_eq!(reassembler.feed(b"ROUTING:1:2:AAAA"), None);
+        let start = std::time::Instant::now();
+        assert!(!reassembler.take_incomplete_at(start));
+        assert!(reassembler.take_incomplete_at(
+            start + RoutingReassembler::REASSEMBLY_TIMEOUT + std::time::Duration::from_millis(1)
+        ));
+        assert!(!reassembler.take_incomplete_at(
+            start + RoutingReassembler::REASSEMBLY_TIMEOUT + std::time::Duration::from_millis(2)
+        ));
     }
 
     #[test]
