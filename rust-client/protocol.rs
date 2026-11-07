@@ -3,6 +3,15 @@ use anyhow::{Result, bail};
 use crate::wire_protocol::PATH_ECHO_PREFIX;
 
 pub const PANEL_RESTART_NOTICE: &[u8] = b"\xffCSQTT_PANEL_RESTART_V1\x00\x91\x7d\x03\xa8";
+/// «Правило маршрутизации изменилось» — зеркало серверного
+/// `protocol::ROUTING_CHANGED_NOTICE`, байт в байт.
+///
+/// Сервер шлёт его живым сессиям после правки или отвязки правила, чтобы
+/// config-owner повторил `GETCONF`, не дожидаясь переподключения. Старый сервер
+/// этот бинарь не отправляет вовсе, а новый сервер → старый клиент: неизвестный
+/// пакет, который тот молча отбрасывает как не-IP — деградация в обе стороны
+/// безопасна.
+pub const ROUTING_CHANGED_NOTICE: &[u8] = b"\xffCSQTT_ROUTING_CHANGED_V1\x00\x5c\x2a\xef\x19";
 pub const STREAM_REPAIR_PREFIX: &[u8] = b"\xffCSQTT_STREAM_REPAIR_V1";
 pub const STREAM_ALIVE_PREFIX: &[u8] = b"\xffCSQTT_STREAM_ALIVE_V1";
 /// `ROUTING:ABSENT` — у подключения нет правила маршрутизации. Лежит в
@@ -94,7 +103,7 @@ pub fn is_config_response(response: &[u8]) -> bool {
 }
 
 pub fn is_control_response(response: &[u8]) -> bool {
-    if is_panel_restart_notice(response) {
+    if is_panel_restart_notice(response) || is_routing_changed_notice(response) {
         return true;
     }
     [
@@ -138,6 +147,13 @@ pub fn parse_tunworkers_response(payload: &[u8]) -> Option<(usize, usize)> {
 
 pub fn is_panel_restart_notice(response: &[u8]) -> bool {
     response == PANEL_RESTART_NOTICE
+}
+
+/// Распознаёт ли пакет сигнал «правило изменилось». Сравнение полное, как у
+/// `is_panel_restart_notice`: совпадение по префиксу превратило бы любой
+/// неизвестный бинарь с тем же началом в сигнал и вызвало бы лишний `GETCONF`.
+pub fn is_routing_changed_notice(response: &[u8]) -> bool {
+    response == ROUTING_CHANGED_NOTICE
 }
 
 pub fn disconnect_request(password: &str, salt: &str) -> String {
@@ -306,6 +322,45 @@ mod tests {
         let mut modified = PANEL_RESTART_NOTICE.to_vec();
         modified[1] ^= 1;
         assert!(!is_panel_restart_notice(&modified));
+    }
+
+    /// Сигнал «правило изменилось» обязан распознаваться строго и не должен
+    /// путаться с соседями: распознавание `ROUTING:`-чанка как сигнала
+    /// обрывало бы сборку правила, а распознавание уведомления о перезапуске
+    /// панели — вызывало лишнюю пересборку туннеля.
+    #[test]
+    fn routing_changed_notice_requires_an_exact_match_and_is_unique() {
+        assert!(is_routing_changed_notice(ROUTING_CHANGED_NOTICE));
+        assert!(!is_routing_changed_notice(b"CSQTT_ROUTING_CHANGED_V1"));
+        // Только префикс — не сигнал.
+        assert!(!is_routing_changed_notice(
+            b"\xffCSQTT_ROUTING_CHANGED_V1\x00"
+        ));
+        let mut modified = ROUTING_CHANGED_NOTICE.to_vec();
+        modified[1] ^= 1;
+        assert!(!is_routing_changed_notice(&modified));
+        let mut tail = ROUTING_CHANGED_NOTICE.to_vec();
+        let last = tail.len() - 1;
+        tail[last] ^= 1;
+        assert!(!is_routing_changed_notice(&tail));
+
+        // Отличим от соседей по протоколу.
+        assert_ne!(ROUTING_CHANGED_NOTICE, PANEL_RESTART_NOTICE);
+        assert!(!is_panel_restart_notice(ROUTING_CHANGED_NOTICE));
+        assert!(!ROUTING_CHANGED_NOTICE.starts_with(b"ROUTING:"));
+        assert!(!is_routing_changed_notice(b"ROUTING:ABSENT"));
+        assert!(!is_routing_changed_notice(
+            b"ROUTING:1:46:YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4"
+        ));
+    }
+
+    /// Notice обязан считаться управляющим пакетом: иначе `reader_loop`
+    /// относит его к «отброшенным не-IP пакетам», и счётчик потерь показывает
+    /// проблему там, где её нет.
+    #[test]
+    fn routing_changed_notice_is_a_control_packet() {
+        assert!(is_control_response(ROUTING_CHANGED_NOTICE));
+        assert!(!is_config_response(ROUTING_CHANGED_NOTICE));
     }
 
     #[test]

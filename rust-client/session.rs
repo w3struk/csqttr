@@ -6,8 +6,8 @@ use crate::{
     packet::{PacketBuf, PacketPool},
     protocol::{
         ConfigResponse, config_request, disconnect_request, is_config_response,
-        is_control_response, is_panel_restart_notice, parse_config_response, parse_stream_alive,
-        parse_stream_repair,
+        is_control_response, is_panel_restart_notice, is_routing_changed_notice,
+        parse_config_response, parse_stream_alive, parse_stream_repair,
     },
     repair::RepairState,
     srtp_mode::SrtpMode,
@@ -1479,6 +1479,23 @@ async fn request_configuration(
                         events.panel_restart();
                         continue;
                     }
+                    // Notice проверяется до `ROUTING:` и до разбора IP: это
+                    // бинарь вне семейства текстовых control-строк, и иначе он
+                    // упал бы в счётчик отброшенных не-IP пакетов.
+                    if is_routing_changed_notice(packet.as_slice()) {
+                        // Правило сменили, пока мы ещё ждём конфиг: просим
+                        // решение заново тем же дублированным запросом.
+                        // Дебаунс здесь не нужен — attempts ограничены
+                        // `CONFIG_RESPONSE_TIMEOUT_MS`, а notice приходит раз на
+                        // сохранение правила.
+                        if emits_routing {
+                            writer
+                                .send_bytes_duplicate(request.as_ref(), true)
+                                .await
+                                .context("повторный GETCONF после изменения правила")?;
+                        }
+                        continue;
+                    }
                     if packet.as_slice().starts_with(b"ROUTING:") {
                         if packet.as_slice() == crate::protocol::ROUTING_ABSENT {
                             if emits_routing {
@@ -1692,6 +1709,78 @@ async fn send_writer_bytes_duplicated(
     result.await.context("writer command response closed")?
 }
 
+/// Как часто живое подключение готово повторять `GETCONF` по push-сигналу
+/// «правило изменилось».
+///
+/// Панель умеет сохранять несколько раз подряд (автосохранение, пакетная
+/// правка, пересохранение того же правила), и каждое сохранение шлёт notice
+/// всем затронутым сессиям. Повтор на живом туннеле стоит дороже стартового:
+/// сервер отдаёт полный blob чанками, а приложение пересобирает маршрутизацию.
+/// Одна секунда — то же самое, что и окно подавления дубля на сервере, поэтому
+/// лишние запросы всё равно не превращаются в лишние доставки.
+const ROUTING_CHANGED_REFRESH_WINDOW: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// Отдать ли повторный `GETCONF` на очередной notice.
+///
+/// Чистая функция: `last` — момент последнего такого запроса (`None` — ещё не
+/// было), `now` — момент получения notice. Отдаём не чаще одного раза за
+/// `ROUTING_CHANGED_REFRESH_WINDOW`; сдвигать отметку обязан вызывающий, иначе
+/// дебаунс превратится в полный запрет повторов.
+fn routing_changed_refresh_due(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    match last {
+        None => true,
+        Some(moment) => now
+            .checked_duration_since(moment)
+            .is_none_or(|elapsed| elapsed >= ROUTING_CHANGED_REFRESH_WINDOW),
+    }
+}
+
+/// Дебаунс повторного `GETCONF` по push-сигналу с гарантированным «хвостом».
+///
+/// Первый notice окна уходит сразу (leading edge). Notice, пришедший внутри
+/// окна, подавляется, но оставляет `pending`: по истечении окна уходит один
+/// хвостовой запрос, забирающий последнее состояние правила. Без хвоста
+/// последнее сохранение серии короче окна потерялось бы навсегда — watchdog
+/// будит только несобранную доставку, периодического опроса нет.
+#[derive(Default)]
+struct RoutingRefreshDebounce {
+    last: Option<std::time::Instant>,
+    pending: bool,
+}
+
+impl RoutingRefreshDebounce {
+    /// Получен notice. `true` — GETCONF уходит прямо сейчас; иначе запрос
+    /// отложен до конца окна (`pending`).
+    fn notice(&mut self, now: std::time::Instant) -> bool {
+        if routing_changed_refresh_due(self.last, now) {
+            self.last = Some(now);
+            self.pending = false;
+            true
+        } else {
+            self.pending = true;
+            false
+        }
+    }
+
+    /// Пора ли отправить хвостовой GETCONF (проверка на периодическом тике).
+    fn trailing_due(&self, now: std::time::Instant) -> bool {
+        self.pending && routing_changed_refresh_due(self.last, now)
+    }
+
+    /// Зафиксировать успешную постановку запроса. При ошибке отправки вызывающий
+    /// НЕ зовёт это — `pending` остаётся, и хвост повторится на следующем тике.
+    fn sent(&mut self, now: std::time::Instant) {
+        self.pending = false;
+        self.last = Some(now);
+    }
+
+    /// Leading-запрос не поставился (очередь полна/закрыта) — оставить долг,
+    /// чтобы хвост повторил попытку, а не терял единственное изменение.
+    fn retry_later(&mut self) {
+        self.pending = true;
+    }
+}
+
 async fn reader_loop(
     mut transport: TransportReader,
     runtime: ReaderRuntime,
@@ -1713,6 +1802,9 @@ async fn reader_loop(
     } = runtime;
     let mut dropped_non_ip = 0u64;
     let mut routing_retries = 0u32;
+    // Серия сохранений правила не должна вылиться в серию полных доставок, но
+    // последнее сохранение серии обязано забраться (см. RoutingRefreshDebounce).
+    let mut routing_refresh = RoutingRefreshDebounce::default();
     const MAX_ROUTING_RETRIES: u32 = 2;
     let mut reassembly_tick = tokio::time::interval(std::time::Duration::from_millis(500));
     reassembly_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1788,12 +1880,50 @@ async fn reader_loop(
                         );
                     }
                 }
+                // Хвост подавленного notice: окно истекло — забираем последнее
+                // состояние. При ошибке постановки флаг не сбрасываем, повтор
+                // уйдёт на следующем тике (сессия с закрытой очередью всё равно
+                // вскоре завершится).
+                if emits_routing && routing_refresh.trailing_due(std::time::Instant::now()) {
+                    crate::log_error!("[СЕССИЯ] правило изменилось на сервере, отложенный GETCONF");
+                    if send_writer_bytes_duplicated(&writer_tx, &routing_request)
+                        .await
+                        .is_ok()
+                    {
+                        routing_refresh.sent(std::time::Instant::now());
+                    }
+                }
                 continue;
             }
             result = transport.recv() => result?,
         };
         if is_panel_restart_notice(packet.as_slice()) {
             events.panel_restart();
+            continue;
+        }
+        // Push «правило изменилось» на живом туннеле. Проверка стоит до
+        // `ROUTING:` и до разбора IP: бинар не принадлежит текстовым
+        // control-строкам, и без этой ветки он попадал бы в
+        // `dropped_non_ip`.
+        if is_routing_changed_notice(packet.as_slice()) {
+            // Повтор запрашивает только config-owner: воркеры не применяют
+            // правило и не эмитят событие, а полный blob на каждого воркера —
+            // это та самая лавина приоритетных пакетов.
+            let now = std::time::Instant::now();
+            if emits_routing && routing_refresh.notice(now) {
+                crate::log_error!("[СЕССИЯ] правило изменилось на сервере, повторный GETCONF");
+                if let Err(error) = send_writer_bytes_duplicated(&writer_tx, &routing_request).await
+                {
+                    // Ошибка постановки не фатальна, но и изменение терять нельзя:
+                    // оставляем долг — хвост повторит GETCONF, как для подавленного
+                    // notice. Закрытая очередь умирающей сессии всё равно скоро
+                    // завершит цикл.
+                    routing_refresh.retry_later();
+                    crate::log_error!(
+                        "[СЕССИЯ] повторный GETCONF после изменения правила не поставлен: {error:#}"
+                    );
+                }
+            }
             continue;
         }
         if let Some(command) = parse_stream_repair(packet.as_slice()) {
@@ -2919,6 +3049,106 @@ mod tests {
             }),
             "копии чанка не имеют права удваивать received"
         );
+    }
+
+    /// Дебаунс push-сигнала «правило изменилось»: панель может сохранять
+    /// несколько раз подряд, и каждое сохранение шлёт notice. Без окна это
+    /// превратилось бы в серию полных доставок правила на живом туннеле.
+    #[test]
+    fn routing_changed_refresh_is_debounced_to_one_request_per_window() {
+        let base = std::time::Instant::now();
+        assert!(
+            routing_changed_refresh_due(None, base),
+            "первый notice обязан порождать запрос"
+        );
+        assert!(
+            !routing_changed_refresh_due(Some(base), base),
+            "повтор в тот же момент подавляется"
+        );
+        assert!(!routing_changed_refresh_due(
+            Some(base),
+            base + Duration::from_millis(999)
+        ));
+        assert!(routing_changed_refresh_due(
+            Some(base),
+            base + ROUTING_CHANGED_REFRESH_WINDOW
+        ));
+        assert!(routing_changed_refresh_due(
+            Some(base),
+            base + ROUTING_CHANGED_REFRESH_WINDOW * 4
+        ));
+        // Часы mono-time не должны паниковать, если «now» оказался раньше
+        // отметки: checked_duration_since даёт None, и запрос разрешается.
+        assert!(routing_changed_refresh_due(
+            Some(base + ROUTING_CHANGED_REFRESH_WINDOW),
+            base
+        ));
+    }
+
+    /// Регрессия на потерю последнего сохранения серии: notice, подавленный
+    /// окном, обязан оставить хвостовой запрос, иначе правило навсегда
+    /// останется старым (watchdog будит только несобранную доставку, не опрос).
+    #[test]
+    fn routing_refresh_debounce_suppressed_notice_leaves_trailing() {
+        let mut debounce = RoutingRefreshDebounce::default();
+        let base = std::time::Instant::now();
+        // Сохранение A: первый notice уходит сразу.
+        assert!(debounce.notice(base));
+        // Сохранение B через 0.5 с подавлено окном...
+        assert!(!debounce.notice(base + Duration::from_millis(500)));
+        // ...но до конца окна хвост ещё не уходит.
+        assert!(!debounce.trailing_due(base + Duration::from_millis(900)));
+        // Окно истекло — обязан уйти один хвостовой запрос за последним состоянием.
+        assert!(debounce.trailing_due(base + ROUTING_CHANGED_REFRESH_WINDOW));
+        debounce.sent(base + ROUTING_CHANGED_REFRESH_WINDOW);
+        // Хвост доставлен — повторных запросов нет.
+        assert!(!debounce.trailing_due(base + ROUTING_CHANGED_REFRESH_WINDOW * 2));
+    }
+
+    #[test]
+    fn routing_refresh_debounce_collapses_burst_to_single_trailing() {
+        let mut debounce = RoutingRefreshDebounce::default();
+        let base = std::time::Instant::now();
+        assert!(debounce.notice(base));
+        for ms in [100u64, 300, 700, 900] {
+            assert!(!debounce.notice(base + Duration::from_millis(ms)));
+        }
+        // Вся серия сводится к одному хвосту, а не к запросу на каждое сохранение.
+        assert!(debounce.trailing_due(base + ROUTING_CHANGED_REFRESH_WINDOW));
+        debounce.sent(base + ROUTING_CHANGED_REFRESH_WINDOW);
+        assert!(
+            !debounce
+                .trailing_due(base + ROUTING_CHANGED_REFRESH_WINDOW + Duration::from_millis(100))
+        );
+        // Новый notice после окна снова уходит сразу.
+        assert!(debounce.notice(base + ROUTING_CHANGED_REFRESH_WINDOW * 2));
+    }
+
+    #[test]
+    fn routing_refresh_debounce_trailing_retries_until_sent() {
+        let mut debounce = RoutingRefreshDebounce::default();
+        let base = std::time::Instant::now();
+        assert!(debounce.notice(base));
+        assert!(!debounce.notice(base + Duration::from_millis(500)));
+        let due_at = base + ROUTING_CHANGED_REFRESH_WINDOW;
+        assert!(debounce.trailing_due(due_at));
+        // Отправка не удалась (вызывающий не позвал sent) — хвост остаётся.
+        assert!(debounce.trailing_due(due_at + Duration::from_millis(500)));
+        debounce.sent(due_at + Duration::from_millis(500));
+        assert!(!debounce.trailing_due(due_at + Duration::from_millis(600)));
+    }
+
+    #[test]
+    fn routing_refresh_debounce_failed_leading_is_retried_as_trailing() {
+        let mut debounce = RoutingRefreshDebounce::default();
+        let base = std::time::Instant::now();
+        // Leading-запрос должен был уйти, но постановка не удалась.
+        assert!(debounce.notice(base));
+        debounce.retry_later();
+        // Долг остаётся: после окна хвост повторит попытку, изменение не потеряно.
+        assert!(debounce.trailing_due(base + ROUTING_CHANGED_REFRESH_WINDOW));
+        debounce.sent(base + ROUTING_CHANGED_REFRESH_WINDOW);
+        assert!(!debounce.trailing_due(base + ROUTING_CHANGED_REFRESH_WINDOW * 2));
     }
 
     /// Watchdog-повтор `GETCONF` обязан ставиться ДУБЛИРОВАННОЙ командой:

@@ -49,6 +49,19 @@ const DIAGNOSTIC_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const DIAGNOSTIC_LEASE: Duration = Duration::from_secs(5 * 60);
 const SESSION_LEASE: &[u8] = b"\xffCSQTT_LEASE";
 pub const PANEL_RESTART_NOTICE: &[u8] = b"\xffCSQTT_PANEL_RESTART_V1\x00\x91\x7d\x03\xa8";
+/// «Правило маршрутизации изменилось» — push-сигнал живым сессиям.
+///
+/// Без него решение о маршрутизации вообще существует только как ответ на
+/// `GETCONF`, который клиент отправляет при старте коннекта: правка или отвязка
+/// правила в панели до живого туннеля не доходила, и ветка
+/// `RELOAD_ROUTING reason=routing_cleared` в приложении была недостижима.
+///
+/// Форма — как у `PANEL_RESTART_NOTICE`: `\xff` + имя + `\x00` + четыре
+/// уникальных magic-байта. Старый клиент не знает этот бинарь и молча
+/// отбрасывает его как не-IP пакет, поэтому сигнал безопасен для смешанных
+/// версий; деградация односторонняя — новый клиент со старым сервером просто
+/// никогда его не получает и живёт по-прежнему, только на `GETCONF`.
+pub const ROUTING_CHANGED_NOTICE: &[u8] = b"\xffCSQTT_ROUTING_CHANGED_V1\x00\x5c\x2a\xef\x19";
 const STREAM_REPAIR_PREFIX: &[u8] = b"\xffCSQTT_STREAM_REPAIR_V1";
 const STREAM_ALIVE_PREFIX: &[u8] = b"\xffCSQTT_STREAM_ALIVE_V1";
 pub(crate) const MAX_STREAM_WORKERS: usize = 100;
@@ -766,6 +779,19 @@ impl PasswordEpochState {
                 true
             }
         }
+    }
+
+    /// Сбросить отметку доставки чанкованного правила config-owner'у, ничего
+    /// не отправляя.
+    ///
+    /// Нужно для push-сигнала «правило изменилось»: без сброса немедленный
+    /// `GETCONF` на живом туннеле попал бы в окно подавления дубля (1 с) и
+    /// остался бы без ответа — клиент получил бы `TUNCONF`, но не новое
+    /// правило. Отметку воркера (`worker_delivered_generation`) не трогаем:
+    /// строгое «одно решение на поколение» для legacy-клиента — его собственный
+    /// инвариант, а не защита от дублей.
+    fn invalidate_owner_routing_delivery(&mut self) {
+        self.owner_routing_delivered = None;
     }
 
     fn matches(&self, generation_id: u64, session_salt: &str) -> bool {
@@ -1805,6 +1831,95 @@ pub fn notify_panel_restart(app: &Arc<App>) -> Result<()> {
             payload: PANEL_RESTART_NOTICE.to_vec(),
         },
     )
+}
+
+/// Забыть отметку доставки правила владельцу по паролю.
+///
+/// Вызывается перед `notify_routing_changed`, чтобы немедленный `GETCONF` на
+/// живом туннеле не был подавлен окном дубля. Отсутствующий слот — не ошибка:
+/// туннела по этому паролю нет, сбрасывать нечего.
+pub async fn invalidate_routing_delivery(app: &Arc<App>, password: &str) {
+    if password.is_empty() {
+        return;
+    }
+    // Ref DashMap живёт только до `.clone()`: держать его через `.await`
+    // нельзя, иначе блокировка шарда переживает снятие блокировки epoch.
+    let Some(slot) = app
+        .password_epochs
+        .get(password)
+        .map(|entry| entry.value().clone())
+    else {
+        return;
+    };
+    slot.epoch.lock().await.invalidate_owner_routing_delivery();
+}
+
+/// Сообщение «правило изменилось» живым сессиям затронутых паролей.
+///
+/// В отличие от `notify_panel_restart` рассылка адресная: `BroadcastPlain`
+/// ударил бы по всем подключениям, включая тех, чьё правило не менялось, а
+/// повторный `GETCONF` для них означает полную переоткачку blob'а.
+///
+/// `Ok(())`, если слать некому: пустой набор, пустые пароли или нет ни одной
+/// живой сессии — нормальный исход (например, правка правила, когда клиент
+/// вообще не подключён).
+pub async fn notify_routing_changed(app: &Arc<App>, passwords: &[String]) -> Result<()> {
+    let wanted: HashSet<&str> = passwords
+        .iter()
+        .map(String::as_str)
+        .filter(|password| !password.is_empty())
+        .collect();
+    if wanted.is_empty() {
+        return Ok(());
+    }
+    for password in &wanted {
+        invalidate_routing_delivery(app, password).await;
+    }
+    // Дедуп по id сессии: у одного пароля их несколько (воркеры), а `passwords`
+    // может пересекаться (main входит и в список клиентов).
+    let mut targets: Vec<u64> = Vec::new();
+    let mut seen = HashSet::new();
+    for entry in app.sessions.iter() {
+        let session = entry.value();
+        if wanted.contains(session.password.as_str()) && seen.insert(session.id) {
+            targets.push(session.id);
+        }
+    }
+    let mut failures = 0usize;
+    for session_id in &targets {
+        if command(
+            app,
+            ProtocolCommand::SendPlain {
+                session_id: *session_id,
+                payload: ROUTING_CHANGED_NOTICE.to_vec(),
+            },
+        )
+        .is_err()
+        {
+            failures += 1;
+        }
+    }
+    // Отдельный отказ — не ошибка: часть сессий могла умереть между снимком и
+    // отправкой. Проблемой считаем только случай, когда не поставился НИ ОДИН
+    // сигнал — это признак неработающего датаплейна, а не гонки.
+    if failures > 0 && failures == targets.len() {
+        bail!("routing change notice was not queued for any of {failures} session(s)");
+    }
+    // Частичный отказ не ошибка ответа, но должен оставлять след: сессия, чья
+    // очередь не приняла notice, останется со старым правилом до следующего
+    // сохранения/переподключения.
+    if failures > 0 {
+        log_event(
+            app,
+            "WARN",
+            "routing",
+            &format!(
+                "routing_changed_notice partial: {failures}/{} session(s) not queued",
+                targets.len()
+            ),
+        );
+    }
+    Ok(())
 }
 
 pub async fn compact_memory(app: &Arc<App>) -> Result<bool> {
@@ -4106,6 +4221,7 @@ fn should_flush_udp_immediately(payload: &[u8]) -> bool {
         || payload == b"READY"
         || payload == b"READY_OK"
         || payload == PANEL_RESTART_NOTICE
+        || payload == ROUTING_CHANGED_NOTICE
 }
 
 fn session_is_retired_by_epoch(
@@ -6730,6 +6846,33 @@ mod tests {
         assert!(should_flush_udp_immediately(ROUTING_ABSENT));
     }
 
+    /// Push-сигнал «правило изменилось» обязан уходить вне общей очереди, как
+    /// остальные control-уведомления: иначе он доедет до клиента за очередью
+    /// media-пакетов и потеряет смысл немедленного обновления.
+    #[test]
+    fn routing_changed_notice_is_flushed_immediately() {
+        assert!(should_flush_udp_immediately(ROUTING_CHANGED_NOTICE));
+        // Та же форма, что у `PANEL_RESTART_NOTICE`: `\xff` + имя + `\x00` +
+        // четыре magic-байта.
+        assert!(ROUTING_CHANGED_NOTICE.starts_with(b"\xffCSQTT_ROUTING_CHANGED_V1\x00"));
+        assert_eq!(ROUTING_CHANGED_NOTICE.len(), 30);
+    }
+
+    /// Notice обязан быть отличим от соседних бинарей: клиент сравнивает его
+    /// целиком (`==`), и любое совпадение с другим уведомлением молча
+    /// перенаправит сигнал в чужую ветку обработки.
+    #[test]
+    fn routing_changed_notice_cannot_be_confused_with_other_packets() {
+        assert_ne!(ROUTING_CHANGED_NOTICE, PANEL_RESTART_NOTICE);
+        assert!(!ROUTING_CHANGED_NOTICE.starts_with(STREAM_REPAIR_PREFIX));
+        assert!(!ROUTING_CHANGED_NOTICE.starts_with(STREAM_ALIVE_PREFIX));
+        assert!(!ROUTING_CHANGED_NOTICE.starts_with(b"ROUTING:"));
+        assert!(!ROUTING_CHANGED_NOTICE.starts_with(b"TUNCONF:"));
+        // Оба уведомления — один класс пакетов, различаются только байтами.
+        assert!(should_flush_udp_immediately(PANEL_RESTART_NOTICE));
+        assert!(!PANEL_RESTART_NOTICE.starts_with(ROUTING_CHANGED_NOTICE));
+    }
+
     #[test]
     fn only_the_owner_request_asks_for_routing() {
         assert!(getconf_requests_routing(&[
@@ -7224,6 +7367,54 @@ mod tests {
             .filter(|sent| routing_delivery_pause_after(*sent, 137))
             .count();
         assert_eq!(worst, 137 / ROUTING_DELIVERY_BATCH);
+    }
+
+    /// Сброс отметки — единственная легитимная причина доставить правило
+    /// повторно внутри окна дубля: именно так push-сигнал «правило изменилось»
+    /// получает немедленный `GETCONF` на живом туннеле.
+    #[test]
+    fn invalidated_owner_delivery_is_available_inside_the_duplicate_window() {
+        let mut state = PasswordEpochState::default();
+        let now = std::time::Instant::now();
+        let owner = RoutingRequester::ConfigOwner { session_id: 51 };
+
+        assert!(state.claim_routing_delivery_at(7, owner, now));
+        assert!(
+            !state.claim_routing_delivery_at(7, owner, now + ROUTING_DUPLICATE_DELIVERY_WINDOW / 2),
+            "без сброса повтор гасится окном"
+        );
+
+        state.invalidate_owner_routing_delivery();
+        assert!(
+            state.claim_routing_delivery_at(7, owner, now + ROUTING_DUPLICATE_DELIVERY_WINDOW / 2),
+            "после сброса тот же интервал обязан вернуть доставку"
+        );
+    }
+
+    /// Сброс касается только отметки владельца: строгое «одно решение на
+    /// поколение» для клиента без метки `owner` — отдельный инвариант, и
+    /// правка правила не должна рассылать blob каждому legacy-воркеру.
+    #[test]
+    fn invalidated_owner_delivery_keeps_the_worker_slot_once_per_generation() {
+        let mut state = PasswordEpochState::default();
+        let now = std::time::Instant::now();
+
+        assert!(state.claim_routing_delivery_at(7, RoutingRequester::Worker, now));
+        state.invalidate_owner_routing_delivery();
+        assert!(!state.claim_routing_delivery_at(7, RoutingRequester::Worker, now));
+        assert!(!state.claim_routing_delivery_at(
+            7,
+            RoutingRequester::Worker,
+            now + ROUTING_DUPLICATE_DELIVERY_WINDOW * 4
+        ));
+
+        // Владельцу после сброса доставляем, воркеру — по-прежнему нет.
+        assert!(state.claim_routing_delivery_at(
+            7,
+            RoutingRequester::ConfigOwner { session_id: 61 },
+            now
+        ));
+        assert!(!state.claim_routing_delivery_at(7, RoutingRequester::Worker, now));
     }
 
     #[test]

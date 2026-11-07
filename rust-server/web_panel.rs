@@ -1916,7 +1916,7 @@ async fn client_update(
         Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
     };
 
-    let revision = {
+    let (revision, affected) = {
         let mut db = state.app.db.write().await;
         if request.vk_token && db.vk_access_token.is_empty() {
             return (StatusCode::BAD_REQUEST, "configure a VK token first").into_response();
@@ -1925,7 +1925,9 @@ async fn client_update(
             db.main_vk_hashes = vk_hashes;
             db.main_vk_token_enabled = request.vk_token;
             db.main_workers = validated_workers;
-            state.app.db_persistence.submit(db.clone())
+            // Привязку правила этот handler не трогает (у main она меняется
+            // только через routing_rules_*), поэтому и уведомления не нужно.
+            (state.app.db_persistence.submit(db.clone()), Vec::new())
         } else {
             let current_group_id = match db.passwords.get(&password) {
                 Some(e) => e.group_id.clone(),
@@ -1950,6 +1952,13 @@ async fn client_update(
 
             let entry = db.passwords.get_mut(&password).unwrap();
 
+            // Смена группы меняет разрешённое правило только у клиента без
+            // собственного: групповое правило стоит ниже собственного в
+            // порядке `resolve_routing_rule`. Если собственного правила нет и
+            // группа другая — старое решение больше не действительно, и
+            // клиенту нужен новый `GETCONF`.
+            let rule_binding_changed =
+                entry.routing_rule_id.is_empty() && target_group_id != current_group_id;
             let default_peer_port = state.app.listen.port();
             let fallback_port = if entry.dtls_port == 0 {
                 default_peer_port
@@ -1976,12 +1985,18 @@ async fn client_update(
                 entry.group_id = g_id.clone();
             }
             entry.workers = validated_workers;
-            state.app.db_persistence.submit(db.clone())
+            let affected = if rule_binding_changed {
+                vec![password.clone()]
+            } else {
+                Vec::new()
+            };
+            (state.app.db_persistence.submit(db.clone()), affected)
         }
     };
     if let Err(response) = wait_for_persistence(&state, revision).await {
         return response;
     }
+    notify_routing_changed_or_log(&state, &affected).await;
     if let Err(message) = refresh_credentials_report(&state).await {
         let warning = format!("saved but reload failed: {message}");
         return (StatusCode::OK, [("x-csqtt-reload-error", warning)], "saved").into_response();
@@ -2012,6 +2027,10 @@ async fn client_toggle(State(state): State<WebState>, Path(password): Path<Strin
 }
 
 async fn client_unbind(State(state): State<WebState>, Path(password): Path<String>) -> Response {
+    // Уведомление о смене правила здесь не нужно и не могло бы сработать:
+    // привязка правила этим handler'ом не меняется, а `drop_password_sessions`
+    // уничтожает ровно те сессии, которым notice был бы адресован. Клиент
+    // переподключится и получит актуальное решение обычным `GETCONF`.
     crate::protocol::drop_password_sessions(&state.app, &password);
     crate::protocol::forget_idle_password_epoch(&state.app, &password);
     StatusCode::OK.into_response()
@@ -2831,26 +2850,59 @@ async fn groups_update(
     Path(id): Path<String>,
     Json(request): Json<UpdateGroupRequest>,
 ) -> Response {
-    let revision = {
+    let (revision, affected) = {
         let mut db = state.app.db.write().await;
-        let Some(group) = db.groups.get_mut(&id) else {
+        // Снимок «до» строится по ПРЕЖНЕМУ значению привязки: после мутации
+        // группа уже не указывает на старое правило, и union собрать было бы
+        // нечем. Отдельного прохода по клиентам ради этого не делаем —
+        // пересохранение имени или лимита воркеров никого не будит.
+        let Some(previous_rule_id) = db
+            .groups
+            .get(&id)
+            .map(|group| group.routing_rule_id.clone())
+        else {
             return StatusCode::NOT_FOUND.into_response();
         };
-        if let Some(name) = request.name {
-            let n = name.trim();
-            if n.is_empty() || n.len() > 64 {
-                return (StatusCode::BAD_REQUEST, "invalid group name").into_response();
+        let next_rule_id = request.routing_rule_id.clone();
+        let binding_changed = next_rule_id
+            .as_ref()
+            .is_some_and(|next| next != &previous_rule_id);
+        let before = if binding_changed {
+            group_affected_passwords(&db, &id)
+        } else {
+            Vec::new()
+        };
+
+        {
+            let Some(group) = db.groups.get_mut(&id) else {
+                return StatusCode::NOT_FOUND.into_response();
+            };
+            if let Some(name) = request.name {
+                let n = name.trim();
+                if n.is_empty() || n.len() > 64 {
+                    return (StatusCode::BAD_REQUEST, "invalid group name").into_response();
+                }
+                group.name = n.to_string();
             }
-            group.name = n.to_string();
+            if let Some(r_id) = request.routing_rule_id {
+                group.routing_rule_id = r_id;
+            }
         }
-        if let Some(r_id) = request.routing_rule_id {
-            group.routing_rule_id = r_id;
-        }
-        state.app.db_persistence.submit(db.clone())
+        // Union «до» и «после»: участники группы попадают в оба набора (их
+        // ожидание определяется членством), а main — только в «до», потому что
+        // после снятия привязки его правило уже не совпадает с групповым. Без
+        // «до» main остался бы живым туннелем со снятым правилом.
+        let affected = if binding_changed {
+            merge_affected_passwords(&before, &group_affected_passwords(&db, &id))
+        } else {
+            Vec::new()
+        };
+        (state.app.db_persistence.submit(db.clone()), affected)
     };
     if let Err(response) = wait_for_persistence(&state, revision).await {
         return response;
     }
+    notify_routing_changed_or_log(&state, &affected).await;
     let _ = crate::protocol::broadcast_tunnel_configuration(&state.app).await;
     StatusCode::OK.into_response()
 }
@@ -2879,6 +2931,14 @@ async fn groups_delete(State(state): State<WebState>, Path(id): Path<String>) ->
     if let Err(response) = wait_for_persistence(&state, revision).await {
         return response;
     }
+    // Уведомление о смене правила здесь не нужно и не могло бы сработать:
+    // участники группы удаляются вместе с ней, а `drop_password_sessions`
+    // уничтожает ровно те сессии, которым notice был бы адресован. Выживших
+    // клиентов, чьё разрешённое правило изменилось бы, нет: через группу
+    // резолвятся только её участники (все удалены), а main — через собственную
+    // привязку `main_routing_rule_id`, не через группу. Удалённые клиенты при
+    // переподключении не пройдут аутентификацию; остальные получат актуальное
+    // решение обычным `GETCONF`. Тот же случай, что `client_unbind`/`client_delete`.
     for pwd in &deleted_passwords {
         crate::protocol::drop_password_sessions(&state.app, pwd);
     }
@@ -3546,27 +3606,30 @@ async fn api_clients_batch_group(
     Json(req): Json<BatchGroupAssignRequest>,
 ) -> Response {
     let mut moved = 0usize;
-    let revision = {
+    let (revision, affected) = {
         let mut db = state.app.db.write().await;
         let gid = req.group_id.trim();
         if !gid.is_empty() && !db.groups.contains_key(gid) {
             return (StatusCode::BAD_REQUEST, "target group not found").into_response();
         }
+        let affected = batch_group_affected_passwords(&db, &req.passwords, gid);
         for pwd in &req.passwords {
             if let Some(entry) = db.passwords.get_mut(pwd) {
                 entry.group_id = gid.to_string();
                 moved += 1;
             }
         }
-        if moved > 0 {
+        let revision = if moved > 0 {
             Some(state.app.db_persistence.submit(db.clone()))
         } else {
             None
-        }
+        };
+        (revision, affected)
     };
     if let Some(rev) = revision {
         let _ = wait_for_persistence(&state, rev).await;
     }
+    notify_routing_changed_or_log(&state, &affected).await;
     (
         StatusCode::OK,
         Json(serde_json::json!({ "ok": true, "moved": moved })),
@@ -4232,6 +4295,142 @@ fn routing_rule_validation_response(rule: &RoutingRule) -> Option<Response> {
         .map(|message| (StatusCode::BAD_REQUEST, message).into_response())
 }
 
+/// Участники, чьё разрешённое правило приходит из группы: `group_id` совпадает,
+/// собственного правила нет, пароль непустой. Единственное место, где живёт
+/// условие «собственное правило важнее группового».
+fn group_member_passwords(
+    db: &model::Database,
+    group_id: &str,
+) -> std::collections::BTreeSet<String> {
+    db.passwords
+        .iter()
+        .filter(|(password, entry)| {
+            entry.group_id == group_id && entry.routing_rule_id.is_empty() && !password.is_empty()
+        })
+        .map(|(password, _)| password.clone())
+        .collect()
+}
+
+/// Кого касается привязка правила к конкретной ГРУППЕ.
+///
+/// Отличается от `rule_affected_passwords` областью: там — все, кто резолвится
+/// на это правило (прямые привязки и другие группы с тем же правилом), здесь —
+/// только эта группа. Пересохранение группы не должно вызывать переоткачку
+/// правила у соседей, которые используют то же правило.
+///
+/// Участники попадают в набор независимо от того, осталось в группе правило или
+/// снято: их разрешённое правило определяется членством, а не значением
+/// `routing_rule_id`. Поэтому «правило забрали» не теряет участников из union'а
+/// даже если считать набор уже после мутации.
+fn group_affected_passwords(db: &model::Database, group_id: &str) -> Vec<String> {
+    let mut affected = group_member_passwords(db, group_id);
+    // main вне группового членства, но если его собственная привязка указывает
+    // на то же правило, что стоит на группе, — смена группы касается и его.
+    if let Some(group) = db.groups.get(group_id)
+        && !group.routing_rule_id.is_empty()
+        && !db.main_password.is_empty()
+        && db.main_routing_rule_id == group.routing_rule_id
+    {
+        affected.insert(db.main_password.clone());
+    }
+    affected.into_iter().collect()
+}
+
+/// Объединение наборов «до» и «после»: без дублей, детерминированный порядок.
+fn merge_affected_passwords(before: &[String], after: &[String]) -> Vec<String> {
+    before
+        .iter()
+        .chain(after.iter())
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// Кому может быть заметно это правило: повторяет порядок разрешения правила из
+/// `model::Database::resolve_routing_rule`, а не угадывает его.
+///
+/// В набор попадают:
+/// - клиенты, у которых `routing_rule_id` равен `rule_id` (собственное правило
+///   имеет приоритет над групповым, поэтому такого клиента изменение видно
+///   всегда);
+/// - члены групп с этим правилом, но только те, у кого собственного правила
+///   нет — иначе группное правило их и так не касается;
+/// - `main_password`, если `main_routing_rule_id` равен `rule_id`.
+///
+/// Возвращает непустые пароли без дублей и в детерминированном порядке.
+/// Пустой `rule_id` — пустой набор: отвязка «на ничего» никого не трогает, а
+/// вызывающий и без того передаёт набор, в котором правила уже нет.
+fn rule_affected_passwords(db: &model::Database, rule_id: &str) -> Vec<String> {
+    if rule_id.is_empty() {
+        return Vec::new();
+    }
+    let mut affected = std::collections::BTreeSet::new();
+    for group in db.groups.values() {
+        if group.routing_rule_id == rule_id {
+            affected.extend(group_member_passwords(db, &group.id));
+        }
+    }
+    for (password, entry) in &db.passwords {
+        if entry.routing_rule_id == rule_id && !password.is_empty() {
+            affected.insert(password.clone());
+        }
+    }
+    if !db.main_password.is_empty() && db.main_routing_rule_id == rule_id {
+        affected.insert(db.main_password.clone());
+    }
+    affected.into_iter().collect()
+}
+
+/// Кого касается массовый перевод клиентов в группу (`api_clients_batch_group`).
+///
+/// Зеркало условия из `client_update`: разрешённое правило меняется только у
+/// перемещаемого клиента БЕЗ собственного правила и только если группа реально
+/// другая. Клиент с собственным правилом от групповой привязки не зависит, а
+/// перевод «в ту же группу» ничего не меняет. Набор строится ДО мутации, поэтому
+/// `entry.group_id` здесь — прежняя группа. Пустые пароли и отсутствующие в базе
+/// пропускаются, порядок детерминированный, без дублей.
+fn batch_group_affected_passwords(
+    db: &model::Database,
+    passwords: &[String],
+    target_group_id: &str,
+) -> Vec<String> {
+    let mut affected = std::collections::BTreeSet::new();
+    for pwd in passwords {
+        if let Some(entry) = db.passwords.get(pwd)
+            && entry.routing_rule_id.is_empty()
+            && entry.group_id.as_str() != target_group_id
+            && !pwd.is_empty()
+        {
+            affected.insert(pwd.clone());
+        }
+    }
+    affected.into_iter().collect()
+}
+
+/// Оповестить живые сессии о смене правила и не превращать неудачу в ошибку
+/// ответа: изменение уже сохранено, а 5xx поверх успешного сохранения
+/// подтолкнул бы оператора сохранять правило повторно.
+///
+/// Пустой набор — молча: уведомлять некого (клиенты выключены, правило
+/// никому не назначено).
+async fn notify_routing_changed_or_log(state: &WebState, passwords: &[String]) {
+    if passwords.is_empty() {
+        return;
+    }
+    if let Err(error) = protocol::notify_routing_changed(&state.app, passwords).await {
+        log_event(
+            &state.app,
+            "WARN",
+            "routing",
+            &format!(
+                "routing_changed_notice undelivered clients={} error={error:#}",
+                passwords.len()
+            ),
+        );
+    }
+}
+
 async fn routing_rules_create(
     State(state): State<WebState>,
     Json(request): Json<CreateRoutingRuleRequest>,
@@ -4289,7 +4488,7 @@ async fn routing_rules_create(
     if let Some(response) = routing_rule_validation_response(&rule) {
         return response;
     }
-    let revision = {
+    let (revision, affected) = {
         let mut db = state.app.db.write().await;
         for g_id in &assigned_groups {
             if let Some(g) = db.groups.get_mut(g_id) {
@@ -4304,12 +4503,16 @@ async fn routing_rules_create(
         if !db.main_password.is_empty() && assigned_clients.contains(&db.main_password) {
             db.main_routing_rule_id = id.clone();
         }
+        // Набор считаем ПОСЛЕ привязки: у нового правила ещё нет старых
+        // владельцев, поэтому «кого задеть» = «кому оно теперь назначено».
+        let affected = rule_affected_passwords(&db, &id);
         db.routing_rules.insert(id, rule.clone());
-        state.app.db_persistence.submit(db.clone())
+        (state.app.db_persistence.submit(db.clone()), affected)
     };
     if let Err(response) = wait_for_persistence(&state, revision).await {
         return response;
     }
+    notify_routing_changed_or_log(&state, &affected).await;
     Json(rule).into_response()
 }
 
@@ -4374,8 +4577,12 @@ async fn routing_rules_update(
     if let Some(response) = routing_rule_validation_response(&candidate) {
         return response;
     }
-    let revision = {
+    let (revision, affected) = {
         let mut db = state.app.db.write().await;
+        // Отвязанные при пересохранении ничем не отличаются от тех, кому
+        // правило просто изменили содержимое: оба случая требуют нового
+        // решения, поэтому берём объединение «до» и «после».
+        let before = rule_affected_passwords(&db, &id);
         db.routing_rules.insert(id.clone(), candidate);
 
         for group in db.groups.values_mut() {
@@ -4399,20 +4606,26 @@ async fn routing_rules_update(
                 db.main_routing_rule_id.clear();
             }
         }
-        state.app.db_persistence.submit(db.clone())
+        let affected = merge_affected_passwords(&before, &rule_affected_passwords(&db, &id));
+        (state.app.db_persistence.submit(db.clone()), affected)
     };
     if let Err(response) = wait_for_persistence(&state, revision).await {
         return response;
     }
+    notify_routing_changed_or_log(&state, &affected).await;
     StatusCode::OK.into_response()
 }
 
 async fn routing_rules_delete(State(state): State<WebState>, Path(id): Path<String>) -> Response {
-    let revision = {
+    let (revision, affected) = {
         let mut db = state.app.db.write().await;
         if db.routing_rules.remove(&id).is_none() {
             return StatusCode::NOT_FOUND.into_response();
         }
+        // Набор снимаем сразу после удаления правила, но до снятия привязок:
+        // ниже эти поля обнуляются, и по «после» было бы не понять, кого
+        // касалось удалённое правило.
+        let affected = rule_affected_passwords(&db, &id);
         for group in db.groups.values_mut() {
             if group.routing_rule_id == id {
                 group.routing_rule_id.clear();
@@ -4426,11 +4639,12 @@ async fn routing_rules_delete(State(state): State<WebState>, Path(id): Path<Stri
         if db.main_routing_rule_id == id {
             db.main_routing_rule_id.clear();
         }
-        state.app.db_persistence.submit(db.clone())
+        (state.app.db_persistence.submit(db.clone()), affected)
     };
     if let Err(response) = wait_for_persistence(&state, revision).await {
         return response;
     }
+    notify_routing_changed_or_log(&state, &affected).await;
     StatusCode::OK.into_response()
 }
 
@@ -13469,12 +13683,218 @@ mod tests {
     use super::{
         CLIENT_SUB_HTML, CreateRoutingRuleRequest, DNS_PROVIDERS, GROUP_ADMIN_HTML, GROUP_SUB_HTML,
         LOGIN_HTML, MAX_CLIENT_NAME_BYTES, PANEL_HTML, PWA_ICON_192_PNG, PWA_ICON_512_PNG,
-        PWA_MANIFEST, PWA_SERVICE_WORKER, THEME_TOKENS, count_active_sessions, decrypt_csqtt_link,
-        deploy_dns_profile_or_yandex, dns_provider_by_id, dns_provider_id, encrypt_csqtt_link,
-        make_client_link, manual_dns, normalize_client_vk_hashes, normalize_vk_access_token,
-        process_memory, process_memory_rollup, provider_dns, routing_rule_validation_response,
-        validate_client_name, validate_proxy_profile_name, validate_workers,
+        PWA_MANIFEST, PWA_SERVICE_WORKER, THEME_TOKENS, batch_group_affected_passwords,
+        count_active_sessions, decrypt_csqtt_link, deploy_dns_profile_or_yandex,
+        dns_provider_by_id, dns_provider_id, encrypt_csqtt_link, group_affected_passwords,
+        make_client_link, manual_dns, merge_affected_passwords, normalize_client_vk_hashes,
+        normalize_vk_access_token, process_memory, process_memory_rollup, provider_dns,
+        routing_rule_validation_response, rule_affected_passwords, validate_client_name,
+        validate_proxy_profile_name, validate_workers,
     };
+
+    /// База с одним правилом `rule_1`, прямым клиентом, группой и main.
+    fn affected_fixture() -> crate::model::Database {
+        let mut db = crate::model::Database {
+            main_password: "main-pass".to_owned(),
+            ..Default::default()
+        };
+        db.passwords.insert(
+            "direct-pass".to_owned(),
+            crate::model::PasswordEntry {
+                routing_rule_id: "rule_1".to_owned(),
+                ..Default::default()
+            },
+        );
+        db.passwords.insert(
+            "group-pass".to_owned(),
+            crate::model::PasswordEntry {
+                group_id: "g1".to_owned(),
+                ..Default::default()
+            },
+        );
+        db.passwords.insert(
+            "overridden-pass".to_owned(),
+            crate::model::PasswordEntry {
+                group_id: "g1".to_owned(),
+                // Собственное правило важнее группового: этого клиента
+                // `rule_1` не касается, даже если его группу привязали к нему.
+                routing_rule_id: "rule_2".to_owned(),
+                ..Default::default()
+            },
+        );
+        db.groups.insert(
+            "g1".to_owned(),
+            crate::model::ClientGroup {
+                id: "g1".to_owned(),
+                routing_rule_id: "rule_1".to_owned(),
+                ..Default::default()
+            },
+        );
+        db
+    }
+
+    #[test]
+    fn rule_affected_passwords_covers_direct_clients_and_group_members() {
+        let affected = rule_affected_passwords(&affected_fixture(), "rule_1");
+        assert_eq!(
+            affected,
+            vec!["direct-pass".to_owned(), "group-pass".to_owned()],
+            "прямые владельцы правила и члены привязанной группы без собственного правила"
+        );
+        assert!(
+            !affected.contains(&"overridden-pass".to_owned()),
+            "клиент с собственным правилом не зависит от групповой привязки"
+        );
+        assert!(
+            !affected.contains(&"main-pass".to_owned()),
+            "main привязывается отдельно и не попадает в набор по умолчанию"
+        );
+    }
+
+    #[test]
+    fn rule_affected_passwords_includes_main_only_for_its_own_binding() {
+        let mut db = affected_fixture();
+        db.main_routing_rule_id = "rule_1".to_owned();
+        let affected = rule_affected_passwords(&db, "rule_1");
+        assert!(affected.contains(&"main-pass".to_owned()));
+        // Другое правило main не имеет отношения к затронутым.
+        assert_eq!(
+            rule_affected_passwords(&db, "rule_2"),
+            vec!["overridden-pass".to_owned()]
+        );
+    }
+
+    #[test]
+    fn rule_affected_passwords_ignores_empty_rule_id() {
+        // Отвязка «на ничего» никого не зовёт на GETCONF: пустой идентификатор
+        // правила — не сигнал изменения.
+        assert!(rule_affected_passwords(&affected_fixture(), "").is_empty());
+    }
+
+    #[test]
+    fn group_affected_passwords_covers_members_and_skips_clients_with_own_rule() {
+        // Группа g1 привязана к rule_1: участников касается, клиента с
+        // собственным rule_2 — нет (его групповое правило не пересекает).
+        assert_eq!(
+            group_affected_passwords(&affected_fixture(), "g1"),
+            vec!["group-pass".to_owned()]
+        );
+        // Незнакомая группа — пустой набор, а не паника.
+        assert!(group_affected_passwords(&affected_fixture(), "nope").is_empty());
+    }
+
+    #[test]
+    fn group_affected_passwords_includes_main_only_when_it_shares_the_group_rule() {
+        let mut db = affected_fixture();
+        db.main_routing_rule_id = "rule_1".to_owned();
+        assert_eq!(
+            group_affected_passwords(&db, "g1"),
+            vec!["group-pass".to_owned(), "main-pass".to_owned()],
+            "main привязан к тому же правилу, что и группа"
+        );
+        db.main_routing_rule_id = "rule_other".to_owned();
+        assert_eq!(
+            group_affected_passwords(&db, "g1"),
+            vec!["group-pass".to_owned()]
+        );
+    }
+
+    /// Ради этого union и нужен: при снятии правила с группы её main-ожидание
+    /// исчезает из набора «после», и без «до» main остался бы живым туннелем со
+    /// снятым правилом.
+    #[test]
+    fn group_rebinding_unions_members_kept_and_main_lost() {
+        let mut db = affected_fixture();
+        db.main_routing_rule_id = "rule_1".to_owned();
+        let before = group_affected_passwords(&db, "g1");
+        assert_eq!(
+            before,
+            vec!["group-pass".to_owned(), "main-pass".to_owned()]
+        );
+
+        db.groups
+            .get_mut("g1")
+            .expect("группа из фикстуры")
+            .routing_rule_id
+            .clear();
+        let after = group_affected_passwords(&db, "g1");
+        // Участник остаётся в «после» (набор строится по членству), а main —
+        // уже нет: его ожидание определялось прежней привязкой группы.
+        assert_eq!(after, vec!["group-pass".to_owned()]);
+
+        let merged = merge_affected_passwords(&before, &after);
+        assert_eq!(
+            merged,
+            vec!["group-pass".to_owned(), "main-pass".to_owned()],
+            "отвязанное правило не должно терять ни участника, ни main"
+        );
+    }
+
+    #[test]
+    fn merge_affected_passwords_is_deduped_and_ordered() {
+        let before = vec!["b".to_owned(), "a".to_owned()];
+        let after = vec!["a".to_owned(), "c".to_owned()];
+        assert_eq!(
+            merge_affected_passwords(&before, &after),
+            vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]
+        );
+        assert!(merge_affected_passwords(&[], &[]).is_empty());
+        assert_eq!(
+            merge_affected_passwords(&["a".to_owned()], &["a".to_owned()]),
+            vec!["a".to_owned()]
+        );
+    }
+
+    #[test]
+    fn batch_group_affected_passwords_notifies_only_moved_clients_without_own_rule() {
+        let mut db = affected_fixture();
+        db.passwords.insert(
+            "b-pass".to_owned(),
+            crate::model::PasswordEntry {
+                group_id: "g1".to_owned(),
+                ..Default::default()
+            },
+        );
+        let moved = vec![
+            "group-pass".to_owned(),
+            "overridden-pass".to_owned(),
+            "direct-pass".to_owned(),
+            "b-pass".to_owned(),
+        ];
+        assert_eq!(
+            batch_group_affected_passwords(&db, &moved, "g2"),
+            vec!["b-pass".to_owned(), "group-pass".to_owned()],
+            "клиенты с собственным правилом от группы не зависят; будим только тех, кто без него"
+        );
+    }
+
+    #[test]
+    fn batch_group_affected_passwords_skips_same_group_but_unbind_notifies() {
+        let db = affected_fixture();
+        // Перевод в ту же группу ничего не меняет.
+        assert!(batch_group_affected_passwords(&db, &["group-pass".to_owned()], "g1").is_empty());
+        // Снятие с группы (пустая цель) меняет разрешённое правило участника.
+        assert_eq!(
+            batch_group_affected_passwords(&db, &["group-pass".to_owned()], ""),
+            vec!["group-pass".to_owned()]
+        );
+    }
+
+    #[test]
+    fn batch_group_affected_passwords_dedups_and_skips_unknown_or_empty() {
+        let db = affected_fixture();
+        let moved = vec![
+            "group-pass".to_owned(),
+            "group-pass".to_owned(),
+            "nonexistent".to_owned(),
+            String::new(),
+        ];
+        assert_eq!(
+            batch_group_affected_passwords(&db, &moved, "g2"),
+            vec!["group-pass".to_owned()]
+        );
+        assert!(batch_group_affected_passwords(&db, &[], "g2").is_empty());
+    }
 
     #[test]
     fn undeliverable_rule_is_rejected_with_400() {
