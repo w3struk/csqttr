@@ -36,7 +36,55 @@ use tokio::{
 
 const CONTROL_MAX: usize = 2048;
 const MAGIC_COOKIE: [u8; 4] = [0x21, 0x12, 0xa4, 0x42];
-const UDP_RECEIVE_BUFFER_BYTES: usize = 32 * 1024;
+/// Размер буфера приёма UDP-сокета TURN-канала (`SO_RCVBUF` на запросе).
+///
+/// Почему 128 КБ, а не 32 КБ. Замер на живом стенде после расширения кольца:
+/// `queue_full_drops`/`pool_deficit_drops` обнулились, но сокет продолжал
+/// терять — `RcvbufErrors=588`, и в 3 из 10 холодных стартов не доходило 2–7
+/// чанков из 51. То есть дроп переехал на уровень ниже: пакет гибнет в
+/// ядерном буфере сокета, ещё до нашего кольца, и ни `queue_full_drops`, ни
+/// `pool_deficit_drops` этого не видят в принципе.
+///
+/// Арифметика бурста: доставка правила — это ≤ 137 пакетов (см.
+/// `INCOMING_QUEUE_CAPACITY`), в поле обычно 51 чанк + START/FINISH ≈ 53
+/// пакета. Ядро считает место не по полезным байтам, а по `skb->truesize` с
+/// накладными: для датаграммы ~735 Б на проводе это от ~1.1 КБ (типично) до
+/// 1.5–2 КБ в худшем случае, значит типичный бурст занимает ≈ 60–108 КБ.
+/// Старые 32 КБ запроса после удвоения давали ≈ 64 КБ, и этого впритык: любой
+/// media-трафик того же соединения вытесняет control-пакеты.
+///
+/// Что реально даёт запрос 128 КБ. Ядро удваивает запрошенное и режет по
+/// `net.core.rmem_max`, поэтому выданное ≈ `min(256 КБ, rmem_max)` — см.
+/// `ANDROID_RMEM_MAX_BYTES`. По памяти на устройство: 10 воркеров × ~208 КБ
+/// ≈ 2.08 МБ ядра (считаем уже от потолка, а не от 2 × запроса). Просить 256 КБ
+/// смысла нет: после удвоения и отсечения выдали бы те же ~208 КБ, только
+/// явнее упёршись в потолок. Для сравнения: другие сокеты процесса просят
+/// больше (`dispatcher.rs` — 1 МиБ, `direct_relay.rs` — 256 КиБ).
+///
+/// Операционный предел после ввода серверного pacing'а — НЕ вся доставка, а
+/// один батч: сервер спит после каждых 16 строк
+/// (`ROUTING_DELIVERY_BATCH` в `rust-server/protocol.rs`), так что в очередь
+/// ядра одновременно ложится ≈ 18–33 КБ по truesize-оценке (16 × 1.1–2 КБ;
+/// ~12 КБ в полезных байтах), а не 137 пакетов целиком.
+///
+/// Когда пересматривать: рост числа пакетов в одном батче (изменение pacing
+/// или возврат дублирования чанков), рост числа воркеров, либо другой вендорский
+/// потолок `rmem_max` на целевом устройстве. Максимальный легитимный бурст
+/// (137 пакетов) целиком этим бюджетом покрывается только при
+/// `truesize ≤ 1554 Б` — при 2 КБ он уже не влезает, и тогда единственная
+/// защита — серверный pacing (батч 16 пакетов ≈ 18–33 КБ), а не размер буфера.
+const UDP_RECEIVE_BUFFER_BYTES: usize = 128 * 1024;
+/// Типичный потолок `net.core.rmem_max` на Android: то, сколько ядро
+/// действительно выдаёт сокету, каким бы большим ни был удвоенный запрос.
+/// ОРИЕНТИР, а не гарантия: значение задаёт вендорный образ, на некоторых
+/// прошивках оно меньше (или его поднимают через `setprop`), поэтому тест
+/// сверяется с `min(2 × запрос, этот потолок)`, а фактическое выданное надо
+/// подтверждать read-back-логом `SO_RCVBUF`, а не считать аксиомой.
+///
+/// Живёт под `#[cfg(test)]`: в рантайме потолок не применяем сами — это решение
+/// ядра, и единственное честное, что мы можем, — прочитать результат.
+#[cfg(test)]
+const ANDROID_RMEM_MAX_BYTES: usize = 208 * 1024;
 const UDP_SEND_BUFFER_BYTES: usize = 16 * 1024;
 const _: () = assert!(UDP_RECEIVE_BUFFER_BYTES + UDP_SEND_BUFFER_BYTES <= 512 * 1024);
 /// Слотов во входящем SPSC-кольце: сюда ложатся ВСЕ расшифрованные ChannelData
@@ -1619,7 +1667,28 @@ fn channel_data_padding(packet: &PacketBuf, channel: u16) -> Result<usize> {
 
 fn configure_udp_socket_buffers(socket: &UdpSocket) {
     let socket = SockRef::from(socket);
-    let _ = socket.set_recv_buffer_size(UDP_RECEIVE_BUFFER_BYTES);
+    // Read-back обязателен: без него следующий замер `RcvbufErrors` не отличит
+    // «ядро не применило запрос» (маленький `rmem_max`, права, другой вендорный
+    // профиль) от «применило, но выданных байт не хватает на бурст». Ни один из
+    // этих случаев не виден в `queue_full_drops`/`pool_deficit_drops` — они
+    // считают дропы ниже сокета.
+    //
+    // Ошибку не считаем фатальной: сокет продолжает работать с унаследованным
+    // буфером, и падать из-за diagnostics на боевом пути нельзя.
+    let requested = UDP_RECEIVE_BUFFER_BYTES;
+    if socket.set_recv_buffer_size(requested).is_err() {
+        crate::log_error!("[TURN] SO_RCVBUF: запрос {requested} не принят ядром");
+    }
+    match socket.recv_buffer_size() {
+        Ok(granted) => {
+            crate::log_error!("[TURN] SO_RCVBUF: запрошено {requested}, выдано {granted}");
+        }
+        Err(error) => {
+            crate::log_error!(
+                "[TURN] SO_RCVBUF: запрошено {requested}, выданное не прочитать: {error}"
+            );
+        }
+    }
     let _ = socket.set_send_buffer_size(UDP_SEND_BUFFER_BYTES);
 }
 
@@ -1682,10 +1751,68 @@ mod tests {
     const MAX_RULE_DELIVERY_PACKETS: usize =
         MAX_RULE_DELIVERY_BASE64_BYTES.div_ceil(ROUTING_CHUNK_BYTES) + 2;
 
+    /// Типичный бурст доставки на стенде: 51 чанк + `START` + `FINISH`.
+    const TYPICAL_RULE_DELIVERY_PACKETS: usize = 53;
+    /// Сколько пакетов успевает налиться в очередь между двумя серверными
+    /// паузами — операционный предел после pacing'а. Зеркало
+    /// `ROUTING_DELIVERY_BATCH` из `rust-server/protocol.rs`: при его изменении
+    /// надо править и это число (и формулировку в комментарии к
+    /// `UDP_RECEIVE_BUFFER_BYTES`).
+    const ROUTING_DELIVERY_BATCH_PACKETS: usize = 16;
+
     #[test]
     fn turn_socket_buffer_budget_is_bounded_per_worker() {
-        assert_eq!(UDP_RECEIVE_BUFFER_BYTES, 32 * 1024);
+        // 128 КБ: ядро удваивает запрос и режет по `net.core.rmem_max`, поэтому
+        // СРАВНИВАЕМ НЕ с 2 × запросом, а с тем бюджетом, который реально может
+        // быть выдан: min(256 КБ, 208 КБ). Иначе тест проверял бы бюджет,
+        // которого не существует, и оставался бы зелёным при любой огромной
+        // константе. Обоснование — в комментарии к UDP_RECEIVE_BUFFER_BYTES.
+        assert_eq!(UDP_RECEIVE_BUFFER_BYTES, 128 * 1024);
         assert_eq!(UDP_SEND_BUFFER_BYTES, 16 * 1024);
+        let effective_receive_budget_bytes =
+            (2 * UDP_RECEIVE_BUFFER_BYTES).min(ANDROID_RMEM_MAX_BYTES);
+
+        // Типичный бурст по ТИПИЧНОЙ оценке truesize (~1.1 КБ на датаграмму).
+        let typical_truesize_bytes = 1127usize;
+        let typical_burst_bytes = TYPICAL_RULE_DELIVERY_PACKETS * typical_truesize_bytes;
+        assert!(
+            typical_burst_bytes <= effective_receive_budget_bytes,
+            "типичный бурст обязан помещаться в выданный SO_RCVBUF: \
+             {typical_burst_bytes} > {effective_receive_budget_bytes}"
+        );
+
+        // Тот же типичный бурст по ВЕРХНЕЙ оценке truesize (1.5–2 КБ на
+        // датаграмму ~735 Б на проводе). Именно этот случай и ловит
+        // `RcvbufErrors=588`, поэтому проверяем по нему, а не по 1.1 КБ.
+        let upper_truesize_bytes = 2048usize;
+        let typical_burst_upper_bytes = TYPICAL_RULE_DELIVERY_PACKETS * upper_truesize_bytes;
+        assert!(
+            typical_burst_upper_bytes <= effective_receive_budget_bytes,
+            "бурст даже по верхней оценке truesize обязан влезать в SO_RCVBUF: \
+             {typical_burst_upper_bytes} > {effective_receive_budget_bytes}"
+        );
+
+        // Операционный предел — один батч pacing'а, а не вся доставка: 16
+        // пакетов даже по верхней оценке это 32 КБ против бюджета 208 КБ.
+        let batch_upper_bytes = ROUTING_DELIVERY_BATCH_PACKETS * upper_truesize_bytes;
+        assert!(
+            batch_upper_bytes <= effective_receive_budget_bytes,
+            "батч между паузами обязан помещаться с многократным запасом: \
+             {batch_upper_bytes} > {effective_receive_budget_bytes}"
+        );
+
+        // Честная граница того, чем этот бюджет прикрыт и чем нет: максимальный
+        // легитимный бурст (137 пакетов) влезает в него при типичном truesize
+        // (137 × 1127 = 154 399 ≤ 212 992), но НЕ влезает при верхней оценке
+        // (137 × 2048 = 280 576 > 212 992). То есть для худшего случая на
+        // максимальном бурсте защита одна — серверный pacing (батч 16 пакетов),
+        // а не размер буфера; проверяем положительную половину этого утверждения.
+        let max_burst_typical_bytes = MAX_RULE_DELIVERY_PACKETS * typical_truesize_bytes;
+        assert!(
+            max_burst_typical_bytes <= effective_receive_budget_bytes,
+            "максимальный бурст по типичному truesize обязан влезать в SO_RCVBUF: \
+             {max_burst_typical_bytes} > {effective_receive_budget_bytes}"
+        );
         // Ёмкость входящего кольца — не магическое число, а окно на бурст
         // доставки правила. Порог ВЫЧИСЛЕН из лимита события (137 пакетов,
         // см. MAX_RULE_DELIVERY_PACKETS), а не выбран круглым: при 16 слотах
