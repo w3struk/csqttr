@@ -4870,6 +4870,32 @@ fn routing_delivery_lines(encoded: &str, chunk_size: usize) -> Vec<String> {
     lines
 }
 
+/// Сколько строк доставки уходит залпом перед паузой.
+///
+/// Замер холодного старта на устройстве после расширения кольца приёмника:
+/// `queue_full_drops`/`pool_deficit_drops` = 0, но сокет терял
+/// `RcvbufErrors=588`, а 3 из 10 стартов не добирали 2–7 чанков из 51. Причина
+/// — залп: `routing_delivery_lines` даёт ≤ 137 (в поле ~53) подряд идущих
+/// приоритетных датаграмм, и очередь приёма сокета не успевает опустошаться.
+/// Вероятность потери из-за всплеска обратно пропорциональна длине очереди на
+/// bottleneck, поэтому доставку разносят по времени вместо слепого
+/// дублирования — `DEEP_RESEARCH_ingress_ring_capacity.md`, раздел про pacing
+/// (и рекомендация там же: порции по 8–16 пакетов с паузой 1–2 мс).
+const ROUTING_DELIVERY_BATCH: usize = 16;
+/// Пауза между порциями. 1 мс на доставку из 53 строк даёт ~3 паузы (≈3–4 мс
+/// сверх самой отправки) — незаметно для пользователя, но достаточно, чтобы
+/// приёмник успел сливать очередь между порциями.
+const ROUTING_DELIVERY_PAUSE: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// Нужна ли пауза после `sent`-й строки из `total`.
+///
+/// Вынесено из цикла, чтобы грани были тестируемыми: после ПОСЛЕДНЕЙ строки
+/// спать нельзя — `FINISH` должен уйти сразу, а следующая за ним запись это
+/// уже `TUNCONF`, который и так ждёт очереди.
+fn routing_delivery_pause_after(sent: usize, total: usize) -> bool {
+    sent < total && sent.is_multiple_of(ROUTING_DELIVERY_BATCH)
+}
+
 fn merged_domains(rule: &crate::model::RoutingRule) -> (Vec<String>, usize) {
     let mut domains = rule.direct_domains.clone();
     if rule.template_domains {
@@ -5454,11 +5480,27 @@ async fn handle_getconf(
                 let lines = routing_delivery_lines(&encoded, chunk_size);
                 let mut queued = 0usize;
                 let mut enqueue_errors = 0usize;
-                for line in &lines {
+                for (index, line) in lines.iter().enumerate() {
                     if writer.write(line.as_bytes()).await.is_ok() {
                         queued += 1;
                     } else {
                         enqueue_errors += 1;
+                    }
+                    // Pacing вместо залпа (см. `ROUTING_DELIVERY_BATCH`).
+                    // Держим паузу ПОСЛЕ записи и НЕ после последней строки.
+                    //
+                    // Для будущего читателя: на время этих пауз удерживается
+                    // owned-гвард `epoch` (tokio Mutex по паролю) — он
+                    // освобождается только после записи TUNCONF. Значит
+                    // конкурентный GETCONF того же пароля подождёт на
+                    // `lock_password_epoch` лишние ~3–4 мс. Это приемлемо:
+                    // доставка происходит раз на поколение/владельца, а не на
+                    // каждый пакет, и альтернатива (отпустить гвард на время
+                    // сна) открыла бы окно для второго GETCONF с его же
+                    // последовательностью ROUTING — ровно тот дефект, который
+                    // мы подавили окном дубля.
+                    if routing_delivery_pause_after(index + 1, lines.len()) {
+                        tokio::time::sleep(ROUTING_DELIVERY_PAUSE).await;
                     }
                 }
                 log_event(
@@ -7143,6 +7185,45 @@ mod tests {
             encoded.len() / 4 * 3,
             "полный блок base64 без padding декодируется целиком"
         );
+    }
+
+    /// Границы pacing'а: пауза после каждых `ROUTING_DELIVERY_BATCH` строк и
+    /// НИКОГДА после последней — `FINISH` и следующий за ним `TUNCONF` не
+    /// должны разрываться сном.
+    #[test]
+    fn delivery_pauses_fall_between_batches_and_never_after_the_last_line() {
+        assert_eq!(ROUTING_DELIVERY_BATCH, 16);
+        assert_eq!(ROUTING_DELIVERY_PAUSE, std::time::Duration::from_millis(1));
+
+        // Ровно одна граница: после 16-й, 32-й, 48-й.
+        for sent in 1..=16 {
+            assert_eq!(
+                routing_delivery_pause_after(sent, 53),
+                sent == 16,
+                "пауза после {sent}-й из 53"
+            );
+        }
+        assert!(routing_delivery_pause_after(32, 53));
+        assert!(routing_delivery_pause_after(48, 53));
+        // Последняя строка — никогда, даже если она кратна батчу.
+        assert!(!routing_delivery_pause_after(53, 53));
+        assert!(
+            !routing_delivery_pause_after(16, 16),
+            "доставка короче батча не спит"
+        );
+        assert!(!routing_delivery_pause_after(32, 32));
+        // Ровно 3 паузы на 53 строки — то, что обещано в комментарии.
+        let pauses = (1..=53)
+            .filter(|sent| routing_delivery_pause_after(*sent, 53))
+            .count();
+        assert_eq!(pauses, 3);
+
+        // Худший легитимный бурст (137 строк) — 8 пауз, то есть ~8 мс сверху,
+        // и ни одной после FINISH.
+        let worst = (1..=137)
+            .filter(|sent| routing_delivery_pause_after(*sent, 137))
+            .count();
+        assert_eq!(worst, 137 / ROUTING_DELIVERY_BATCH);
     }
 
     #[test]
