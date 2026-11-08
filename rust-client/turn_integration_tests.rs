@@ -207,9 +207,44 @@ fn empty_authenticated_success(kind: u16, transaction: [u8; 12]) -> Vec<u8> {
 }
 
 fn refresh_zero_success(transaction: [u8; 12]) -> Vec<u8> {
+    refresh_success(transaction, 0)
+}
+
+fn refresh_success(transaction: [u8; 12], lifetime: u32) -> Vec<u8> {
     let mut response = MessageBuilder::new(REFRESH_SUCCESS, transaction);
-    response.attribute(ATTR_LIFETIME, &0u32.to_be_bytes());
+    response.attribute(ATTR_LIFETIME, &lifetime.to_be_bytes());
     response.finish_authenticated(&long_term_key())
+}
+
+/// Ответ на периодический Refresh/CreatePermission, который allocation может
+/// отправить между пакетами данных. Иначе тест падал на контрольном STUN
+/// вместо ожидаемого ChannelData — источник флака под нагрузкой CI.
+async fn answer_periodic_turn_request(server: &UdpSocket, client: SocketAddr, wire: &[u8]) {
+    let message = StunMessage::decode(wire).unwrap();
+    assert_eq!(message.class(), StunClass::Request);
+    match message.method() {
+        REFRESH_REQUEST => {
+            let lifetime = attribute_u32(&message, ATTR_LIFETIME);
+            assert_ne!(
+                lifetime, 0,
+                "deallocate refresh arrived before the channel batch completed"
+            );
+            server
+                .send_to(&refresh_success(message.transaction(), lifetime), client)
+                .await
+                .unwrap();
+        }
+        CREATE_PERMISSION_REQUEST => {
+            server
+                .send_to(
+                    &empty_authenticated_success(CREATE_PERMISSION_SUCCESS, message.transaction()),
+                    client,
+                )
+                .await
+                .unwrap();
+        }
+        other => panic!("unexpected TURN request {other} between channel data packets"),
+    }
 }
 
 fn assert_fingerprint(message: &StunMessage<'_>) {
@@ -636,20 +671,37 @@ async fn data_packets_preserve_channel_order_and_release_idle_pool_leases() {
                     .unwrap();
             }
 
-            for payload in OUTBOUND {
+            let channel_prefix = channel.to_be_bytes();
+            let mut next_outbound = 0usize;
+            while next_outbound < OUTBOUND.len() {
                 let (wire, outbound_client) = recv_datagram(&server).await;
                 assert_eq!(outbound_client, client);
-                assert_eq!(wire, channel_data(channel, payload));
+                if wire.len() >= 2 && wire[0..2] == channel_prefix {
+                    assert_eq!(wire, channel_data(channel, OUTBOUND[next_outbound]));
+                    next_outbound += 1;
+                    continue;
+                }
+                answer_periodic_turn_request(&server, client, &wire).await;
             }
 
-            let (refresh_wire, refresh_client) = recv_datagram(&server).await;
-            assert_eq!(refresh_client, client);
-            let refresh = assert_authenticated_request(&refresh_wire, REFRESH_REQUEST);
-            assert_eq!(attribute_u32(&refresh, ATTR_LIFETIME), 0);
-            server
-                .send_to(&refresh_zero_success(refresh.transaction()), client)
-                .await
-                .unwrap();
+            // После пакетов ждём Refresh(lifetime=0) от deallocate; до него
+            // периодические Refresh/CreatePermission тоже допустимы.
+            loop {
+                let (wire, source) = recv_datagram(&server).await;
+                assert_eq!(source, client);
+                let message = StunMessage::decode(&wire).unwrap();
+                assert_eq!(message.class(), StunClass::Request);
+                if message.method() == REFRESH_REQUEST
+                    && attribute_u32(&message, ATTR_LIFETIME) == 0
+                {
+                    server
+                        .send_to(&refresh_zero_success(message.transaction()), client)
+                        .await
+                        .unwrap();
+                    break;
+                }
+                answer_periodic_turn_request(&server, client, &wire).await;
+            }
         }
     });
 
@@ -1592,6 +1644,8 @@ async fn windows_client_reaches_wsl_server_through_a_real_turn_channel_and_dispa
             server_stream_repair: Arc::new(AtomicBool::new(false)),
             repair: RepairState::new(9),
             configured_workers: 1,
+            routing_ips_sha: None,
+            routing_content_sha_file: None,
         },
         TurnCredentials {
             username: Arc::from(USERNAME),
@@ -1767,6 +1821,8 @@ async fn windows_client_reaches_wsl_server_over_dtls_srtp() {
             server_stream_repair: Arc::new(AtomicBool::new(false)),
             repair: RepairState::new(9),
             configured_workers: 1,
+            routing_ips_sha: None,
+            routing_content_sha_file: None,
         },
         TurnCredentials {
             username: Arc::from(USERNAME),
@@ -1946,6 +2002,8 @@ async fn getconf_timeout_recovers_without_terminating_the_tunnel() {
             server_stream_repair: Arc::new(AtomicBool::new(false)),
             repair: RepairState::new(1),
             configured_workers: 1,
+            routing_ips_sha: None,
+            routing_content_sha_file: None,
         },
         TurnCredentials {
             username: Arc::from(USERNAME),
@@ -2020,6 +2078,8 @@ async fn getconf_timeout_recovers_without_terminating_the_tunnel() {
             server_stream_repair: Arc::new(AtomicBool::new(false)),
             repair: RepairState::new(1),
             configured_workers: 1,
+            routing_ips_sha: None,
+            routing_content_sha_file: None,
         },
         TurnCredentials {
             username: Arc::from(USERNAME),
@@ -2134,6 +2194,8 @@ async fn running_client_receives_hot_dns_configuration_without_reconnect() {
             server_stream_repair: Arc::new(AtomicBool::new(false)),
             repair: RepairState::new(1),
             configured_workers: 1,
+            routing_ips_sha: None,
+            routing_content_sha_file: None,
         },
         TurnCredentials {
             username: Arc::from(USERNAME),
@@ -2328,6 +2390,8 @@ async fn nine_windows_workers_register_with_a_wsl_server_without_missing_or_dupl
                 server_stream_repair: server_stream_repair.clone(),
                 repair: repair.clone(),
                 configured_workers: 1,
+                routing_ips_sha: None,
+                routing_content_sha_file: None,
             },
             TurnCredentials {
                 username: Arc::from(USERNAME),
@@ -2785,6 +2849,8 @@ async fn linux_workers_hold_per_stream_rate_through_server_dataplane() {
                 server_stream_repair: server_stream_repair.clone(),
                 repair: repair.clone(),
                 configured_workers: 1,
+                routing_ips_sha: None,
+                routing_content_sha_file: None,
             },
             TurnCredentials {
                 username: Arc::from(USERNAME),
@@ -3036,6 +3102,8 @@ async fn assert_fatal_auth_case(wrap_pwd: &str, session_pwd: &str, expected_need
             server_stream_repair: Arc::new(AtomicBool::new(false)),
             repair: RepairState::new(1),
             configured_workers: 1,
+            routing_ips_sha: None,
+            routing_content_sha_file: None,
         },
         TurnCredentials {
             username: Arc::from(USERNAME),
@@ -3187,6 +3255,8 @@ async fn streams_partial_death_keeps_tunnel_and_dataplane_alive() {
                 server_stream_repair: server_stream_repair.clone(),
                 repair: repair.clone(),
                 configured_workers: 1,
+                routing_ips_sha: None,
+                routing_content_sha_file: None,
             },
             TurnCredentials {
                 username: Arc::from(USERNAME),

@@ -5,9 +5,9 @@ use crate::{
     obfs::{ObfsCipher, ObfsConfig, ObfsMode, ObfsState, SessionCipher, is_rtp_packet},
     packet::{PacketBuf, PacketPool},
     protocol::{
-        ConfigResponse, config_request, disconnect_request, is_config_response,
-        is_control_response, is_panel_restart_notice, parse_config_response, parse_stream_alive,
-        parse_stream_repair,
+        ConfigResponse, config_request_with_content, disconnect_request, is_config_response,
+        is_control_response, is_panel_restart_notice, is_routing_changed_notice,
+        is_routing_delivery, parse_config_response, parse_stream_alive, parse_stream_repair,
     },
     repair::RepairState,
     srtp_mode::SrtpMode,
@@ -94,6 +94,9 @@ pub struct SessionConfig {
     pub server_stream_repair: Arc<AtomicBool>,
     pub repair: Arc<RepairState>,
     pub configured_workers: usize,
+    pub routing_ips_sha: Option<Arc<str>>,
+    /// Файл с sha кеша доменов и приложений; читается на каждом GETCONF.
+    pub routing_content_sha_file: Option<std::path::PathBuf>,
 }
 
 pub struct SessionRuntime {
@@ -114,13 +117,21 @@ pub struct SessionRuntime {
 }
 
 fn build_registration_payload(config: &SessionConfig) -> Bytes {
-    Bytes::from(config_request(
+    let routing_content_sha = config
+        .routing_content_sha_file
+        .as_deref()
+        .and_then(crate::protocol::read_routing_content_sha);
+    Bytes::from(config_request_with_content(
         &config.local_port,
         &config.password,
         config.generation,
         &config.salt,
         config.id,
         Some(config.configured_workers.max(1)),
+        config.get_config,
+        config.routing_ips_sha.as_deref(),
+        routing_content_sha.as_deref(),
+        true,
     ))
 }
 
@@ -185,8 +196,26 @@ struct TransportReader {
     replay: ReplayProtection,
 }
 
+/// Команда writer-циклу на отправку control-датаграммы.
+///
+/// Ветки различаются ровно одним: уходит ли датаграмма двумя копиями.
+/// Дублируется только `GETCONF` — первый (`request_configuration` шлёт его
+/// удвоенным напрямую, мимо очереди) и watchdog-повтор
+/// (`send_writer_bytes_duplicated`). Всё остальное, что проходит через эту
+/// очередь (`DISCONNECT`), обязано оставаться одиночным: вторая копия
+/// control-команды — это второе исполнение на сервере, а не просто ещё одна
+/// копия ответа. `READY`, `GETWORKERS` и keepalive уходят тем же одиночным
+/// путём, но напрямую через `send_bytes`.
 enum WriterCommand {
+    /// Одиночный датаграмма — прежняя и единственная ветка для всех
+    /// постановщиков, кроме watchdog-повтора `GETCONF`.
     SendBytes {
+        data: Bytes,
+        completion: oneshot::Sender<Result<()>>,
+    },
+    /// Тот же путь отправки и та же обработка ошибки, но датаграмма уходит
+    /// двумя копиями. Только для `GETCONF`.
+    SendBytesDuplicated {
         data: Bytes,
         completion: oneshot::Sender<Result<()>>,
     },
@@ -206,12 +235,61 @@ pub const MAX_ROUTING_CHUNKS: usize = 8192;
 /// with the full bundled RU preset is ~3.8 KB, so 256 KiB leaves a wide margin.
 pub const MAX_ROUTING_PAYLOAD_BYTES: usize = 262_144;
 
+/// Счётчики последней НЕзавершённой сборки `ROUTING` — для диагностики потери
+/// датаграмм.
+///
+/// Отдаются только когда дедлайн сработал, то есть когда сборка начата, но за
+/// `REASSEMBLY_TIMEOUT` не закрылась. Различают два принципиально разных отказа,
+/// которые раньше выглядели одинаково: не дошёл почти ничего (`received` ≈ 0) и
+/// дошла почти вся последовательность (`received` = `total − k`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IncompleteRouting {
+    /// Сколько уникальных чанков лежат в сборке на момент срыва.
+    pub received: usize,
+    /// Сколько чанков обещала доставка (`START`, `FINISH` и голый чанк задают
+    /// его одинаково). При сработавшем дедлайне он заведомо `> 0`: deadline
+    /// взводится только из ветвей, которые уже разобрали `total`.
+    pub total: usize,
+    /// Был ли получен `FINISH`: `true` при недостающих чанках означает «хвост
+    /// доставки дошёл, не хватает середины», `false` — «посреди потока всё
+    /// встало».
+    pub finish_seen: bool,
+}
+
+/// Nonce `ROUTING2`: до 16 hex-символов (сервер шлёт 16).
+fn parse_routing_nonce(value: &str) -> Option<u64> {
+    if value.is_empty() || value.len() > 16 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(value, 16).ok()
+}
+
 #[derive(Default)]
 pub struct RoutingReassembler {
     total_chunks: usize,
     chunks: Vec<Option<String>>,
     received_count: usize,
     finished: bool,
+    /// `total` последней собранной последовательности.
+    ///
+    /// Клиент дублирует `GETCONF`, поэтому на одно подключение вполне могут
+    /// приехать две одинаковые последовательности `ROUTING`. После успешной
+    /// сборки хвост второй из них (`ROUTING:i:N:…`, `ROUTING:FINISH:N` с тем же
+    /// `N`) — не новая сборка: он обязан быть игнорирован, иначе опоздавший
+    /// чанк взведёт дедлайн, которого хватает watchdog, и туннель упадёт с
+    /// ложным `routing_payload_incomplete`.
+    assembled_total: Option<usize>,
+    /// После явного нового запроса (`reset_for_new_delivery`/retry) ждём START.
+    /// Данные до него игнорируются: это может быть хвост старой доставки.
+    awaiting_start: bool,
+    /// Nonce активной `ROUTING2`-доставки: чанки с чужим nonce не принимаются.
+    active_nonce: Option<u64>,
+    /// Nonce последних собранных `ROUTING2`-доставок (кольцо на 4): их
+    /// опоздавшие хвосты игнорируются молча, а не считаются потерянным START.
+    recent_assembled_nonces: Vec<u64>,
+    oversize: Option<usize>,
+    corrupt: bool,
+    deadline: Option<std::time::Instant>,
 }
 
 impl RoutingReassembler {
@@ -219,25 +297,123 @@ impl RoutingReassembler {
         Self::default()
     }
 
+    pub fn take_oversize_error(&mut self) -> Option<usize> {
+        self.oversize.take()
+    }
+
+    pub fn take_corrupt_error(&mut self) -> bool {
+        std::mem::take(&mut self.corrupt)
+    }
+
+    /// Начать новую доставку: забыть отметку уже собранной последовательности
+    /// и остатки частичной сборки.
+    ///
+    /// Нужно перед повторным `GETCONF` по push-сигналу: иначе новая доставка с
+    /// тем же числом чанков и потерянным `START` принимается за хвост старой и
+    /// молча игнорируется, оставляя в туннеле прежнее правило. После сброса
+    /// такой хвост не совпадёт с `assembled_total` и взведёт дедлайн — watchdog
+    /// повторит `GETCONF`, а не применит смесь старого и нового.
+    pub fn reset_for_new_delivery(&mut self) {
+        self.total_chunks = 0;
+        self.chunks.clear();
+        self.received_count = 0;
+        self.finished = false;
+        self.assembled_total = None;
+        self.deadline = None;
+        self.awaiting_start = true;
+        self.active_nonce = None;
+        // `last_assembled_nonce` не сбрасываем: хвост уже собранной доставки
+        // должен остаться молча проигнорированным.
+    }
+
+    /// Сколько ждать недостающие чанки `ROUTING`, прежде чем считать правило потерянным.
+    const REASSEMBLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+    /// Some(счётчики), если `ROUTING` начался, но за отведённое время не
+    /// собрался. Сбрасывает состояние, чтобы ошибка не повторялась; счётчики
+    /// снимаются ДО сброса.
+    pub fn take_incomplete(&mut self) -> Option<IncompleteRouting> {
+        self.take_incomplete_at(std::time::Instant::now())
+    }
+
+    fn take_incomplete_at(&mut self, now: std::time::Instant) -> Option<IncompleteRouting> {
+        let deadline = self.deadline?;
+        if now < deadline {
+            return None;
+        }
+        let incomplete = IncompleteRouting {
+            received: self.received_count,
+            total: self.total_chunks,
+            finish_seen: self.finished,
+        };
+        self.deadline = None;
+        self.chunks.clear();
+        self.total_chunks = 0;
+        self.received_count = 0;
+        self.finished = false;
+        // Сборка не состоялась — следующая доставка (повторный `GETCONF`) может
+        // приехать и без `START`, recovery-путь оставляем открытым.
+        self.assembled_total = None;
+        // Данные до нового START — потенциальный хвост потерянной доставки.
+        self.awaiting_start = true;
+        self.active_nonce = None;
+        Some(incomplete)
+    }
+
     pub fn feed(&mut self, payload: &[u8]) -> Option<String> {
+        self.oversize = None;
+        self.corrupt = false;
         let text = std::str::from_utf8(payload).ok()?;
+        if let Some(v2) = text.strip_prefix("ROUTING2:") {
+            return self.feed_v2(v2);
+        }
         let rest = text.strip_prefix("ROUTING:")?;
         if let Some(total_str) = rest.strip_prefix("START:") {
             let total: usize = total_str.trim().parse().ok()?;
             if total == 0 || total > MAX_ROUTING_CHUNKS {
                 return None;
             }
-            if self.total_chunks != total {
+            // После нового запроса всё, что пришло до START, уже отброшено:
+            // новый START обязан начать сборку с чистого листа. Без нового
+            // запроса (обычное переупорядочивание) чанки до START принадлежат
+            // этой же доставке и сохраняются.
+            let was_awaiting = self.awaiting_start;
+            if was_awaiting || self.total_chunks != total {
                 self.total_chunks = total;
                 self.chunks = vec![None; total];
                 self.received_count = 0;
                 self.finished = false;
             }
+            self.awaiting_start = false;
+            self.active_nonce = None;
+            // Новый `START` — новая последовательность: она больше не считается
+            // уже собранной, даже если `total` совпадает с предыдущей.
+            self.assembled_total = None;
+            self.deadline = Some(std::time::Instant::now() + Self::REASSEMBLY_TIMEOUT);
             return None;
         }
         if let Some(total_str) = rest.strip_prefix("FINISH:") {
             let total: usize = total_str.trim().parse().ok()?;
             if total == 0 || total > MAX_ROUTING_CHUNKS {
+                return None;
+            }
+            // После нового запроса данные до START не буферизуются: это может
+            // быть хвост старой доставки. Ждём START; watchdog по дедлайну
+            // повторит GETCONF, если START потерян.
+            if self.awaiting_start {
+                self.total_chunks = total;
+                self.chunks = vec![None; total];
+                self.received_count = 0;
+                self.finished = false;
+                if self.deadline.is_none() {
+                    self.deadline = Some(std::time::Instant::now() + Self::REASSEMBLY_TIMEOUT);
+                }
+                return None;
+            }
+            // `FINISH` уже собранной последовательности без нового `START` —
+            // хвост дублированной доставки: игнорируем, не трогая ни состояние,
+            // ни дедлайн.
+            if self.total_chunks == 0 && self.assembled_total == Some(total) {
                 return None;
             }
             if self.total_chunks != total {
@@ -248,6 +424,12 @@ impl RoutingReassembler {
             self.finished = true;
             if self.received_count == self.total_chunks && self.total_chunks > 0 {
                 return self.assemble();
+            }
+            // Чанков не хватает — это настоящая потеря: дедлайн обязан стоять
+            // (или быть взведён), иначе watchdog не увидит incomplete и не
+            // отправит повторный `GETCONF`.
+            if self.deadline.is_none() {
+                self.deadline = Some(std::time::Instant::now() + Self::REASSEMBLY_TIMEOUT);
             }
             return None;
         }
@@ -260,6 +442,25 @@ impl RoutingReassembler {
         if total == 0 || total > MAX_ROUTING_CHUNKS || seq == 0 || seq > total {
             return None;
         }
+        // После нового запроса данные до START не буферизуются (см. FINISH):
+        // хвост старой доставки не должен засеять новую сборку.
+        if self.awaiting_start {
+            self.total_chunks = total;
+            self.chunks = vec![None; total];
+            self.received_count = 0;
+            self.finished = false;
+            if self.deadline.is_none() {
+                self.deadline = Some(std::time::Instant::now() + Self::REASSEMBLY_TIMEOUT);
+            }
+            return None;
+        }
+        // Голые чанки уже собранной последовательности (тот же `total`, нового
+        // `START` не было) — те же опоздавшие копии второй доставки. Молча
+        // отбрасываем: сброс состояния и взведение дедлайна превращаются в
+        // ложный `routing_payload_incomplete` и убитый туннель.
+        if self.total_chunks == 0 && self.assembled_total == Some(total) {
+            return None;
+        }
         if self.total_chunks != total {
             self.total_chunks = total;
             self.chunks = vec![None; total];
@@ -270,13 +471,127 @@ impl RoutingReassembler {
             self.chunks[seq - 1] = Some(chunk_data.to_string());
             self.received_count += 1;
         }
+        // Таймаут — по затишью, а не по общему времени: 41+ чанк на медленном
+        // TURN-канале может идти дольше нескольких секунд, но пока чанки
+        // приходят, сборка продолжается. Сбрасываем дедлайн на каждом чанке.
+        // Дедлайн взводится только для активной последовательности.
+        self.deadline = Some(std::time::Instant::now() + Self::REASSEMBLY_TIMEOUT);
         if self.finished && self.received_count == self.total_chunks && self.total_chunks > 0 {
             return self.assemble();
         }
         None
     }
 
+    /// `ROUTING2`-доставка: nonce обязателен в каждом пакете. Чанк или FINISH с
+    /// чужим nonce не может попасть в текущую сборку — это и есть защита от
+    /// смешивания доставок при потерянном START.
+    fn feed_v2(&mut self, rest: &str) -> Option<String> {
+        if let Some(rest) = rest.strip_prefix("START:") {
+            let (nonce_text, total_text) = rest.split_once(':')?;
+            let nonce = parse_routing_nonce(nonce_text)?;
+            let total: usize = total_text.trim().parse().ok()?;
+            if total == 0 || total > MAX_ROUTING_CHUNKS {
+                return None;
+            }
+            // Повторный START той же доставки не должен стирать уже собранные
+            // чанки — только освежает дедлайн.
+            if self.active_nonce == Some(nonce) && self.total_chunks == total {
+                self.deadline = Some(std::time::Instant::now() + Self::REASSEMBLY_TIMEOUT);
+                return None;
+            }
+            self.active_nonce = Some(nonce);
+            self.total_chunks = total;
+            self.chunks = vec![None; total];
+            self.received_count = 0;
+            self.finished = false;
+            self.awaiting_start = false;
+            self.assembled_total = None;
+            self.deadline = Some(std::time::Instant::now() + Self::REASSEMBLY_TIMEOUT);
+            return None;
+        }
+        if let Some(rest) = rest.strip_prefix("FINISH:") {
+            let (nonce_text, total_text) = rest.split_once(':')?;
+            let nonce = parse_routing_nonce(nonce_text)?;
+            let total: usize = total_text.trim().parse().ok()?;
+            if total == 0 || total > MAX_ROUTING_CHUNKS {
+                return None;
+            }
+            if self.active_nonce != Some(nonce) {
+                self.reject_stale_v2(nonce, total);
+                return None;
+            }
+            if self.total_chunks != total {
+                self.total_chunks = total;
+                self.chunks = vec![None; total];
+                self.received_count = 0;
+            }
+            self.finished = true;
+            if self.received_count == self.total_chunks && total > 0 {
+                return self.assemble();
+            }
+            if self.deadline.is_none() {
+                self.deadline = Some(std::time::Instant::now() + Self::REASSEMBLY_TIMEOUT);
+            }
+            return None;
+        }
+        let mut parts = rest.splitn(4, ':');
+        let nonce = parse_routing_nonce(parts.next()?)?;
+        let seq: usize = parts.next()?.trim().parse().ok()?;
+        let total: usize = parts.next()?.trim().parse().ok()?;
+        let chunk_data = parts.next()?;
+        if total == 0 || total > MAX_ROUTING_CHUNKS || seq == 0 || seq > total {
+            return None;
+        }
+        if self.active_nonce != Some(nonce) {
+            self.reject_stale_v2(nonce, total);
+            return None;
+        }
+        if self.total_chunks != total {
+            self.total_chunks = total;
+            self.chunks = vec![None; total];
+            self.received_count = 0;
+            self.finished = false;
+        }
+        if self.chunks[seq - 1].is_none() {
+            self.chunks[seq - 1] = Some(chunk_data.to_string());
+            self.received_count += 1;
+        }
+        self.deadline = Some(std::time::Instant::now() + Self::REASSEMBLY_TIMEOUT);
+        if self.finished && self.received_count == self.total_chunks && self.total_chunks > 0 {
+            return self.assemble();
+        }
+        None
+    }
+
+    /// Чужой nonce: опоздавший хвост уже собранной доставки молча игнорируем;
+    /// при активной сборке не трогаем её; иначе это новая доставка с потерянным
+    /// START — ставим placeholder и дедлайн, чтобы watchdog повторил GETCONF.
+    fn reject_stale_v2(&mut self, nonce: u64, total: usize) {
+        if self.recent_assembled_nonces.contains(&nonce) {
+            return;
+        }
+        if self.active_nonce.is_some() && self.total_chunks > 0 {
+            return;
+        }
+        self.active_nonce = None;
+        self.total_chunks = total;
+        self.chunks = vec![None; total];
+        self.received_count = 0;
+        self.finished = false;
+        if self.deadline.is_none() {
+            self.deadline = Some(std::time::Instant::now() + Self::REASSEMBLY_TIMEOUT);
+        }
+    }
+
     fn assemble(&mut self) -> Option<String> {
+        self.deadline = None;
+        if let Some(nonce) = self.active_nonce.take() {
+            self.recent_assembled_nonces.push(nonce);
+            if self.recent_assembled_nonces.len() > 4 {
+                self.recent_assembled_nonces.remove(0);
+            }
+        }
+        let total = self.total_chunks;
         use base64::Engine;
         let mut b64_combined = String::new();
         for chunk in &self.chunks {
@@ -286,10 +601,18 @@ impl RoutingReassembler {
         self.received_count = 0;
         self.total_chunks = 0;
         self.finished = false;
+        self.awaiting_start = false;
+        // Последовательность закрыта: её опоздавшие копии (тот же `total` без
+        // нового `START`) больше не собираются.
+        self.assembled_total = Some(total);
 
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(b64_combined.trim())
-            .ok()?;
+        let decoded = match base64::engine::general_purpose::STANDARD.decode(b64_combined.trim()) {
+            Ok(decoded) => decoded,
+            Err(_) => {
+                self.corrupt = true;
+                return None;
+            }
+        };
         if decoded.len() >= 2 && decoded[0] == 0x1f && decoded[1] == 0x8b {
             use flate2::read::GzDecoder;
             use std::io::Read;
@@ -301,27 +624,42 @@ impl RoutingReassembler {
                 .read_to_end(&mut decompressed);
             if read.is_ok() {
                 if decompressed.len() > MAX_ROUTING_PAYLOAD_BYTES {
-                    report_routing_payload_too_large(decompressed.len());
+                    self.report_oversize(decompressed.len());
                     return None;
                 }
                 // A gzip header can never be valid UTF-8, so a bad inner stream is a hard reject.
-                return String::from_utf8(decompressed).ok();
+                return match String::from_utf8(decompressed) {
+                    Ok(text) => Some(text),
+                    Err(_) => {
+                        self.corrupt = true;
+                        None
+                    }
+                };
             }
-        }
-        if decoded.len() > MAX_ROUTING_PAYLOAD_BYTES {
-            report_routing_payload_too_large(decoded.len());
+            self.corrupt = true;
             return None;
         }
-        String::from_utf8(decoded).ok()
+        if decoded.len() > MAX_ROUTING_PAYLOAD_BYTES {
+            self.report_oversize(decoded.len());
+            return None;
+        }
+        match String::from_utf8(decoded) {
+            Ok(text) => Some(text),
+            Err(_) => {
+                self.corrupt = true;
+                None
+            }
+        }
     }
-}
 
-fn report_routing_payload_too_large(size: usize) {
-    crate::log_error!(
-        "[СЕССИЯ] Правило маршрутизации слишком велико (>{} байт, получено {}), событие отброшено",
-        MAX_ROUTING_PAYLOAD_BYTES,
-        size
-    );
+    fn report_oversize(&mut self, size: usize) {
+        crate::log_error!(
+            "[СЕССИЯ] Правило маршрутизации слишком велико (>{} байт, получено {}), событие отброшено",
+            MAX_ROUTING_PAYLOAD_BYTES,
+            size
+        );
+        self.oversize = Some(size);
+    }
 }
 
 struct ReaderRuntime {
@@ -331,9 +669,17 @@ struct ReaderRuntime {
     shutdown: Arc<ShutdownCoordinator>,
     config_tx: mpsc::Sender<String>,
     routing_reassembler: RoutingReassembler,
+    /// Эмитить ли события маршрутизации: только config-owner, иначе решение,
+    /// разосланное всем воркерам, применилось бы в приложении многократно.
+    emits_routing: bool,
     scale_notify: Option<Arc<tokio::sync::Notify>>,
     target_workers: Option<Arc<AtomicUsize>>,
     configured_workers: usize,
+    /// Канал в writer: повторный GETCONF, если `ROUTING` не собрался.
+    writer_tx: mpsc::Sender<WriterCommand>,
+    /// Конфиг сессии: GETCONF пересобирается перед каждой отправкой, чтобы
+    /// подхватить актуальный sha кеша доменов/приложений.
+    config: Arc<SessionConfig>,
 }
 
 pub struct ShutdownCoordinator {
@@ -1091,6 +1437,10 @@ async fn run_allocated_session(
     allocation: Arc<TurnAllocation>,
     _turn_path: Arc<str>,
 ) -> Result<bool> {
+    // CONFIG нужен reader-циклу, чтобы пересобирать GETCONF перед каждой
+    // отправкой: sha кеша доменов/приложений читается из живого файла и не
+    // должен «прибиваться» к моменту старта сессии.
+    let config = Arc::new(config);
     let session_cancel = CancellationToken::new();
     let turn_receiver = allocation.take_receiver()?;
     crate::log_error!(
@@ -1195,9 +1545,12 @@ async fn run_allocated_session(
             shutdown: runtime.shutdown.clone(),
             config_tx: runtime.config_tx.clone(),
             routing_reassembler,
+            emits_routing: config.get_config,
             scale_notify: runtime.scale_notify.clone(),
             target_workers: runtime.target_workers.clone(),
             configured_workers: runtime.configured_workers,
+            writer_tx: writer_command_tx.clone(),
+            config: config.clone(),
         },
         session_cancel.clone(),
     ));
@@ -1285,7 +1638,10 @@ async fn request_configuration(
     routing_reassembler: &mut RoutingReassembler,
     scale: WorkerScale<'_>,
 ) -> Result<bool> {
-    let request = build_registration_payload(config);
+    // Событие о маршрутизации эмитит только config-owner: сервер отдаёт решение
+    // каждому воркеру (owner выбирается на клиенте и не обязан быть первым),
+    // и без этого гейта приложение получало бы по событию с каждого воркера.
+    let emits_routing = config.get_config;
     'attempts: for (attempt, timeout_ms) in CONFIG_RESPONSE_TIMEOUT_MS.into_iter().enumerate() {
         if !config.srtp_mode.uses_dtls()
             && config.client_wrap_key != [0; 32]
@@ -1300,6 +1656,9 @@ async fn request_configuration(
                 install_cipher_pair(&writer.shared, pair);
             }
         }
+        // Пересобираем перед каждой попыткой: sha кеша доменов/приложений
+        // читается из файла и мог обновиться между попытками.
+        let request = build_registration_payload(config);
         writer
             .send_bytes_duplicate(request.as_ref(), true)
             .await
@@ -1318,9 +1677,50 @@ async fn request_configuration(
                         events.panel_restart();
                         continue;
                     }
-                    if packet.as_slice().starts_with(b"ROUTING:") {
+                    // Notice проверяется до `ROUTING:` и до разбора IP: это
+                    // бинарь вне семейства текстовых control-строк, и иначе он
+                    // упал бы в счётчик отброшенных не-IP пакетов.
+                    if is_routing_changed_notice(packet.as_slice()) {
+                        // Правило сменили, пока мы ещё ждём конфиг: просим
+                        // решение заново тем же дублированным запросом.
+                        // Дебаунс здесь не нужен — attempts ограничены
+                        // `CONFIG_RESPONSE_TIMEOUT_MS`, а notice приходит раз на
+                        // сохранение правила.
+                        if emits_routing {
+                            writer
+                                .send_bytes_duplicate(request.as_ref(), true)
+                                .await
+                                .context("повторный GETCONF после изменения правила")?;
+                        }
+                        continue;
+                    }
+                    if is_routing_delivery(packet.as_slice()) {
+                        if packet.as_slice() == crate::protocol::ROUTING_ABSENT {
+                            if emits_routing {
+                                events.routing_absent();
+                            }
+                            continue;
+                        }
                         if let Some(json) = routing_reassembler.feed(packet.as_slice()) {
-                            events.routing(&json);
+                            if emits_routing {
+                                events.routing(&json);
+                            }
+                        } else if let Some(size) = routing_reassembler.take_oversize_error()
+                            && emits_routing
+                        {
+                            events.error(
+                                "routing_payload_too_large",
+                                &format!(
+                                    "ROUTING: {size} байт, предел {MAX_ROUTING_PAYLOAD_BYTES}"
+                                ),
+                                true,
+                            );
+                        } else if routing_reassembler.take_corrupt_error() && emits_routing {
+                            events.error(
+                                "routing_payload_corrupt",
+                                "ROUTING: payload не декодируется (base64/gzip/UTF-8)",
+                                true,
+                            );
                         }
                         continue;
                     }
@@ -1448,6 +1848,14 @@ async fn handle_writer_command(
             let _ = completion.send(result);
             Ok(())
         }
+        WriterCommand::SendBytesDuplicated { data, completion } => {
+            // Тот же `send_bytes` внутри, только с `duplicate = true`, и та же
+            // передача результата постановщику: ошибка отправке не должна
+            // отличаться между ветками.
+            let result = transport.send_bytes_duplicate(&data, true).await;
+            let _ = completion.send(result);
+            Ok(())
+        }
     }
 }
 
@@ -1462,6 +1870,115 @@ async fn send_writer_bytes(sender: &mpsc::Sender<WriterCommand>, data: &[u8]) ->
     result.await.context("writer command response closed")?
 }
 
+/// Постановка `GETCONF` в writer-очередь двумя копиями — так же, как первый
+/// запрос отправляет `request_configuration` (`send_bytes_duplicate(.., true)`
+/// напрямую, минуя очередь команд).
+///
+/// Безопасно это именно сейчас по двум причинам, и обе надо перепроверить при
+/// изменении таймингов:
+///
+/// 1. Сервер подавляет повтор `GETCONF` той же сессии в окне
+///    `ROUTING_DUPLICATE_DELIVERY_WINDOW` = 1 с (`rust-server/protocol.rs`),
+///    поэтому вторая копия не приносит вторую последовательность `ROUTING`.
+///    Отсюда главное ограничение: интервал между повторами должен оставаться
+///    БОЛЬШЕ этого окна. Watchdog будит `reassembly_tick` раз в 500 мс, но
+///    повтор поставится только когда `take_incomplete()` сработал по
+///    `REASSEMBLY_TIMEOUT` (3 с) без новых чанков, то есть не чаще, чем раз в
+///    ~3 с. Если `REASSEMBLY_TIMEOUT` (или окно сервера) изменится так, что
+///    интервал повтора станет меньше окна, первая копия повтора начнёт
+///    подавляться как «дубль», легальная потеря чанка перестанет лечиться и
+///    `MAX_ROUTING_RETRIES` станет fatal — ровно тот дефект, из-за которого
+///    повтор раньше не дублировали.
+/// 2. Хвост уже собранной последовательности игнорирует рессемблер
+///    (`assembled_total` в `RoutingReassembler`), поэтому даже если обе копии
+///    как-то дойдут и дадут полную доставку, ложного `routing_payload_incomplete`
+///    не будет.
+async fn send_writer_bytes_duplicated(
+    sender: &mpsc::Sender<WriterCommand>,
+    data: &[u8],
+) -> Result<()> {
+    let (completion, result) = oneshot::channel();
+    sender
+        .try_send(WriterCommand::SendBytesDuplicated {
+            data: Bytes::copy_from_slice(data),
+            completion,
+        })
+        .context("writer command queue closed")?;
+    result.await.context("writer command response closed")?
+}
+
+/// Как часто живое подключение готово повторять `GETCONF` по push-сигналу
+/// «правило изменилось».
+///
+/// Панель умеет сохранять несколько раз подряд (автосохранение, пакетная
+/// правка, пересохранение того же правила), и каждое сохранение шлёт notice
+/// всем затронутым сессиям. Повтор на живом туннеле стоит дороже стартового:
+/// сервер отдаёт полный blob чанками, а приложение пересобирает маршрутизацию.
+/// Одна секунда — то же самое, что и окно подавления дубля на сервере, поэтому
+/// лишние запросы всё равно не превращаются в лишние доставки.
+const ROUTING_CHANGED_REFRESH_WINDOW: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// Отдать ли повторный `GETCONF` на очередной notice.
+///
+/// Чистая функция: `last` — момент последнего такого запроса (`None` — ещё не
+/// было), `now` — момент получения notice. Отдаём не чаще одного раза за
+/// `ROUTING_CHANGED_REFRESH_WINDOW`; сдвигать отметку обязан вызывающий, иначе
+/// дебаунс превратится в полный запрет повторов.
+fn routing_changed_refresh_due(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    match last {
+        None => true,
+        Some(moment) => now
+            .checked_duration_since(moment)
+            .is_none_or(|elapsed| elapsed >= ROUTING_CHANGED_REFRESH_WINDOW),
+    }
+}
+
+/// Дебаунс повторного `GETCONF` по push-сигналу с гарантированным «хвостом».
+///
+/// Первый notice окна уходит сразу (leading edge). Notice, пришедший внутри
+/// окна, подавляется, но оставляет `pending`: по истечении окна уходит один
+/// хвостовой запрос, забирающий последнее состояние правила. Без хвоста
+/// последнее сохранение серии короче окна потерялось бы навсегда — watchdog
+/// будит только несобранную доставку, периодического опроса нет.
+#[derive(Default)]
+struct RoutingRefreshDebounce {
+    last: Option<std::time::Instant>,
+    pending: bool,
+}
+
+impl RoutingRefreshDebounce {
+    /// Получен notice. `true` — GETCONF уходит прямо сейчас; иначе запрос
+    /// отложен до конца окна (`pending`).
+    fn notice(&mut self, now: std::time::Instant) -> bool {
+        if routing_changed_refresh_due(self.last, now) {
+            self.last = Some(now);
+            self.pending = false;
+            true
+        } else {
+            self.pending = true;
+            false
+        }
+    }
+
+    /// Пора ли отправить хвостовой GETCONF (проверка на периодическом тике).
+    fn trailing_due(&self, now: std::time::Instant) -> bool {
+        self.pending && routing_changed_refresh_due(self.last, now)
+    }
+
+    /// Зафиксировать успешную постановку запроса. При ошибке отправки вызывающий
+    /// НЕ зовёт это — `pending` остаётся, и хвост повторится на следующем тике.
+    fn sent(&mut self, now: std::time::Instant) {
+        self.pending = false;
+        self.last = Some(now);
+    }
+
+    /// Leading-запрос не поставился (очередь полна/закрыта) — оставить долг,
+    /// чтобы хвост повторил попытку, а не терял единственное изменение.
+    fn retry_later(&mut self) {
+        self.pending = true;
+    }
+}
+
 async fn reader_loop(
     mut transport: TransportReader,
     runtime: ReaderRuntime,
@@ -1474,19 +1991,146 @@ async fn reader_loop(
         shutdown,
         config_tx,
         mut routing_reassembler,
+        emits_routing,
         scale_notify,
         target_workers,
         configured_workers,
+        writer_tx,
+        config,
     } = runtime;
     let mut dropped_non_ip = 0u64;
+    let mut routing_retries = 0u32;
+    // Серия сохранений правила не должна вылиться в серию полных доставок, но
+    // последнее сохранение серии обязано забраться (см. RoutingRefreshDebounce).
+    let mut routing_refresh = RoutingRefreshDebounce::default();
+    const MAX_ROUTING_RETRIES: u32 = 2;
+    let mut reassembly_tick = tokio::time::interval(std::time::Duration::from_millis(500));
+    reassembly_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         let packet = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Ok(()),
+            _ = reassembly_tick.tick() => {
+                if let Some(incomplete) = routing_reassembler.take_incomplete()
+                    && emits_routing
+                {
+                    // Снимок TURN-приёмника на момент срыва. При нехватке пакета
+                    // в пуле и при переполнении входящей SPSC-очереди драйвер
+                    // молча роняет ChannelData (`process_deficit_packet`,
+                    // `TrySendError::Full` в turn.rs) — такой пакет не доходит до
+                    // рессемблера и не виден ни в одном другом месте. Числа
+                    // накопительные за жизнь аллокации, не за доставку.
+                    let pool_drops = transport.receiver.ingress_pool_deficit_drops();
+                    let queue_drops = transport.receiver.ingress_queue_full_drops();
+                    if routing_retries < MAX_ROUTING_RETRIES {
+                        routing_retries += 1;
+                        // Цифры решают, что именно лечить: 0 из N — не доходит
+                        // поток пакетов целиком, N-несколько из N — теряются
+                        // отдельные датаграммы. Но drops — накопительные за всё
+                        // соединение, и через то же кольцо идёт media-трафик:
+                        // сравнивать надо ПРИРОСТ между срабатываниями watchdog,
+                        // а не абсолютное значение.
+                        crate::log_error!(
+                            "[КЛИЕНТ] ROUTING не собран (получено {} из {}, finish={}, pool_drops={}, queue_drops={}), повторный GETCONF #{}",
+                            incomplete.received,
+                            incomplete.total,
+                            incomplete.finish_seen,
+                            pool_drops,
+                            queue_drops,
+                            routing_retries
+                        );
+                        // Повтор уходит ДВУМЯ копиями, как первый GETCONF: одна
+                        // потерянная датаграмма не должна съедать единственный
+                        // retry из бюджета MAX_ROUTING_RETRIES. Раньше это было
+                        // нельзя — дубль удваивал бы доставку ROUTING и сам
+                        // провоцировал ложный routing_payload_incomplete; теперь
+                        // безопасно (окно сервера 1 с + игнор хвоста рессемблером),
+                        // см. `send_writer_bytes_duplicated`.
+                        let routing_request = build_registration_payload(&config);
+                        if send_writer_bytes_duplicated(&writer_tx, &routing_request)
+                            .await
+                            .is_err()
+                        {
+                            events.error(
+                                "routing_payload_incomplete",
+                                &format!(
+                                    "ROUTING: не все чанки получены ({} из {}, finish={}, pool_drops={}, queue_drops={}), повторный GETCONF не отправлен",
+                                    incomplete.received,
+                                    incomplete.total,
+                                    incomplete.finish_seen,
+                                    pool_drops,
+                                    queue_drops
+                                ),
+                                true,
+                            );
+                        }
+                    } else {
+                        events.error(
+                            "routing_payload_incomplete",
+                            &format!(
+                                "ROUTING: не все чанки получены после повторов ({} из {}, finish={}, pool_drops={}, queue_drops={}), правило отброшено",
+                                incomplete.received,
+                                incomplete.total,
+                                incomplete.finish_seen,
+                                pool_drops,
+                                queue_drops
+                            ),
+                            true,
+                        );
+                    }
+                }
+                // Хвост подавленного notice: окно истекло — забираем последнее
+                // состояние. При ошибке постановки флаг не сбрасываем, повтор
+                // уйдёт на следующем тике (сессия с закрытой очередью всё равно
+                // вскоре завершится).
+                if emits_routing && routing_refresh.trailing_due(std::time::Instant::now()) {
+                    crate::log_error!("[СЕССИЯ] правило изменилось на сервере, отложенный GETCONF");
+                    // Новая доставка обязана собраться с нуля: хвост старой с тем
+                    // же числом чанков иначе выглядел бы как её продолжение.
+                    routing_reassembler.reset_for_new_delivery();
+                    let routing_request = build_registration_payload(&config);
+                    if send_writer_bytes_duplicated(&writer_tx, &routing_request)
+                        .await
+                        .is_ok()
+                    {
+                        routing_refresh.sent(std::time::Instant::now());
+                    }
+                }
+                continue;
+            }
             result = transport.recv() => result?,
         };
         if is_panel_restart_notice(packet.as_slice()) {
             events.panel_restart();
+            continue;
+        }
+        // Push «правило изменилось» на живом туннеле. Проверка стоит до
+        // `ROUTING:` и до разбора IP: бинар не принадлежит текстовым
+        // control-строкам, и без этой ветки он попадал бы в
+        // `dropped_non_ip`.
+        if is_routing_changed_notice(packet.as_slice()) {
+            // Повтор запрашивает только config-owner: воркеры не применяют
+            // правило и не эмитят событие, а полный blob на каждого воркера —
+            // это та самая лавина приоритетных пакетов.
+            let now = std::time::Instant::now();
+            if emits_routing && routing_refresh.notice(now) {
+                crate::log_error!("[СЕССИЯ] правило изменилось на сервере, повторный GETCONF");
+                // Новая доставка не должна смешаться с недостроенной старой —
+                // см. `reset_for_new_delivery`.
+                routing_reassembler.reset_for_new_delivery();
+                let routing_request = build_registration_payload(&config);
+                if let Err(error) = send_writer_bytes_duplicated(&writer_tx, &routing_request).await
+                {
+                    // Ошибка постановки не фатальна, но и изменение терять нельзя:
+                    // оставляем долг — хвост повторит GETCONF, как для подавленного
+                    // notice. Закрытая очередь умирающей сессии всё равно скоро
+                    // завершит цикл.
+                    routing_refresh.retry_later();
+                    crate::log_error!(
+                        "[СЕССИЯ] повторный GETCONF после изменения правила не поставлен: {error:#}"
+                    );
+                }
+            }
             continue;
         }
         if let Some(command) = parse_stream_repair(packet.as_slice()) {
@@ -1525,9 +2169,33 @@ async fn reader_loop(
             }
             continue;
         }
-        if packet.as_slice().starts_with(b"ROUTING:") {
+        if is_routing_delivery(packet.as_slice()) {
+            if packet.as_slice() == crate::protocol::ROUTING_ABSENT {
+                if emits_routing {
+                    events.routing_absent();
+                    routing_retries = 0;
+                }
+                continue;
+            }
             if let Some(json) = routing_reassembler.feed(packet.as_slice()) {
-                events.routing(&json);
+                if emits_routing {
+                    events.routing(&json);
+                    routing_retries = 0;
+                }
+            } else if let Some(size) = routing_reassembler.take_oversize_error()
+                && emits_routing
+            {
+                events.error(
+                    "routing_payload_too_large",
+                    &format!("ROUTING: {size} байт, предел {MAX_ROUTING_PAYLOAD_BYTES}"),
+                    true,
+                );
+            } else if routing_reassembler.take_corrupt_error() && emits_routing {
+                events.error(
+                    "routing_payload_corrupt",
+                    "ROUTING: payload не декодируется (base64/gzip/UTF-8)",
+                    true,
+                );
             }
             continue;
         }
@@ -1661,10 +2329,74 @@ mod tests {
             server_stream_repair: Arc::new(AtomicBool::new(false)),
             repair: RepairState::new(18),
             configured_workers: 18,
+            routing_ips_sha: None,
+            routing_content_sha_file: None,
         };
         assert_eq!(
             select_turn_address(&addresses, &config).unwrap(),
             "turn:relay.example:3478?transport=tcp"
+        );
+    }
+
+    /// GETCONF пересобирается перед отправкой и читает живой файл: запись
+    /// нового sha в середине сессии обязана попасть в следующий запрос.
+    #[test]
+    fn registration_payload_reads_the_live_content_sha_file() {
+        let path = std::env::temp_dir().join(format!(
+            "csqtt-live-content-sha-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or_default()
+        ));
+        let first = "a".repeat(64);
+        let second = "b".repeat(64);
+        std::fs::write(&path, &first).expect("write first sha");
+        let config = SessionConfig {
+            id: 1,
+            peer: "127.0.0.1:46000".parse().unwrap(),
+            turn_host: None,
+            turn_port: None,
+            turn_transport: TurnTransportMode::Udp,
+            srtp_mode: SrtpMode::Auto,
+            local_port: Arc::from("9000"),
+            password: Arc::from("pass1234"),
+            generation: 7,
+            turn_endpoint_cursor: 0,
+            salt: Arc::from("generation-id"),
+            mode: ObfsMode::Audio,
+            wrap_key: [0; 32],
+            client_wrap_key: [0; 32],
+            get_config: true,
+            server_stream_repair: Arc::new(AtomicBool::new(false)),
+            repair: RepairState::new(18),
+            configured_workers: 18,
+            routing_ips_sha: None,
+            routing_content_sha_file: Some(path.clone()),
+        };
+
+        let payload = build_registration_payload(&config);
+        let text = std::str::from_utf8(&payload).expect("GETCONF is utf8");
+        assert!(
+            text.ends_with(&format!("|owner||{first}|routing2")),
+            "{text}"
+        );
+
+        std::fs::write(&path, &second).expect("rewrite sha");
+        let payload = build_registration_payload(&config);
+        let text = std::str::from_utf8(&payload).expect("GETCONF is utf8");
+        assert!(
+            text.ends_with(&format!("|owner||{second}|routing2")),
+            "{text}"
+        );
+
+        std::fs::remove_file(&path).expect("remove sha");
+        let payload = build_registration_payload(&config);
+        let text = std::str::from_utf8(&payload).expect("GETCONF is utf8");
+        assert!(
+            text.ends_with("|owner|||routing2"),
+            "без файла оба поля пустые, метка остаётся: {text}"
         );
     }
 
@@ -1689,10 +2421,12 @@ mod tests {
             server_stream_repair: Arc::new(AtomicBool::new(false)),
             repair: RepairState::new(9),
             configured_workers: 18,
+            routing_ips_sha: None,
+            routing_content_sha_file: None,
         };
         assert_eq!(
             build_registration_payload(&config).as_ref(),
-            b"GETCONF:9000|pass1234|7|generation-id|1|18"
+            b"GETCONF:9000|pass1234|7|generation-id|1|18|owner|||routing2"
         );
     }
 
@@ -1716,6 +2450,10 @@ mod tests {
             Some(WriterCommand::SendBytes { data, completion }) => {
                 assert_eq!(data.as_ref(), b"DISCONNECT:device|salt");
                 completion
+            }
+            // `DISCONNECT` — не `GETCONF`: дублировать его нельзя.
+            Some(WriterCommand::SendBytesDuplicated { .. }) => {
+                panic!("shutdown поставил дублированную команду")
             }
             None => panic!("shutdown did not select the active control stream"),
         };
@@ -1749,6 +2487,10 @@ mod tests {
             .unwrap_or(None);
         let completion = match command {
             Some(WriterCommand::SendBytes { completion, .. }) => completion,
+            // `DISCONNECT` — не `GETCONF`: дублировать его нельзя.
+            Some(WriterCommand::SendBytesDuplicated { .. }) => {
+                panic!("shutdown поставил дублированную команду")
+            }
             None => panic!("shutdown did not select a live control stream"),
         };
         assert!(completion.send(Ok(())).is_ok());
@@ -2386,11 +3128,716 @@ mod tests {
     }
 
     #[test]
+    fn test_routing_reassembler_ignores_absent_marker() {
+        let mut reassembler = RoutingReassembler::new();
+        assert_eq!(reassembler.feed(crate::protocol::ROUTING_ABSENT), None);
+    }
+
+    #[test]
     fn test_routing_reassembler_corrupted_payload() {
         let mut reassembler = RoutingReassembler::new();
         assert_eq!(reassembler.feed(b"ROUTING:START:1"), None);
         assert_eq!(reassembler.feed(b"ROUTING:1:1:not-valid-base64-!!!"), None);
         assert_eq!(reassembler.feed(b"ROUTING:FINISH:1"), None);
+        assert!(reassembler.take_corrupt_error());
+        assert!(!reassembler.take_corrupt_error());
+    }
+
+    #[test]
+    fn test_routing_reassembler_incomplete_times_out() {
+        let mut reassembler = RoutingReassembler::new();
+        assert_eq!(reassembler.feed(b"ROUTING:START:2"), None);
+        assert_eq!(reassembler.feed(b"ROUTING:1:2:AAAA"), None);
+        let start = std::time::Instant::now();
+        assert!(reassembler.take_incomplete_at(start).is_none());
+        // Срыв обязан назвать цифры: сколько дошло, сколько ждали, был ли FINISH.
+        assert_eq!(
+            reassembler.take_incomplete_at(
+                start
+                    + RoutingReassembler::REASSEMBLY_TIMEOUT
+                    + std::time::Duration::from_millis(1)
+            ),
+            Some(IncompleteRouting {
+                received: 1,
+                total: 2,
+                finish_seen: false,
+            })
+        );
+        // Состояние сброшено — повторного срыва на тех же счётчиках нет.
+        assert!(
+            reassembler
+                .take_incomplete_at(
+                    start
+                        + RoutingReassembler::REASSEMBLY_TIMEOUT
+                        + std::time::Duration::from_millis(2)
+                )
+                .is_none()
+        );
+    }
+
+    /// Разбить `payload` на `parts` чанков ровно в той форме, что шлёт сервер:
+    /// `ROUTING:<seq>:<total>:<кусок base64>`.
+    fn routing_delivery_chunks(payload: &str, parts: usize) -> Vec<String> {
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(payload);
+        let bytes = encoded.as_bytes();
+        (0..parts)
+            .map(|index| {
+                let start = bytes.len() * index / parts;
+                let end = bytes.len() * (index + 1) / parts;
+                String::from_utf8_lossy(&bytes[start..end]).into_owned()
+            })
+            .collect()
+    }
+
+    /// Прогнать полную доставку `ROUTING` и вернуть собранное правило.
+    fn feed_full_delivery(
+        reassembler: &mut RoutingReassembler,
+        chunks: &[String],
+    ) -> Option<String> {
+        assert_eq!(
+            reassembler.feed(format!("ROUTING:START:{}", chunks.len()).as_bytes()),
+            None
+        );
+        for (index, chunk) in chunks.iter().enumerate() {
+            let line = format!("ROUTING:{}:{}:{}", index + 1, chunks.len(), chunk);
+            assert_eq!(reassembler.feed(line.as_bytes()), None);
+        }
+        reassembler.feed(format!("ROUTING:FINISH:{}", chunks.len()).as_bytes())
+    }
+
+    /// Точное репро дефекта доставки: дубль `GETCONF` дал две последовательности
+    /// `ROUTING`, у второй потерялся `START`, и её хвост приехал уже после
+    /// успешной сборки. Голые чанки и `FINISH` собранной последовательности
+    /// обязаны быть игнорированы — иначе watchdog выдумывает потерю чанка и
+    /// через `REASSEMBLY_TIMEOUT` роняет туннель ложным fatal.
+    #[test]
+    fn test_routing_reassembler_ignores_tail_of_an_assembled_sequence() {
+        let payload = r#"{"mode":"whitelist","domains":["test.com"],"ips":["1.2.3.4"]}"#;
+        let chunks = routing_delivery_chunks(payload, 4);
+        let mut reassembler = RoutingReassembler::new();
+
+        assert_eq!(
+            feed_full_delivery(&mut reassembler, &chunks),
+            Some(payload.to_owned())
+        );
+
+        assert_eq!(
+            reassembler.feed(format!("ROUTING:2:4:{}", chunks[1]).as_bytes()),
+            None
+        );
+        assert_eq!(reassembler.feed(b"ROUTING:FINISH:4"), None);
+
+        let now = std::time::Instant::now();
+        assert!(
+            reassembler
+                .take_incomplete_at(
+                    now + RoutingReassembler::REASSEMBLY_TIMEOUT
+                        + std::time::Duration::from_millis(1)
+                )
+                .is_none(),
+            "хвост второй доставки не имеет права считаться потерянным правилом"
+        );
+    }
+
+    /// MINOR-2: после `reset_for_new_delivery` данные до `START` игнорируются,
+    /// а дедлайн взводится — watchdog повторит `GETCONF`, а не соберёт смесь
+    /// старой и новой доставок.
+    #[test]
+    fn test_reset_for_new_delivery_ignores_a_startless_tail() {
+        let payload = r#"{"mode":"blacklist","domains":["old.com"]}"#;
+        let chunks = routing_delivery_chunks(payload, 4);
+        let mut reassembler = RoutingReassembler::new();
+        assert_eq!(
+            feed_full_delivery(&mut reassembler, &chunks),
+            Some(payload.to_owned())
+        );
+
+        reassembler.reset_for_new_delivery();
+        assert_eq!(
+            reassembler.feed(format!("ROUTING:2:4:{}", chunks[1]).as_bytes()),
+            None
+        );
+        assert_eq!(reassembler.feed(b"ROUTING:FINISH:4"), None);
+
+        let now = std::time::Instant::now();
+        let incomplete = reassembler
+            .take_incomplete_at(
+                now + RoutingReassembler::REASSEMBLY_TIMEOUT + std::time::Duration::from_millis(1),
+            )
+            .expect("потерянный START обязан взводить дедлайн, а не игнорироваться");
+        assert_eq!(incomplete.total, 4);
+        assert_eq!(incomplete.received, 0, "хвостовые данные не засчитываются");
+    }
+
+    /// После явного нового запроса чанк-«сирота» старой доставки не должен
+    /// засеять ячейку новой: `START` очищает всё, что пришло до него. При этом
+    /// штатное переупорядочивание без нового запроса сохраняет чанки (см.
+    /// `test_routing_reassembler_out_of_order_and_gzip`).
+    #[test]
+    fn test_new_request_discards_a_straggler_before_start() {
+        let old = r#"{"mode":"blacklist","domains":["old.com"]}"#;
+        let new = r#"{"mode":"blacklist","domains":["new.com"]}"#;
+        let old_chunks = routing_delivery_chunks(old, 4);
+        let new_chunks = routing_delivery_chunks(new, 4);
+        assert_eq!(old_chunks.len(), new_chunks.len());
+
+        let mut reassembler = RoutingReassembler::new();
+        assert_eq!(
+            feed_full_delivery(&mut reassembler, &old_chunks),
+            Some(old.to_owned())
+        );
+
+        reassembler.reset_for_new_delivery();
+        // Хвост старой доставки приходит до START новой.
+        assert_eq!(
+            reassembler.feed(format!("ROUTING:1:4:{}", old_chunks[0]).as_bytes()),
+            None
+        );
+        assert_eq!(reassembler.feed(b"ROUTING:START:4"), None);
+        assert_eq!(
+            feed_full_delivery(&mut reassembler, &new_chunks),
+            Some(new.to_owned()),
+            "старый чанк не имеет права попасть в новую сборку"
+        );
+    }
+
+    /// Если после нового запроса потерялся ещё и START, доставка не собирается
+    /// из хвоста: данные до START игнорируются, watchdog повторяет GETCONF.
+    #[test]
+    fn test_new_request_without_start_is_not_assembled_from_a_tail() {
+        let old = r#"{"mode":"blacklist","domains":["old.com"]}"#;
+        let new = r#"{"mode":"blacklist","domains":["new.com"]}"#;
+        let old_chunks = routing_delivery_chunks(old, 4);
+        let new_chunks = routing_delivery_chunks(new, 4);
+        let mut reassembler = RoutingReassembler::new();
+        assert_eq!(
+            feed_full_delivery(&mut reassembler, &old_chunks),
+            Some(old.to_owned())
+        );
+
+        reassembler.reset_for_new_delivery();
+        for (index, chunk) in new_chunks.iter().enumerate() {
+            assert_eq!(
+                reassembler.feed(format!("ROUTING:{}:4:{chunk}", index + 1).as_bytes()),
+                None
+            );
+        }
+        assert_eq!(reassembler.feed(b"ROUTING:FINISH:4"), None);
+
+        let now = std::time::Instant::now();
+        let incomplete = reassembler
+            .take_incomplete_at(
+                now + RoutingReassembler::REASSEMBLY_TIMEOUT + std::time::Duration::from_millis(1),
+            )
+            .expect("потерянный START обязан взвести дедлайн");
+        assert_eq!(incomplete.received, 0, "ни один хвостовой чанк не засчитан");
+        assert_eq!(incomplete.total, 4);
+    }
+
+    fn feed_routing2_delivery(
+        reassembler: &mut RoutingReassembler,
+        nonce: &str,
+        chunks: &[String],
+    ) -> Option<String> {
+        assert_eq!(
+            reassembler.feed(format!("ROUTING2:START:{nonce}:{}", chunks.len()).as_bytes()),
+            None
+        );
+        for (index, chunk) in chunks.iter().enumerate() {
+            assert_eq!(
+                reassembler.feed(
+                    format!("ROUTING2:{nonce}:{}:{}:{chunk}", index + 1, chunks.len()).as_bytes()
+                ),
+                None
+            );
+        }
+        reassembler.feed(format!("ROUTING2:FINISH:{nonce}:{}", chunks.len()).as_bytes())
+    }
+
+    /// ROUTING2 собирается по nonce; чужие чанки не попадают в сборку.
+    #[test]
+    fn test_routing2_assembles_only_chunks_of_the_active_nonce() {
+        let payload = r#"{"mode":"blacklist","domains":["a.example"]}"#;
+        let chunks = routing_delivery_chunks(payload, 4);
+        let nonce_a = "0000000000000001";
+        let nonce_b = "0000000000000002";
+        let mut reassembler = RoutingReassembler::new();
+
+        assert_eq!(
+            reassembler.feed(format!("ROUTING2:START:{nonce_a}:4").as_bytes()),
+            None
+        );
+        assert_eq!(
+            reassembler.feed(format!("ROUTING2:{nonce_a}:1:4:{}", chunks[0]).as_bytes()),
+            None
+        );
+        // Чужая доставка B приходит целиком, пока активна A.
+        for (index, chunk) in chunks.iter().enumerate() {
+            assert_eq!(
+                reassembler.feed(format!("ROUTING2:{nonce_b}:{}:4:{chunk}", index + 1).as_bytes()),
+                None
+            );
+        }
+        assert_eq!(
+            reassembler.feed(format!("ROUTING2:FINISH:{nonce_b}:4").as_bytes()),
+            None
+        );
+        for (index, chunk) in chunks.iter().enumerate().skip(1) {
+            assert_eq!(
+                reassembler.feed(format!("ROUTING2:{nonce_a}:{}:4:{chunk}", index + 1).as_bytes()),
+                None
+            );
+        }
+        assert_eq!(
+            reassembler.feed(format!("ROUTING2:FINISH:{nonce_a}:4").as_bytes()),
+            Some(payload.to_owned()),
+            "в сборку попали только чанки nonce A"
+        );
+    }
+
+    /// Потерянный START у ROUTING2: данные не буферизуются, watchdog повторит.
+    #[test]
+    fn test_routing2_lost_start_arms_the_deadline() {
+        let payload = r#"{"mode":"blacklist","domains":["b.example"]}"#;
+        let chunks = routing_delivery_chunks(payload, 4);
+        let nonce = "0000000000000003";
+        let mut reassembler = RoutingReassembler::new();
+        for (index, chunk) in chunks.iter().enumerate() {
+            assert_eq!(
+                reassembler.feed(format!("ROUTING2:{nonce}:{}:4:{chunk}", index + 1).as_bytes()),
+                None
+            );
+        }
+        assert_eq!(
+            reassembler.feed(format!("ROUTING2:FINISH:{nonce}:4").as_bytes()),
+            None
+        );
+
+        let now = std::time::Instant::now();
+        let incomplete = reassembler
+            .take_incomplete_at(
+                now + RoutingReassembler::REASSEMBLY_TIMEOUT + std::time::Duration::from_millis(1),
+            )
+            .expect("потерянный START обязан взвести дедлайн");
+        assert_eq!(incomplete.received, 0);
+        assert_eq!(incomplete.total, 4);
+
+        // Повторная доставка приходит с новым nonce и собирается.
+        assert_eq!(
+            feed_routing2_delivery(&mut reassembler, "0000000000000009", &chunks),
+            Some(payload.to_owned())
+        );
+    }
+
+    /// Повторный START той же доставки не стирает уже принятые чанки.
+    #[test]
+    fn test_routing2_duplicate_start_keeps_chunks() {
+        let payload = r#"{"mode":"blacklist","domains":["d.example"]}"#;
+        let chunks = routing_delivery_chunks(payload, 4);
+        let nonce = "0000000000000005";
+        let mut reassembler = RoutingReassembler::new();
+        assert_eq!(
+            reassembler.feed(format!("ROUTING2:START:{nonce}:4").as_bytes()),
+            None
+        );
+        assert_eq!(
+            reassembler.feed(format!("ROUTING2:{nonce}:1:4:{}", chunks[0]).as_bytes()),
+            None
+        );
+        assert_eq!(
+            reassembler.feed(format!("ROUTING2:START:{nonce}:4").as_bytes()),
+            None
+        );
+        for (index, chunk) in chunks.iter().enumerate().skip(1) {
+            assert_eq!(
+                reassembler.feed(format!("ROUTING2:{nonce}:{}:4:{chunk}", index + 1).as_bytes()),
+                None
+            );
+        }
+        assert_eq!(
+            reassembler.feed(format!("ROUTING2:FINISH:{nonce}:4").as_bytes()),
+            Some(payload.to_owned())
+        );
+    }
+
+    /// Хвост не только последней, но и более ранней собранной доставки
+    /// игнорируется — не превращается в ложный дедлайн.
+    #[test]
+    fn test_routing2_ignores_tail_of_an_older_assembled_delivery() {
+        let payload_a = r#"{"mode":"blacklist","domains":["e.example"]}"#;
+        let payload_b = r#"{"mode":"blacklist","domains":["f.example"]}"#;
+        let chunks_a = routing_delivery_chunks(payload_a, 4);
+        let chunks_b = routing_delivery_chunks(payload_b, 4);
+        let nonce_a = "0000000000000006";
+        let nonce_b = "0000000000000007";
+        let mut reassembler = RoutingReassembler::new();
+        assert_eq!(
+            feed_routing2_delivery(&mut reassembler, nonce_a, &chunks_a),
+            Some(payload_a.to_owned())
+        );
+        assert_eq!(
+            feed_routing2_delivery(&mut reassembler, nonce_b, &chunks_b),
+            Some(payload_b.to_owned())
+        );
+
+        assert_eq!(
+            reassembler.feed(format!("ROUTING2:{nonce_a}:1:4:{}", chunks_a[0]).as_bytes()),
+            None
+        );
+        assert_eq!(
+            reassembler.feed(format!("ROUTING2:FINISH:{nonce_a}:4").as_bytes()),
+            None
+        );
+        let now = std::time::Instant::now();
+        assert!(
+            reassembler
+                .take_incomplete_at(
+                    now + RoutingReassembler::REASSEMBLY_TIMEOUT
+                        + std::time::Duration::from_millis(1)
+                )
+                .is_none(),
+            "хвост более ранней собранной доставки не считается потерей"
+        );
+    }
+
+    /// FINISH с другим total — порча доставки: не собираем, ждём retry.
+    #[test]
+    fn test_routing2_finish_with_mismatched_total_is_not_assembled() {
+        let payload = r#"{"mode":"blacklist","domains":["g.example"]}"#;
+        let chunks = routing_delivery_chunks(payload, 4);
+        let nonce = "0000000000000008";
+        let mut reassembler = RoutingReassembler::new();
+        assert_eq!(
+            reassembler.feed(format!("ROUTING2:START:{nonce}:4").as_bytes()),
+            None
+        );
+        for (index, chunk) in chunks.iter().enumerate() {
+            assert_eq!(
+                reassembler.feed(format!("ROUTING2:{nonce}:{}:4:{chunk}", index + 1).as_bytes()),
+                None
+            );
+        }
+        assert_eq!(
+            reassembler.feed(format!("ROUTING2:FINISH:{nonce}:5").as_bytes()),
+            None
+        );
+        let now = std::time::Instant::now();
+        let incomplete = reassembler
+            .take_incomplete_at(
+                now + RoutingReassembler::REASSEMBLY_TIMEOUT + std::time::Duration::from_millis(1),
+            )
+            .expect("несогласованный FINISH обязан взвести дедлайн");
+        assert_eq!(incomplete.total, 5);
+        assert!(incomplete.finish_seen);
+    }
+
+    /// Опоздавший хвост уже собранной ROUTING2 молча игнорируется.
+    #[test]
+    fn test_routing2_ignores_the_tail_of_an_assembled_delivery() {
+        let payload = r#"{"mode":"blacklist","domains":["c.example"]}"#;
+        let chunks = routing_delivery_chunks(payload, 4);
+        let nonce = "0000000000000004";
+        let mut reassembler = RoutingReassembler::new();
+        assert_eq!(
+            feed_routing2_delivery(&mut reassembler, nonce, &chunks),
+            Some(payload.to_owned())
+        );
+        assert_eq!(
+            reassembler.feed(format!("ROUTING2:{nonce}:1:4:{}", chunks[0]).as_bytes()),
+            None
+        );
+        assert_eq!(
+            reassembler.feed(format!("ROUTING2:FINISH:{nonce}:4").as_bytes()),
+            None
+        );
+        let now = std::time::Instant::now();
+        assert!(
+            reassembler
+                .take_incomplete_at(
+                    now + RoutingReassembler::REASSEMBLY_TIMEOUT
+                        + std::time::Duration::from_millis(1)
+                )
+                .is_none(),
+            "хвост собранной доставки не считается потерей"
+        );
+    }
+
+    /// Две полные доставки подряд — это штатный исход дублированного
+    /// `GETCONF`: обе собираются, между ними нет incomplete.
+    #[test]
+    fn test_routing_reassembler_assembles_two_back_to_back_deliveries() {
+        let payload = r#"{"mode":"blacklist","domains":["old.com"]}"#;
+        let chunks = routing_delivery_chunks(payload, 4);
+        let mut reassembler = RoutingReassembler::new();
+
+        for _ in 0..2 {
+            assert_eq!(
+                feed_full_delivery(&mut reassembler, &chunks),
+                Some(payload.to_owned())
+            );
+        }
+
+        let now = std::time::Instant::now();
+        assert!(
+            reassembler
+                .take_incomplete_at(
+                    now + RoutingReassembler::REASSEMBLY_TIMEOUT
+                        + std::time::Duration::from_millis(1)
+                )
+                .is_none(),
+            "после двух собранных доставок нечего считать неполным"
+        );
+    }
+
+    /// Подавление хвоста не должно прятать настоящую потерю: `FINISH` без
+    /// достаточного числа чанков обязан оставить дедлайн взведённым, чтобы
+    /// watchdog отправил повторный `GETCONF`.
+    #[test]
+    fn test_routing_reassembler_finish_with_missing_chunks_arms_the_deadline() {
+        let mut reassembler = RoutingReassembler::new();
+        assert_eq!(reassembler.feed(b"ROUTING:FINISH:4"), None);
+
+        let now = std::time::Instant::now();
+        assert!(reassembler.take_incomplete_at(now).is_none());
+        // Это и есть профиль «не дошло ничего»: FINISH есть, чанков нет.
+        assert_eq!(
+            reassembler.take_incomplete_at(
+                now + RoutingReassembler::REASSEMBLY_TIMEOUT + std::time::Duration::from_millis(1)
+            ),
+            Some(IncompleteRouting {
+                received: 0,
+                total: 4,
+                finish_seen: true,
+            })
+        );
+    }
+
+    /// Диагностические счётчики считают УНИКАЛЬНЫЕ чанки. Копия `seq` приходит
+    /// не только от дублирования на сервере (сейчас его нет): повтор `GETCONF`
+    /// после окна подавления даёт вторую полную последовательность, а старый
+    /// билд сервера до сих пор шлёт каждый чанк дважды. Если бы копия попадала в
+    /// `received`, диагностика выдавала бы «получено 92 из 46» вместо ответа на
+    /// вопрос, сколько реально не дошло.
+    #[test]
+    fn incomplete_counters_count_unique_chunks_not_arrived_lines() {
+        let mut reassembler = RoutingReassembler::new();
+        assert_eq!(reassembler.feed(b"ROUTING:START:3"), None);
+        for seq in [1, 1, 2, 2] {
+            assert_eq!(
+                reassembler.feed(format!("ROUTING:{seq}:3:AAAA").as_bytes()),
+                None
+            );
+        }
+        assert_eq!(reassembler.feed(b"ROUTING:FINISH:3"), None);
+
+        let now = std::time::Instant::now();
+        assert_eq!(
+            reassembler.take_incomplete_at(
+                now + RoutingReassembler::REASSEMBLY_TIMEOUT + std::time::Duration::from_millis(1)
+            ),
+            Some(IncompleteRouting {
+                received: 2,
+                total: 3,
+                finish_seen: true,
+            }),
+            "копии чанка не имеют права удваивать received"
+        );
+    }
+
+    /// Дебаунс push-сигнала «правило изменилось»: панель может сохранять
+    /// несколько раз подряд, и каждое сохранение шлёт notice. Без окна это
+    /// превратилось бы в серию полных доставок правила на живом туннеле.
+    #[test]
+    fn routing_changed_refresh_is_debounced_to_one_request_per_window() {
+        let base = std::time::Instant::now();
+        assert!(
+            routing_changed_refresh_due(None, base),
+            "первый notice обязан порождать запрос"
+        );
+        assert!(
+            !routing_changed_refresh_due(Some(base), base),
+            "повтор в тот же момент подавляется"
+        );
+        assert!(!routing_changed_refresh_due(
+            Some(base),
+            base + Duration::from_millis(999)
+        ));
+        assert!(routing_changed_refresh_due(
+            Some(base),
+            base + ROUTING_CHANGED_REFRESH_WINDOW
+        ));
+        assert!(routing_changed_refresh_due(
+            Some(base),
+            base + ROUTING_CHANGED_REFRESH_WINDOW * 4
+        ));
+        // Часы mono-time не должны паниковать, если «now» оказался раньше
+        // отметки: checked_duration_since даёт None, и запрос разрешается.
+        assert!(routing_changed_refresh_due(
+            Some(base + ROUTING_CHANGED_REFRESH_WINDOW),
+            base
+        ));
+    }
+
+    /// Регрессия на потерю последнего сохранения серии: notice, подавленный
+    /// окном, обязан оставить хвостовой запрос, иначе правило навсегда
+    /// останется старым (watchdog будит только несобранную доставку, не опрос).
+    #[test]
+    fn routing_refresh_debounce_suppressed_notice_leaves_trailing() {
+        let mut debounce = RoutingRefreshDebounce::default();
+        let base = std::time::Instant::now();
+        // Сохранение A: первый notice уходит сразу.
+        assert!(debounce.notice(base));
+        // Сохранение B через 0.5 с подавлено окном...
+        assert!(!debounce.notice(base + Duration::from_millis(500)));
+        // ...но до конца окна хвост ещё не уходит.
+        assert!(!debounce.trailing_due(base + Duration::from_millis(900)));
+        // Окно истекло — обязан уйти один хвостовой запрос за последним состоянием.
+        assert!(debounce.trailing_due(base + ROUTING_CHANGED_REFRESH_WINDOW));
+        debounce.sent(base + ROUTING_CHANGED_REFRESH_WINDOW);
+        // Хвост доставлен — повторных запросов нет.
+        assert!(!debounce.trailing_due(base + ROUTING_CHANGED_REFRESH_WINDOW * 2));
+    }
+
+    #[test]
+    fn routing_refresh_debounce_collapses_burst_to_single_trailing() {
+        let mut debounce = RoutingRefreshDebounce::default();
+        let base = std::time::Instant::now();
+        assert!(debounce.notice(base));
+        for ms in [100u64, 300, 700, 900] {
+            assert!(!debounce.notice(base + Duration::from_millis(ms)));
+        }
+        // Вся серия сводится к одному хвосту, а не к запросу на каждое сохранение.
+        assert!(debounce.trailing_due(base + ROUTING_CHANGED_REFRESH_WINDOW));
+        debounce.sent(base + ROUTING_CHANGED_REFRESH_WINDOW);
+        assert!(
+            !debounce
+                .trailing_due(base + ROUTING_CHANGED_REFRESH_WINDOW + Duration::from_millis(100))
+        );
+        // Новый notice после окна снова уходит сразу.
+        assert!(debounce.notice(base + ROUTING_CHANGED_REFRESH_WINDOW * 2));
+    }
+
+    #[test]
+    fn routing_refresh_debounce_trailing_retries_until_sent() {
+        let mut debounce = RoutingRefreshDebounce::default();
+        let base = std::time::Instant::now();
+        assert!(debounce.notice(base));
+        assert!(!debounce.notice(base + Duration::from_millis(500)));
+        let due_at = base + ROUTING_CHANGED_REFRESH_WINDOW;
+        assert!(debounce.trailing_due(due_at));
+        // Отправка не удалась (вызывающий не позвал sent) — хвост остаётся.
+        assert!(debounce.trailing_due(due_at + Duration::from_millis(500)));
+        debounce.sent(due_at + Duration::from_millis(500));
+        assert!(!debounce.trailing_due(due_at + Duration::from_millis(600)));
+    }
+
+    #[test]
+    fn routing_refresh_debounce_failed_leading_is_retried_as_trailing() {
+        let mut debounce = RoutingRefreshDebounce::default();
+        let base = std::time::Instant::now();
+        // Leading-запрос должен был уйти, но постановка не удалась.
+        assert!(debounce.notice(base));
+        debounce.retry_later();
+        // Долг остаётся: после окна хвост повторит попытку, изменение не потеряно.
+        assert!(debounce.trailing_due(base + ROUTING_CHANGED_REFRESH_WINDOW));
+        debounce.sent(base + ROUTING_CHANGED_REFRESH_WINDOW);
+        assert!(!debounce.trailing_due(base + ROUTING_CHANGED_REFRESH_WINDOW * 2));
+    }
+
+    /// Watchdog-повтор `GETCONF` обязан ставиться ДУБЛИРОВАННОЙ командой:
+    /// потеря одинокого датаграммы съедала один из двух retries и вела к fatal
+    /// на уже поднятом туннеле. Проверка без таймеров: постановщик пишет в
+    /// канал, тест сверяет выбранную ветку команды.
+    #[tokio::test]
+    async fn routing_retry_is_posted_as_a_duplicated_writer_command() {
+        const REQUEST: &[u8] = b"GETCONF:9000|pass1234|7|generation-id|1|18|owner";
+
+        let (tx, mut rx) = mpsc::channel::<WriterCommand>(2);
+        let poster = tokio::spawn(async move { send_writer_bytes_duplicated(&tx, REQUEST).await });
+
+        match rx.recv().await {
+            Some(WriterCommand::SendBytesDuplicated { data, completion }) => {
+                assert_eq!(data.as_ref(), REQUEST);
+                // Ответ так же, как writer-цикл: исход отправке доставлен.
+                assert!(completion.send(Ok(())).is_ok());
+            }
+            Some(WriterCommand::SendBytes { .. }) => {
+                panic!("повтор GETCONF обязан уходить дублированной командой")
+            }
+            None => panic!("постановщик ничего не положил в writer-очередь"),
+        }
+
+        assert!(poster.await.unwrap().is_ok());
+    }
+
+    /// Симметричная часть того же инварианта: дублируется ТОЛЬКО `GETCONF`.
+    /// Остальные control-строки (`DISCONNECT` и всё, что идёт через
+    /// `send_writer_bytes`) обязаны оставаться одиночными датаграммами.
+    #[tokio::test]
+    async fn regular_control_write_stays_a_single_copy_writer_command() {
+        const REQUEST: &[u8] = b"DISCONNECT:device|salt";
+
+        let (tx, mut rx) = mpsc::channel::<WriterCommand>(2);
+        let poster = tokio::spawn(async move { send_writer_bytes(&tx, REQUEST).await });
+
+        match rx.recv().await {
+            Some(WriterCommand::SendBytes { data, completion }) => {
+                assert_eq!(data.as_ref(), REQUEST);
+                assert!(completion.send(Ok(())).is_ok());
+            }
+            Some(WriterCommand::SendBytesDuplicated { .. }) => {
+                panic!("обычная control-строка не имеет права дублироваться")
+            }
+            None => panic!("постановщик ничего не положил в writer-очередь"),
+        }
+
+        assert!(poster.await.unwrap().is_ok());
+    }
+
+    /// Интерливинг двух доставок с одним `total` остаётся рабочей сборкой:
+    /// чанки дедуплицируются по `seq`, правило собирается один раз.
+    #[test]
+    fn test_routing_reassembler_interleaves_two_sequences_with_the_same_total() {
+        let payload = r#"{"mode":"whitelist","domains":["a.com","b.com"]}"#;
+        let chunks = routing_delivery_chunks(payload, 4);
+        let mut reassembler = RoutingReassembler::new();
+        assert_eq!(reassembler.feed(b"ROUTING:START:4"), None);
+        for (index, chunk) in chunks.iter().enumerate() {
+            for _ in 0..2 {
+                let line = format!("ROUTING:{}:4:{}", index + 1, chunk);
+                assert_eq!(reassembler.feed(line.as_bytes()), None);
+            }
+        }
+        assert_eq!(
+            reassembler.feed(b"ROUTING:FINISH:4"),
+            Some(payload.to_owned())
+        );
+    }
+
+    /// После сборки закрывается только последовательность с тем же `total`:
+    /// доставка нового правила (другое число чанков) собирается и без `START`,
+    /// как и на холодном рессемблере.
+    #[test]
+    fn test_routing_reassembler_accepts_a_different_total_after_assembling() {
+        let payload = r#"{"mode":"whitelist","domains":["old.example"]}"#;
+        let chunks = routing_delivery_chunks(payload, 4);
+        let mut reassembler = RoutingReassembler::new();
+        assert_eq!(
+            feed_full_delivery(&mut reassembler, &chunks),
+            Some(payload.to_owned())
+        );
+
+        let updated = r#"{"mode":"whitelist","domains":["new.example","other.example"]}"#;
+        let updated_chunks = routing_delivery_chunks(updated, 6);
+        for (index, chunk) in updated_chunks.iter().enumerate() {
+            let line = format!("ROUTING:{}:6:{}", index + 1, chunk);
+            assert_eq!(reassembler.feed(line.as_bytes()), None);
+        }
+        assert_eq!(
+            reassembler.feed(b"ROUTING:FINISH:6"),
+            Some(updated.to_owned())
+        );
     }
 
     #[test]
@@ -2413,6 +3860,33 @@ mod tests {
             None
         );
         assert_eq!(reassembler.feed(b"ROUTING:FINISH:1"), None);
+    }
+
+    #[test]
+    fn oversized_routing_chunk_is_fatal_too() {
+        use base64::Engine;
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+
+        let bomb = "a".repeat(MAX_ROUTING_PAYLOAD_BYTES + 10);
+        let mut enc = GzEncoder::new(Vec::new(), Compression::best());
+        enc.write_all(bomb.as_bytes()).unwrap();
+        let compressed = enc.finish().unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&compressed);
+
+        let mut reassembler = RoutingReassembler::new();
+        assert_eq!(reassembler.feed(b"ROUTING:START:1"), None);
+        assert_eq!(
+            reassembler.feed(format!("ROUTING:1:1:{b64}").as_bytes()),
+            None
+        );
+        assert_eq!(reassembler.feed(b"ROUTING:FINISH:1"), None);
+        assert_eq!(
+            reassembler.take_oversize_error(),
+            Some(MAX_ROUTING_PAYLOAD_BYTES + 1)
+        );
+        assert_eq!(reassembler.take_oversize_error(), None);
     }
 
     #[test]

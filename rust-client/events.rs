@@ -67,7 +67,21 @@ impl Events {
     }
 
     pub fn routing(&self, routing_json: &str) {
-        self.emit("ROUTING", || serde_json::json!({"routing": routing_json}));
+        if !self.enabled {
+            return;
+        }
+        if let Some(line) =
+            encode_routing_line("ROUTING", &serde_json::json!({"routing": routing_json}))
+        {
+            crate::log_output!("{line}");
+        }
+    }
+
+    /// Сервер прислал `ROUTING:ABSENT`: правила у этого подключения нет.
+    /// Приложение по этому событию очищает ранее полученное правило — иначе
+    /// после отвязки правила на сервере оно оставалось бы в памяти.
+    pub fn routing_absent(&self) {
+        self.emit("ROUTING_ABSENT", || serde_json::json!({}));
     }
 
     pub fn workers(&self, workers: u32) {
@@ -193,6 +207,31 @@ fn encode_event_line<T: Serialize>(kind: &str, payload: &T) -> Option<String> {
             "code": "event_payload_too_large",
             "fatal": false,
             "message": format!("{kind}: {} байт", line.len())
+        }),
+    )
+}
+
+/// Encodes a routing event, and makes an oversized payload fatal instead of a silent downgrade.
+///
+/// A routing rule that does not fit the line limit can never be applied: the app drops the line
+/// and keeps the previous rule, so the tunnel would run without the exclusions the operator
+/// configured. Emitting a non-fatal `ERROR` would leave the tunnel up in local-routing mode;
+/// a fatal event stops the connection instead.
+fn encode_routing_line<T: Serialize>(kind: &str, payload: &T) -> Option<String> {
+    let line = encode_event(kind, payload)?;
+    if line.len() <= crate::logging::MAX_PROTOCOL_LINE_BYTES {
+        return Some(line);
+    }
+    encode_event(
+        "ERROR",
+        &serde_json::json!({
+            "code": "routing_payload_too_large",
+            "fatal": true,
+            "message": format!(
+                "{kind}: {} байт, предел {}",
+                line.len(),
+                crate::logging::MAX_PROTOCOL_LINE_BYTES
+            )
         }),
     )
 }
@@ -338,5 +377,22 @@ mod tests {
         assert_eq!(hashes.len(), 2);
         assert!(hashes.contains("dead-call"));
         assert!(hashes.contains("other-call"));
+    }
+
+    #[test]
+    fn oversized_routing_event_is_fatal() {
+        let line = encode_routing_line(
+            "ROUTING",
+            &serde_json::json!({"routing": "x".repeat(crate::logging::MAX_PROTOCOL_LINE_BYTES)}),
+        )
+        .unwrap();
+        assert!(line.contains("\"fatal\":true"));
+        assert!(line.contains("\"code\":\"routing_payload_too_large\""));
+    }
+
+    #[test]
+    fn a_routing_event_that_fits_is_untouched() {
+        let line = encode_routing_line("ROUTING", &serde_json::json!({"routing": "{}"})).unwrap();
+        assert!(line.starts_with("__CSQTT_EVENT__|ROUTING|"));
     }
 }

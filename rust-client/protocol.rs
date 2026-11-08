@@ -3,8 +3,21 @@ use anyhow::{Result, bail};
 use crate::wire_protocol::PATH_ECHO_PREFIX;
 
 pub const PANEL_RESTART_NOTICE: &[u8] = b"\xffCSQTT_PANEL_RESTART_V1\x00\x91\x7d\x03\xa8";
+/// «Правило маршрутизации изменилось» — зеркало серверного
+/// `protocol::ROUTING_CHANGED_NOTICE`, байт в байт.
+///
+/// Сервер шлёт его живым сессиям после правки или отвязки правила, чтобы
+/// config-owner повторил `GETCONF`, не дожидаясь переподключения. Старый сервер
+/// этот бинарь не отправляет вовсе, а новый сервер → старый клиент: неизвестный
+/// пакет, который тот молча отбрасывает как не-IP — деградация в обе стороны
+/// безопасна.
+pub const ROUTING_CHANGED_NOTICE: &[u8] = b"\xffCSQTT_ROUTING_CHANGED_V1\x00\x5c\x2a\xef\x19";
 pub const STREAM_REPAIR_PREFIX: &[u8] = b"\xffCSQTT_STREAM_REPAIR_V1";
 pub const STREAM_ALIVE_PREFIX: &[u8] = b"\xffCSQTT_STREAM_ALIVE_V1";
+/// `ROUTING:ABSENT` — у подключения нет правила маршрутизации. Лежит в
+/// семействе `ROUTING:`, поэтому считается управляющим пакетом; рессемблер
+/// такой формат не разбирает, и старые клиенты его молча отбрасывают.
+pub const ROUTING_ABSENT: &[u8] = b"ROUTING:ABSENT";
 const MAX_STREAM_WORKERS: u16 = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,6 +33,9 @@ pub struct StreamRepairCommand {
     pub worker_ids: Vec<u16>,
 }
 
+/// Тестовый помощник для формы без кеша доменов/приложений.
+#[cfg(test)]
+#[expect(clippy::too_many_arguments)]
 pub fn config_request(
     local_port: &str,
     password: &str,
@@ -27,9 +43,95 @@ pub fn config_request(
     salt: &str,
     worker_id: usize,
     desired_count: Option<usize>,
+    config_owner: bool,
+    routing_ips_sha: Option<&str>,
+) -> String {
+    config_request_with_content(
+        local_port,
+        password,
+        generation_id,
+        salt,
+        worker_id,
+        desired_count,
+        config_owner,
+        routing_ips_sha,
+        None,
+        false,
+    )
+}
+
+const ROUTING2_CAPABILITY: &str = "routing2";
+
+#[expect(clippy::too_many_arguments)]
+pub fn config_request_with_content(
+    local_port: &str,
+    password: &str,
+    generation_id: u64,
+    salt: &str,
+    worker_id: usize,
+    desired_count: Option<usize>,
+    config_owner: bool,
+    routing_ips_sha: Option<&str>,
+    routing_content_sha: Option<&str>,
+    advertise_routing2: bool,
 ) -> String {
     let desired_count = desired_count.map_or_else(String::new, |value| value.to_string());
-    format!("GETCONF:{local_port}|{password}|{generation_id}|{salt}|{worker_id}|{desired_count}")
+    let base = format!(
+        "GETCONF:{local_port}|{password}|{generation_id}|{salt}|{worker_id}|{desired_count}"
+    );
+    if config_owner {
+        // Только config-owner просит сервер прислать решение о маршрутизации:
+        // остальные воркеры получают голый TUNCONF. Поля добавлены в конец,
+        // поэтому старый сервер их игнорирует, а новый без них обслуживает
+        // клиента по-прежнему — один раз на поколение. Восьмое поле — sha
+        // закешированного адресного списка, девятое — sha кеша доменов и
+        // приложений; не-owner их не читает и не получает. Пустые восьмое и
+        // девятое поля нужны, чтобы метка `routing2` осталась десятой.
+        if advertise_routing2 {
+            return format!(
+                "{base}|owner|{}|{}|{ROUTING2_CAPABILITY}",
+                routing_ips_sha.unwrap_or(""),
+                routing_content_sha.unwrap_or("")
+            );
+        }
+        match (routing_ips_sha, routing_content_sha) {
+            (None, None) => format!("{base}|owner"),
+            (Some(ips), None) => format!("{base}|owner|{ips}"),
+            (None, Some(content)) => format!("{base}|owner||{content}"),
+            (Some(ips), Some(content)) => format!("{base}|owner|{ips}|{content}"),
+        }
+    } else if advertise_routing2 {
+        // Воркер тоже объявляет формат: сервер может отправить ему legacy-доставку.
+        format!("{base}|{ROUTING2_CAPABILITY}")
+    } else {
+        base
+    }
+}
+
+/// Пакет доставки правила: старый `ROUTING:` или `ROUTING2:` с nonce.
+pub fn is_routing_delivery(payload: &[u8]) -> bool {
+    payload.starts_with(b"ROUTING:") || payload.starts_with(b"ROUTING2:")
+}
+
+pub fn parse_routing_ips_sha(value: &str) -> Option<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    (normalized.len() == 64 && normalized.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then_some(normalized)
+}
+
+/// Sha кеша доменов и приложений — та же форма, что у адресного.
+pub fn parse_routing_content_sha(value: &str) -> Option<String> {
+    parse_routing_ips_sha(value)
+}
+
+/// Прочитать sha кеша из живого файла.
+///
+/// Файл, а не argv: приложение перезаписывает кеш в середине сессии, и
+/// следующий GETCONF обязан унести новый sha. Ошибка чтения/формата — «кеша
+/// нет»: сервер пришлёт полный набор, это безопасно.
+pub fn read_routing_content_sha(path: &std::path::Path) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    parse_routing_content_sha(&raw)
 }
 
 pub fn parse_config_response(response: &[u8]) -> Result<ConfigResponse> {
@@ -66,7 +168,7 @@ pub fn is_config_response(response: &[u8]) -> bool {
 }
 
 pub fn is_control_response(response: &[u8]) -> bool {
-    if is_panel_restart_notice(response) {
+    if is_panel_restart_notice(response) || is_routing_changed_notice(response) {
         return true;
     }
     [
@@ -76,6 +178,7 @@ pub fn is_control_response(response: &[u8]) -> bool {
         b"READY_OK".as_slice(),
         b"OK:disconnected".as_slice(),
         b"ROUTING:".as_slice(),
+        b"ROUTING2:".as_slice(),
         b"TUNWORKERS:".as_slice(),
         b"WORKERS:".as_slice(),
         STREAM_REPAIR_PREFIX,
@@ -110,6 +213,13 @@ pub fn parse_tunworkers_response(payload: &[u8]) -> Option<(usize, usize)> {
 
 pub fn is_panel_restart_notice(response: &[u8]) -> bool {
     response == PANEL_RESTART_NOTICE
+}
+
+/// Распознаёт ли пакет сигнал «правило изменилось». Сравнение полное, как у
+/// `is_panel_restart_notice`: совпадение по префиксу превратило бы любой
+/// неизвестный бинарь с тем же началом в сигнал и вызвало бы лишний `GETCONF`.
+pub fn is_routing_changed_notice(response: &[u8]) -> bool {
+    response == ROUTING_CHANGED_NOTICE
 }
 
 pub fn disconnect_request(password: &str, salt: &str) -> String {
@@ -161,11 +271,198 @@ mod tests {
 
     #[test]
     fn request_matches_go_contract() {
-        let req1 = config_request("9000", "pass1234567890ab", 7, "salt", 4, None);
+        let req1 = config_request("9000", "pass1234567890ab", 7, "salt", 4, None, false, None);
         assert_eq!(req1, "GETCONF:9000|pass1234567890ab|7|salt|4|");
 
-        let req2 = config_request("9000", "pass1234567890ab", 7, "salt", 4, Some(36));
+        let req2 = config_request(
+            "9000",
+            "pass1234567890ab",
+            7,
+            "salt",
+            4,
+            Some(36),
+            false,
+            None,
+        );
         assert_eq!(req2, "GETCONF:9000|pass1234567890ab|7|salt|4|36");
+    }
+
+    #[test]
+    fn config_owner_marks_its_request() {
+        let owner = config_request("9000", "pass", 7, "salt", 1, Some(10), true, None);
+        assert_eq!(owner, "GETCONF:9000|pass|7|salt|1|10|owner");
+
+        let worker = config_request("9000", "pass", 7, "salt", 2, Some(10), false, None);
+        assert_eq!(worker, "GETCONF:9000|pass|7|salt|2|10");
+    }
+
+    #[test]
+    fn owner_with_a_cached_sha_appends_an_eighth_field() {
+        let sha = "5cf0b8862ad4f3318831dcf2e94076e221320ff47d77f1a12ebe661f613f70f6";
+        assert_eq!(
+            config_request("9000", "pass", 7, "salt", 4, Some(10), true, Some(sha)),
+            format!("GETCONF:9000|pass|7|salt|4|10|owner|{sha}")
+        );
+        assert_eq!(
+            config_request("9000", "pass", 7, "salt", 4, Some(10), true, None),
+            "GETCONF:9000|pass|7|salt|4|10|owner"
+        );
+        assert_eq!(
+            config_request("9000", "pass", 7, "salt", 4, Some(10), false, Some(sha)),
+            "GETCONF:9000|pass|7|salt|4|10"
+        );
+    }
+
+    #[test]
+    fn owner_with_cached_content_appends_a_ninth_field() {
+        let ips = "5cf0b8862ad4f3318831dcf2e94076e221320ff47d77f1a12ebe661f613f70f6";
+        let content = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            config_request_with_content(
+                "9000",
+                "pass",
+                7,
+                "salt",
+                4,
+                Some(10),
+                true,
+                Some(ips),
+                Some(content),
+                false
+            ),
+            format!("GETCONF:9000|pass|7|salt|4|10|owner|{ips}|{content}")
+        );
+        // Без ips-кеша восьмое поле остаётся пустым, чтобы девятое не сдвинулось.
+        assert_eq!(
+            config_request_with_content(
+                "9000",
+                "pass",
+                7,
+                "salt",
+                4,
+                Some(10),
+                true,
+                None,
+                Some(content),
+                false
+            ),
+            format!("GETCONF:9000|pass|7|salt|4|10|owner||{content}")
+        );
+        // Не-owner контент не шлёт.
+        assert_eq!(
+            config_request_with_content(
+                "9000",
+                "pass",
+                7,
+                "salt",
+                4,
+                Some(10),
+                false,
+                None,
+                Some(content),
+                false
+            ),
+            "GETCONF:9000|pass|7|salt|4|10"
+        );
+    }
+
+    #[test]
+    fn routing2_capability_is_advertised_for_owner_and_worker() {
+        let ips = "5cf0b8862ad4f3318831dcf2e94076e221320ff47d77f1a12ebe661f613f70f6";
+        let content = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            config_request_with_content(
+                "9000",
+                "pass",
+                7,
+                "salt",
+                4,
+                Some(10),
+                true,
+                Some(ips),
+                Some(content),
+                true
+            ),
+            format!("GETCONF:9000|pass|7|salt|4|10|owner|{ips}|{content}|routing2")
+        );
+        assert_eq!(
+            config_request_with_content(
+                "9000",
+                "pass",
+                7,
+                "salt",
+                4,
+                Some(10),
+                true,
+                None,
+                None,
+                true
+            ),
+            "GETCONF:9000|pass|7|salt|4|10|owner|||routing2"
+        );
+        assert_eq!(
+            config_request_with_content(
+                "9000",
+                "pass",
+                7,
+                "salt",
+                2,
+                Some(10),
+                false,
+                None,
+                None,
+                true
+            ),
+            "GETCONF:9000|pass|7|salt|2|10|routing2"
+        );
+    }
+
+    #[test]
+    fn routing_delivery_prefix_accepts_both_formats() {
+        assert!(is_routing_delivery(b"ROUTING:START:3"));
+        assert!(is_routing_delivery(b"ROUTING2:START:0000000000000001:3"));
+        assert!(!is_routing_delivery(b"ROUTING_ABSENT"));
+        assert!(!is_routing_delivery(b"TUNCONF:x"));
+    }
+
+    #[test]
+    fn content_sha_is_read_from_a_live_file() {
+        let path = std::env::temp_dir().join(format!(
+            "csqtt-content-sha-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or_default()
+        ));
+        let sha = "a".repeat(64);
+        std::fs::write(&path, &sha).expect("write sha file");
+        assert_eq!(
+            read_routing_content_sha(&path).as_deref(),
+            Some(sha.as_str())
+        );
+        std::fs::write(&path, "not-a-sha").expect("write bad sha");
+        assert_eq!(read_routing_content_sha(&path), None);
+        std::fs::remove_file(&path).expect("remove sha file");
+        assert_eq!(read_routing_content_sha(&path), None);
+    }
+
+    #[test]
+    fn malformed_sha_is_dropped_instead_of_sent() {
+        assert_eq!(parse_routing_ips_sha("not-a-sha"), None);
+        assert_eq!(
+            parse_routing_ips_sha(
+                "5CF0B8862AD4F3318831DCF2E94076E221320FF47D77F1A12EBE661F613F70F6"
+            )
+            .map(|value| value.len()),
+            Some(64)
+        );
+        assert_eq!(
+            parse_routing_ips_sha(
+                "5CF0B8862AD4F3318831DCF2E94076E221320FF47D77F1A12EBE661F613F70F6"
+            ),
+            Some("5cf0b8862ad4f3318831dcf2e94076e221320ff47d77f1a12ebe661f613f70f6".to_owned())
+        );
     }
 
     #[test]
@@ -225,6 +522,45 @@ mod tests {
         let mut modified = PANEL_RESTART_NOTICE.to_vec();
         modified[1] ^= 1;
         assert!(!is_panel_restart_notice(&modified));
+    }
+
+    /// Сигнал «правило изменилось» обязан распознаваться строго и не должен
+    /// путаться с соседями: распознавание `ROUTING:`-чанка как сигнала
+    /// обрывало бы сборку правила, а распознавание уведомления о перезапуске
+    /// панели — вызывало лишнюю пересборку туннеля.
+    #[test]
+    fn routing_changed_notice_requires_an_exact_match_and_is_unique() {
+        assert!(is_routing_changed_notice(ROUTING_CHANGED_NOTICE));
+        assert!(!is_routing_changed_notice(b"CSQTT_ROUTING_CHANGED_V1"));
+        // Только префикс — не сигнал.
+        assert!(!is_routing_changed_notice(
+            b"\xffCSQTT_ROUTING_CHANGED_V1\x00"
+        ));
+        let mut modified = ROUTING_CHANGED_NOTICE.to_vec();
+        modified[1] ^= 1;
+        assert!(!is_routing_changed_notice(&modified));
+        let mut tail = ROUTING_CHANGED_NOTICE.to_vec();
+        let last = tail.len() - 1;
+        tail[last] ^= 1;
+        assert!(!is_routing_changed_notice(&tail));
+
+        // Отличим от соседей по протоколу.
+        assert_ne!(ROUTING_CHANGED_NOTICE, PANEL_RESTART_NOTICE);
+        assert!(!is_panel_restart_notice(ROUTING_CHANGED_NOTICE));
+        assert!(!ROUTING_CHANGED_NOTICE.starts_with(b"ROUTING:"));
+        assert!(!is_routing_changed_notice(b"ROUTING:ABSENT"));
+        assert!(!is_routing_changed_notice(
+            b"ROUTING:1:46:YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4"
+        ));
+    }
+
+    /// Notice обязан считаться управляющим пакетом: иначе `reader_loop`
+    /// относит его к «отброшенным не-IP пакетам», и счётчик потерь показывает
+    /// проблему там, где её нет.
+    #[test]
+    fn routing_changed_notice_is_a_control_packet() {
+        assert!(is_control_response(ROUTING_CHANGED_NOTICE));
+        assert!(!is_config_response(ROUTING_CHANGED_NOTICE));
     }
 
     #[test]
@@ -299,7 +635,7 @@ mod tests {
 
     #[test]
     fn test_two_stage_handshake_requests_and_responses() {
-        let req1 = config_request("45000", "pass123", 789, "salt99", 1, None);
+        let req1 = config_request("45000", "pass123", 789, "salt99", 1, None, false, None);
         assert_eq!(req1, "GETCONF:45000|pass123|789|salt99|1|");
 
         let req2 = workers_request("pass123", 25);

@@ -256,6 +256,19 @@ pub(crate) fn deploy_dns_profile_or_yandex(existing_dns: &str) -> String {
 }
 
 const WEB_BODY_LIMIT_BYTES: usize = 16 * 1024;
+/// Лимит тела только для создания/правки маршрутного правила.
+///
+/// Правило доставляется событием ≤ 65 536 байт, но его JSON в запросе панели
+/// содержит ещё явные адреса, обвязку и экранирование; худший валидный случай
+/// (~1 024 домена по ~58 символов + 512 адресов + blob) — около 113 КБ. Общий
+/// лимит 16 КиБ отсекал такие запросы до валидатора (413 вместо 400), из-за
+/// чего ветка «правило не доставляется» была недостижима. 256 КиБ оставляют
+/// запас и не расширяют остальные endpoint'ы.
+const ROUTING_RULE_BODY_LIMIT_BYTES: usize = 256 * 1024;
+// D1: тело правила обязано проходить дальше общего лимита и достигать
+// валидатора, который и возвращает 400 про размер события.
+const _: () = assert!(ROUTING_RULE_BODY_LIMIT_BYTES > 65_536);
+const _: () = assert!(ROUTING_RULE_BODY_LIMIT_BYTES >= 4 * WEB_BODY_LIMIT_BYTES);
 const MAX_LOGIN_FIELD_BYTES: usize = 256;
 const MAX_CLIENT_NAME_BYTES: usize = 128;
 const MAX_PROXY_PROFILE_NAME_BYTES: usize = 64;
@@ -1916,7 +1929,7 @@ async fn client_update(
         Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
     };
 
-    let revision = {
+    let (revision, affected) = {
         let mut db = state.app.db.write().await;
         if request.vk_token && db.vk_access_token.is_empty() {
             return (StatusCode::BAD_REQUEST, "configure a VK token first").into_response();
@@ -1925,7 +1938,9 @@ async fn client_update(
             db.main_vk_hashes = vk_hashes;
             db.main_vk_token_enabled = request.vk_token;
             db.main_workers = validated_workers;
-            state.app.db_persistence.submit(db.clone())
+            // Привязку правила этот handler не трогает (у main она меняется
+            // только через routing_rules_*), поэтому и уведомления не нужно.
+            (state.app.db_persistence.submit(db.clone()), Vec::new())
         } else {
             let current_group_id = match db.passwords.get(&password) {
                 Some(e) => e.group_id.clone(),
@@ -1950,6 +1965,13 @@ async fn client_update(
 
             let entry = db.passwords.get_mut(&password).unwrap();
 
+            // Смена группы меняет разрешённое правило только у клиента без
+            // собственного: групповое правило стоит ниже собственного в
+            // порядке `resolve_routing_rule`. Если собственного правила нет и
+            // группа другая — старое решение больше не действительно, и
+            // клиенту нужен новый `GETCONF`.
+            let rule_binding_changed =
+                entry.routing_rule_id.is_empty() && target_group_id != current_group_id;
             let default_peer_port = state.app.listen.port();
             let fallback_port = if entry.dtls_port == 0 {
                 default_peer_port
@@ -1976,12 +1998,18 @@ async fn client_update(
                 entry.group_id = g_id.clone();
             }
             entry.workers = validated_workers;
-            state.app.db_persistence.submit(db.clone())
+            let affected = if rule_binding_changed {
+                vec![password.clone()]
+            } else {
+                Vec::new()
+            };
+            (state.app.db_persistence.submit(db.clone()), affected)
         }
     };
     if let Err(response) = wait_for_persistence(&state, revision).await {
         return response;
     }
+    notify_routing_changed_or_log(&state, &affected).await;
     if let Err(message) = refresh_credentials_report(&state).await {
         let warning = format!("saved but reload failed: {message}");
         return (StatusCode::OK, [("x-csqtt-reload-error", warning)], "saved").into_response();
@@ -2012,6 +2040,10 @@ async fn client_toggle(State(state): State<WebState>, Path(password): Path<Strin
 }
 
 async fn client_unbind(State(state): State<WebState>, Path(password): Path<String>) -> Response {
+    // Уведомление о смене правила здесь не нужно и не могло бы сработать:
+    // привязка правила этим handler'ом не меняется, а `drop_password_sessions`
+    // уничтожает ровно те сессии, которым notice был бы адресован. Клиент
+    // переподключится и получит актуальное решение обычным `GETCONF`.
     crate::protocol::drop_password_sessions(&state.app, &password);
     crate::protocol::forget_idle_password_epoch(&state.app, &password);
     StatusCode::OK.into_response()
@@ -2629,6 +2661,18 @@ async fn api_import_post(
     let mut applied_dns = None;
     let mut applied_interval = None;
 
+    for (rid, rule) in &export.routing_rules {
+        if let Err(message) = crate::protocol::validate_routing_rule(rule) {
+            log_event(
+                &state.app,
+                "WARN",
+                "import",
+                &format!("routing rule {rid} rejected: {message}"),
+            );
+            return (StatusCode::BAD_REQUEST, format!("правило {rid}: {message}")).into_response();
+        }
+    }
+
     let revision = {
         let mut db = state.app.db.write().await;
         if do_clients {
@@ -2819,26 +2863,59 @@ async fn groups_update(
     Path(id): Path<String>,
     Json(request): Json<UpdateGroupRequest>,
 ) -> Response {
-    let revision = {
+    let (revision, affected) = {
         let mut db = state.app.db.write().await;
-        let Some(group) = db.groups.get_mut(&id) else {
+        // Снимок «до» строится по ПРЕЖНЕМУ значению привязки: после мутации
+        // группа уже не указывает на старое правило, и union собрать было бы
+        // нечем. Отдельного прохода по клиентам ради этого не делаем —
+        // пересохранение имени или лимита воркеров никого не будит.
+        let Some(previous_rule_id) = db
+            .groups
+            .get(&id)
+            .map(|group| group.routing_rule_id.clone())
+        else {
             return StatusCode::NOT_FOUND.into_response();
         };
-        if let Some(name) = request.name {
-            let n = name.trim();
-            if n.is_empty() || n.len() > 64 {
-                return (StatusCode::BAD_REQUEST, "invalid group name").into_response();
+        let next_rule_id = request.routing_rule_id.clone();
+        let binding_changed = next_rule_id
+            .as_ref()
+            .is_some_and(|next| next != &previous_rule_id);
+        let before = if binding_changed {
+            group_affected_passwords(&db, &id)
+        } else {
+            Vec::new()
+        };
+
+        {
+            let Some(group) = db.groups.get_mut(&id) else {
+                return StatusCode::NOT_FOUND.into_response();
+            };
+            if let Some(name) = request.name {
+                let n = name.trim();
+                if n.is_empty() || n.len() > 64 {
+                    return (StatusCode::BAD_REQUEST, "invalid group name").into_response();
+                }
+                group.name = n.to_string();
             }
-            group.name = n.to_string();
+            if let Some(r_id) = request.routing_rule_id {
+                group.routing_rule_id = r_id;
+            }
         }
-        if let Some(r_id) = request.routing_rule_id {
-            group.routing_rule_id = r_id;
-        }
-        state.app.db_persistence.submit(db.clone())
+        // Union «до» и «после»: участники группы попадают в оба набора (их
+        // ожидание определяется членством), а main — только в «до», потому что
+        // после снятия привязки его правило уже не совпадает с групповым. Без
+        // «до» main остался бы живым туннелем со снятым правилом.
+        let affected = if binding_changed {
+            merge_affected_passwords(&before, &group_affected_passwords(&db, &id))
+        } else {
+            Vec::new()
+        };
+        (state.app.db_persistence.submit(db.clone()), affected)
     };
     if let Err(response) = wait_for_persistence(&state, revision).await {
         return response;
     }
+    notify_routing_changed_or_log(&state, &affected).await;
     let _ = crate::protocol::broadcast_tunnel_configuration(&state.app).await;
     StatusCode::OK.into_response()
 }
@@ -2867,6 +2944,14 @@ async fn groups_delete(State(state): State<WebState>, Path(id): Path<String>) ->
     if let Err(response) = wait_for_persistence(&state, revision).await {
         return response;
     }
+    // Уведомление о смене правила здесь не нужно и не могло бы сработать:
+    // участники группы удаляются вместе с ней, а `drop_password_sessions`
+    // уничтожает ровно те сессии, которым notice был бы адресован. Выживших
+    // клиентов, чьё разрешённое правило изменилось бы, нет: через группу
+    // резолвятся только её участники (все удалены), а main — через собственную
+    // привязку `main_routing_rule_id`, не через группу. Удалённые клиенты при
+    // переподключении не пройдут аутентификацию; остальные получат актуальное
+    // решение обычным `GETCONF`. Тот же случай, что `client_unbind`/`client_delete`.
     for pwd in &deleted_passwords {
         crate::protocol::drop_password_sessions(&state.app, pwd);
     }
@@ -3534,27 +3619,30 @@ async fn api_clients_batch_group(
     Json(req): Json<BatchGroupAssignRequest>,
 ) -> Response {
     let mut moved = 0usize;
-    let revision = {
+    let (revision, affected) = {
         let mut db = state.app.db.write().await;
         let gid = req.group_id.trim();
         if !gid.is_empty() && !db.groups.contains_key(gid) {
             return (StatusCode::BAD_REQUEST, "target group not found").into_response();
         }
+        let affected = batch_group_affected_passwords(&db, &req.passwords, gid);
         for pwd in &req.passwords {
             if let Some(entry) = db.passwords.get_mut(pwd) {
                 entry.group_id = gid.to_string();
                 moved += 1;
             }
         }
-        if moved > 0 {
+        let revision = if moved > 0 {
             Some(state.app.db_persistence.submit(db.clone()))
         } else {
             None
-        }
+        };
+        (revision, affected)
     };
     if let Some(rev) = revision {
         let _ = wait_for_persistence(&state, rev).await;
     }
+    notify_routing_changed_or_log(&state, &affected).await;
     (
         StatusCode::OK,
         Json(serde_json::json!({ "ok": true, "moved": moved })),
@@ -4075,6 +4163,7 @@ struct RoutingRuleInfo {
     mode: String,
     packages: Vec<String>,
     template_domains: bool,
+    template_ips: bool,
     preset_apps: bool,
     direct_domains: Vec<String>,
     domains: Vec<String>,
@@ -4119,6 +4208,7 @@ async fn routing_rules_get(State(state): State<WebState>) -> Response {
             },
             packages: rule.packages.clone(),
             template_domains: rule.template_domains,
+            template_ips: rule.template_ips,
             preset_apps: rule.preset_apps,
             direct_domains: rule.direct_domains.clone(),
             domains: rule.direct_domains.clone(),
@@ -4144,15 +4234,23 @@ async fn routing_rules_get(State(state): State<WebState>) -> Response {
     Json(list).into_response()
 }
 
-const TEMPLATE_DOMAINS_TXT: &str = include_str!("../app/src/main/assets/domains.txt");
-
 async fn template_domains_get() -> impl IntoResponse {
     (
         [(
             axum::http::header::CONTENT_TYPE,
             "text/plain; charset=utf-8",
         )],
-        TEMPLATE_DOMAINS_TXT,
+        crate::routing_assets::ASSETS.domains_text.as_str(),
+    )
+}
+
+async fn template_ips_get() -> impl IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )],
+        crate::routing_assets::ASSETS.ips.text.as_str(),
     )
 }
 
@@ -4172,6 +4270,8 @@ struct CreateRoutingRuleRequest {
     packages: Vec<String>,
     #[serde(default)]
     template_domains: bool,
+    #[serde(default)]
+    template_ips: bool,
     #[serde(default = "default_preset_enabled")]
     preset_apps: bool,
     #[serde(default)]
@@ -4200,6 +4300,141 @@ struct CreateRoutingRuleRequest {
 
 fn default_preset_enabled() -> bool {
     true
+}
+
+fn routing_rule_validation_response(rule: &RoutingRule) -> Option<Response> {
+    crate::protocol::validate_routing_rule(rule)
+        .err()
+        .map(|message| (StatusCode::BAD_REQUEST, message).into_response())
+}
+
+/// Участники, чьё разрешённое правило приходит из группы: `group_id` совпадает,
+/// собственного правила нет, пароль непустой. Единственное место, где живёт
+/// условие «собственное правило важнее группового».
+fn group_member_passwords(
+    db: &model::Database,
+    group_id: &str,
+) -> std::collections::BTreeSet<String> {
+    db.passwords
+        .iter()
+        .filter(|(password, entry)| {
+            entry.group_id == group_id && entry.routing_rule_id.is_empty() && !password.is_empty()
+        })
+        .map(|(password, _)| password.clone())
+        .collect()
+}
+
+/// Кого касается привязка правила к конкретной ГРУППЕ.
+///
+/// Отличается от `rule_affected_passwords` областью: там — все, кто резолвится
+/// на это правило (прямые привязки и другие группы с тем же правилом), здесь —
+/// только эта группа. Пересохранение группы не должно вызывать переоткачку
+/// правила у соседей, которые используют то же правило.
+///
+/// Участники попадают в набор независимо от того, осталось в группе правило или
+/// снято: их разрешённое правило определяется членством, а не значением
+/// `routing_rule_id`. Поэтому «правило забрали» не теряет участников из union'а
+/// даже если считать набор уже после мутации.
+fn group_affected_passwords(db: &model::Database, group_id: &str) -> Vec<String> {
+    // main вне группового членства и наследует правило только из собственной
+    // привязки `main_routing_rule_id`, поэтому перепривязка группы его не
+    // касается даже при совпадении rule id — иначе он получал бы лишний GETCONF.
+    group_member_passwords(db, group_id).into_iter().collect()
+}
+
+/// Объединение наборов «до» и «после»: без дублей, детерминированный порядок.
+fn merge_affected_passwords(before: &[String], after: &[String]) -> Vec<String> {
+    before
+        .iter()
+        .chain(after.iter())
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// Кому может быть заметно это правило: повторяет порядок разрешения правила из
+/// `model::Database::resolve_routing_rule`, а не угадывает его.
+///
+/// В набор попадают:
+/// - клиенты, у которых `routing_rule_id` равен `rule_id` (собственное правило
+///   имеет приоритет над групповым, поэтому такого клиента изменение видно
+///   всегда);
+/// - члены групп с этим правилом, но только те, у кого собственного правила
+///   нет — иначе группное правило их и так не касается;
+/// - `main_password`, если `main_routing_rule_id` равен `rule_id`.
+///
+/// Возвращает непустые пароли без дублей и в детерминированном порядке.
+/// Пустой `rule_id` — пустой набор: отвязка «на ничего» никого не трогает, а
+/// вызывающий и без того передаёт набор, в котором правила уже нет.
+fn rule_affected_passwords(db: &model::Database, rule_id: &str) -> Vec<String> {
+    if rule_id.is_empty() {
+        return Vec::new();
+    }
+    let mut affected = std::collections::BTreeSet::new();
+    for group in db.groups.values() {
+        if group.routing_rule_id == rule_id {
+            affected.extend(group_member_passwords(db, &group.id));
+        }
+    }
+    for (password, entry) in &db.passwords {
+        if entry.routing_rule_id == rule_id && !password.is_empty() {
+            affected.insert(password.clone());
+        }
+    }
+    if !db.main_password.is_empty() && db.main_routing_rule_id == rule_id {
+        affected.insert(db.main_password.clone());
+    }
+    affected.into_iter().collect()
+}
+
+/// Кого касается массовый перевод клиентов в группу (`api_clients_batch_group`).
+///
+/// Зеркало условия из `client_update`: разрешённое правило меняется только у
+/// перемещаемого клиента БЕЗ собственного правила и только если группа реально
+/// другая. Клиент с собственным правилом от групповой привязки не зависит, а
+/// перевод «в ту же группу» ничего не меняет. Набор строится ДО мутации, поэтому
+/// `entry.group_id` здесь — прежняя группа. Пустые пароли и отсутствующие в базе
+/// пропускаются, порядок детерминированный, без дублей.
+fn batch_group_affected_passwords(
+    db: &model::Database,
+    passwords: &[String],
+    target_group_id: &str,
+) -> Vec<String> {
+    let mut affected = std::collections::BTreeSet::new();
+    for pwd in passwords {
+        if let Some(entry) = db.passwords.get(pwd)
+            && entry.routing_rule_id.is_empty()
+            && entry.group_id.as_str() != target_group_id
+            && !pwd.is_empty()
+        {
+            affected.insert(pwd.clone());
+        }
+    }
+    affected.into_iter().collect()
+}
+
+/// Оповестить живые сессии о смене правила и не превращать неудачу в ошибку
+/// ответа: изменение уже сохранено, а 5xx поверх успешного сохранения
+/// подтолкнул бы оператора сохранять правило повторно.
+///
+/// Пустой набор — молча: уведомлять некого (клиенты выключены, правило
+/// никому не назначено).
+async fn notify_routing_changed_or_log(state: &WebState, passwords: &[String]) {
+    if passwords.is_empty() {
+        return;
+    }
+    if let Err(error) = protocol::notify_routing_changed(&state.app, passwords).await {
+        log_event(
+            &state.app,
+            "WARN",
+            "routing",
+            &format!(
+                "routing_changed_notice undelivered clients={} error={error:#}",
+                passwords.len()
+            ),
+        );
+    }
 }
 
 async fn routing_rules_create(
@@ -4249,13 +4484,17 @@ async fn routing_rules_create(
         is_whitelist,
         packages: request.packages,
         template_domains: request.template_domains,
+        template_ips: request.template_ips,
         preset_apps: request.preset_apps,
         direct_domains,
         domains_is_whitelist,
         ip_is_whitelist,
         ips: request.ips,
     };
-    let revision = {
+    if let Some(response) = routing_rule_validation_response(&rule) {
+        return response;
+    }
+    let (revision, affected) = {
         let mut db = state.app.db.write().await;
         for g_id in &assigned_groups {
             if let Some(g) = db.groups.get_mut(g_id) {
@@ -4270,12 +4509,16 @@ async fn routing_rules_create(
         if !db.main_password.is_empty() && assigned_clients.contains(&db.main_password) {
             db.main_routing_rule_id = id.clone();
         }
+        // Набор считаем ПОСЛЕ привязки: у нового правила ещё нет старых
+        // владельцев, поэтому «кого задеть» = «кому оно теперь назначено».
+        let affected = rule_affected_passwords(&db, &id);
         db.routing_rules.insert(id, rule.clone());
-        state.app.db_persistence.submit(db.clone())
+        (state.app.db_persistence.submit(db.clone()), affected)
     };
     if let Err(response) = wait_for_persistence(&state, revision).await {
         return response;
     }
+    notify_routing_changed_or_log(&state, &affected).await;
     Json(rule).into_response()
 }
 
@@ -4320,20 +4563,33 @@ async fn routing_rules_update(
     } else {
         request.target_client_passwords.unwrap_or_default()
     };
-    let revision = {
-        let mut db = state.app.db.write().await;
-        let Some(rule) = db.routing_rules.get_mut(&id) else {
+    let mut candidate = {
+        let db = state.app.db.read().await;
+        let Some(rule) = db.routing_rules.get(&id) else {
             return StatusCode::NOT_FOUND.into_response();
         };
-        rule.name = name;
-        rule.is_whitelist = is_whitelist;
-        rule.packages = request.packages;
-        rule.template_domains = request.template_domains;
-        rule.preset_apps = request.preset_apps;
-        rule.direct_domains = direct_domains;
-        rule.domains_is_whitelist = domains_is_whitelist;
-        rule.ip_is_whitelist = ip_is_whitelist;
-        rule.ips = request.ips;
+        rule.clone()
+    };
+    candidate.name = name;
+    candidate.is_whitelist = is_whitelist;
+    candidate.packages = request.packages;
+    candidate.template_domains = request.template_domains;
+    candidate.template_ips = request.template_ips;
+    candidate.preset_apps = request.preset_apps;
+    candidate.direct_domains = direct_domains;
+    candidate.domains_is_whitelist = domains_is_whitelist;
+    candidate.ip_is_whitelist = ip_is_whitelist;
+    candidate.ips = request.ips;
+    if let Some(response) = routing_rule_validation_response(&candidate) {
+        return response;
+    }
+    let (revision, affected) = {
+        let mut db = state.app.db.write().await;
+        // Отвязанные при пересохранении ничем не отличаются от тех, кому
+        // правило просто изменили содержимое: оба случая требуют нового
+        // решения, поэтому берём объединение «до» и «после».
+        let before = rule_affected_passwords(&db, &id);
+        db.routing_rules.insert(id.clone(), candidate);
 
         for group in db.groups.values_mut() {
             if assigned_groups.contains(&group.id) {
@@ -4356,20 +4612,26 @@ async fn routing_rules_update(
                 db.main_routing_rule_id.clear();
             }
         }
-        state.app.db_persistence.submit(db.clone())
+        let affected = merge_affected_passwords(&before, &rule_affected_passwords(&db, &id));
+        (state.app.db_persistence.submit(db.clone()), affected)
     };
     if let Err(response) = wait_for_persistence(&state, revision).await {
         return response;
     }
+    notify_routing_changed_or_log(&state, &affected).await;
     StatusCode::OK.into_response()
 }
 
 async fn routing_rules_delete(State(state): State<WebState>, Path(id): Path<String>) -> Response {
-    let revision = {
+    let (revision, affected) = {
         let mut db = state.app.db.write().await;
         if db.routing_rules.remove(&id).is_none() {
             return StatusCode::NOT_FOUND.into_response();
         }
+        // Набор снимаем сразу после удаления правила, но до снятия привязок:
+        // ниже эти поля обнуляются, и по «после» было бы не понять, кого
+        // касалось удалённое правило.
+        let affected = rule_affected_passwords(&db, &id);
         for group in db.groups.values_mut() {
             if group.routing_rule_id == id {
                 group.routing_rule_id.clear();
@@ -4383,11 +4645,12 @@ async fn routing_rules_delete(State(state): State<WebState>, Path(id): Path<Stri
         if db.main_routing_rule_id == id {
             db.main_routing_rule_id.clear();
         }
-        state.app.db_persistence.submit(db.clone())
+        (state.app.db_persistence.submit(db.clone()), affected)
     };
     if let Err(response) = wait_for_persistence(&state, revision).await {
         return response;
     }
+    notify_routing_changed_or_log(&state, &affected).await;
     StatusCode::OK.into_response()
 }
 
@@ -5422,13 +5685,18 @@ pub async fn run(
         )
         .route(
             "/api/routing-rules",
-            get(routing_rules_get).post(routing_rules_create),
+            get(routing_rules_get)
+                .post(routing_rules_create)
+                .layer(DefaultBodyLimit::max(ROUTING_RULE_BODY_LIMIT_BYTES)),
         )
         .route(
             "/api/routing-rules/{id}",
-            put(routing_rules_update).delete(routing_rules_delete),
+            put(routing_rules_update)
+                .delete(routing_rules_delete)
+                .layer(DefaultBodyLimit::max(ROUTING_RULE_BODY_LIMIT_BYTES)),
         )
         .route("/api/template-domains", get(template_domains_get))
+        .route("/api/template-ips", get(template_ips_get))
         .route("/api/preset-apps", get(preset_apps_get))
         .route("/api/logs", get(logs_get))
         .route("/api/logs/toggle", post(logs_toggle))
@@ -8372,6 +8640,7 @@ const PANEL_HTML_TEMPLATE: &str = r##"
 
         .toggle-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 16px; padding: 12px; background: var(--bg-color); border-radius: 12px; border: 1px solid var(--border); transition: background 0.3s, border-color 0.3s; }
         .toggle-row label { font-size: 14px; font-weight: 600; color: var(--text-main); margin: 0; text-transform: none; white-space: nowrap; }
+        .input-hint { font-size: 12px; color: var(--text-muted); margin: -8px 0 16px; line-height: 1.5; }
         .vk-hashes-toggle { margin-top: 10px; }
         .switch { position: relative; display: inline-block; width: 44px; height: 24px; }
         .switch input { opacity: 0; width: 0; height: 0; }
@@ -9668,9 +9937,10 @@ const PANEL_HTML_TEMPLATE: &str = r##"
                 <span class="slider"></span>
             </label>
         </div>
+        <div class="input-hint">Вместе с готовым списком RU — до 1024 доменов; правило, которое не влезает в одно событие, сохранить нельзя.</div>
         <div class="input-group">
             <label for="ruleIpMode">Режим исключения адресов</label>
-            <select id="ruleIpMode">
+            <select id="ruleIpMode" onchange="onRuleIpModeChange()">
                 <option value="blacklist">Чёрный список</option>
                 <option value="whitelist">Белый список</option>
             </select>
@@ -9678,6 +9948,19 @@ const PANEL_HTML_TEMPLATE: &str = r##"
         <div class="input-group">
             <label for="ruleIps">Список адресов</label>
             <textarea id="ruleIps" rows="3" style="width: 100%; background: var(--surface); color: var(--text-main); border: 1px solid var(--border); border-radius: 12px; padding: 10px; font-family: monospace; font-size: 12px;" placeholder="1.2.3.4/32&#10;1.2.3.4&#10;1.2.3.4-1.2.3.255"></textarea>
+        </div>
+        <div class="input-hint">До 512 адресов.</div>
+        <div class="toggle-row" id="ruleTemplateIpsRow" style="margin-bottom: 16px;">
+            <div style="display: flex; align-items: center; gap: 8px;">
+                <label for="ruleTemplateIps" style="cursor: pointer;">Готовый список RU адресов</label>
+                <button type="button" class="btn-icon" style="padding: 2px; border: none; background: transparent; cursor: pointer; color: var(--primary); display: flex; align-items: center;" onclick="openTemplateIpsDlg()" title="Посмотреть список RU адресов">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
+                </button>
+            </div>
+            <label class="switch">
+                <input type="checkbox" id="ruleTemplateIps">
+                <span class="slider"></span>
+            </label>
         </div>
         <div class="input-group">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; flex-wrap: wrap; gap: 6px;">
@@ -9712,6 +9995,25 @@ const PANEL_HTML_TEMPLATE: &str = r##"
         <div id="templateDomainsList" style="max-height: 320px; overflow-y: auto; background: var(--bg-color); border: 1px solid var(--border); border-radius: 12px; padding: 12px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; line-height: 1.6; color: var(--text-main);"></div>
         <div class="dlg-actions" style="margin-top: 16px;">
             <button class="btn btn-primary" onclick="document.getElementById('templateDomainsDlg').close()">Понятно</button>
+        </div>
+    </dialog>
+
+    <dialog id="templateIpsDlg" style="max-width: 540px; width: min(540px, calc(100% - 24px)); max-height: 80vh; overflow-y: auto;">
+        <div class="dlg-header">
+            <h2>Список RU адресов</h2>
+            <button class="close-btn" onclick="document.getElementById('templateIpsDlg').close()">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+            </button>
+        </div>
+        <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 10px; line-height: 1.5;">
+            Эти <span id="templateIpsCount"></span> адресов направляются напрямую без VPN при включении функции:
+        </p>
+        <div style="margin-bottom: 10px;">
+            <input id="templateIpsFilter" placeholder="Быстрый поиск по адресам..." style="width: 100%; height: 38px; font-size: 13px; padding: 0 12px;" oninput="filterTemplateIps(this.value)">
+        </div>
+        <div id="templateIpsList" style="max-height: 320px; overflow-y: auto; background: var(--bg-color); border: 1px solid var(--border); border-radius: 12px; padding: 12px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; line-height: 1.6; color: var(--text-main);"></div>
+        <div class="dlg-actions" style="margin-top: 16px;">
+            <button class="btn btn-primary" onclick="document.getElementById('templateIpsDlg').close()">Понятно</button>
         </div>
     </dialog>
 
@@ -10408,15 +10710,30 @@ const PANEL_HTML_TEMPLATE: &str = r##"
                 </div>
                 <div class="api-card-body">
                     <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 8px;">
-                        <code>GET</code> возвращает список настроенных правил обхода. <code>POST</code> создает новое правило с доменами, IP-диапазонами и outbound-действием (прямой выход или прокси):
+                        <code>GET</code> возвращает список правил вместе с <code>id</code> и разрешёнными привязками
+                        (<code>assigned_groups</code>, <code>assigned_clients</code>). <code>POST</code> создаёт правило;
+                        режим приложений, доменов и адресов задаётся независимо. Готовые шаблоны включаются флагами
+                        <code>preset_apps</code>, <code>template_domains</code>, <code>template_ips</code>:
                     </p>
                     <pre class="api-code-block"><code>{
-  "name": "YouTube & Discord",
-  "domains": ["youtube.com", "googlevideo.com", "discord.com"],
-  "ip_ranges": ["162.158.0.0/15"],
-  "action": "proxy", // "direct" или "proxy"
-  "proxy_id": "proxy_uuid_here"
+  "name": "RU + пресет",
+  "mode": "blacklist",                // "blacklist" | "whitelist" (алиас is_whitelist)
+  "packages": ["com.example.app"],    // явные приложения
+  "preset_apps": true,                // готовый пресет приложений
+  "direct_domains": ["example.com"],  // явные домены (алиас domains)
+  "domains_mode": "blacklist",        // режим явных доменов
+  "template_domains": true,           // готовый список RU доменов
+  "ips": ["10.0.0.0/8"],              // явные адреса, не больше 512
+  "ip_mode": "blacklist",             // режим явных адресов
+  "template_ips": true,               // готовый список RU адресов
+  "assigned_groups": ["grp_..."],
+  "assigned_clients": ["client-password"]
 }</code></pre>
+                    <p style="font-size: 12px; color: var(--text-muted);">
+                        Ограничения: явных <code>ips</code> — до 512, объединённых доменов — до 1024,
+                        <code>template_domains</code>/<code>template_ips</code> — только в чёрном режиме.
+                        Событие правила не должно превышать 65 536 байт.
+                    </p>
                 </div>
             </div>
 
@@ -10429,7 +10746,9 @@ const PANEL_HTML_TEMPLATE: &str = r##"
                 </div>
                 <div class="api-card-body">
                     <p style="font-size: 12px; color: var(--text-muted);">
-                        <code>PUT</code> обновляет список доменов и IP правила, <code>DELETE</code> удаляет правило.
+                        <code>PUT</code> заменяет правило целиком — передавайте то же тело, что и в <code>POST</code>
+                        (включая <code>packages</code>, <code>preset_apps</code> и оба шаблонных флага),
+                        <code>DELETE</code> удаляет правило.
                     </p>
                 </div>
             </div>
@@ -10442,8 +10761,44 @@ const PANEL_HTML_TEMPLATE: &str = r##"
                 </div>
                 <div class="api-card-body">
                     <p style="font-size: 12px; color: var(--text-muted);">
-                        Возвращает готовые списки доменов для YouTube, Discord, Instagram, Twitter/X, ChatGPT, Spotify и др.
+                        <code>text/plain</code>, один домен на строку: нормализованный список RU доменов (515 записей;
+                        клиент применяет 513 — однокомпонентные <code>psk</code> и <code>yandex</code> отбрасываются).
+                        Подключается к правилу флагом <code>template_domains: true</code>.
                     </p>
+                </div>
+            </div>
+
+            <div class="api-card">
+                <div class="api-card-header">
+                    <span class="api-method get">GET</span>
+                    <span class="api-path">/api/template-ips</span>
+                    <span class="api-desc">Готовый список RU адресов</span>
+                </div>
+                <div class="api-card-body">
+                    <p style="font-size: 12px; color: var(--text-muted);">
+                        <code>text/plain</code>, один CIDR на строку: нормализованный список RU адресов (6 710 записей),
+                        которые направляются напрямую без VPN. Подключается к правилу флагом
+                        <code>template_ips: true</code> (только чёрный режим адресов).
+                    </p>
+                </div>
+            </div>
+
+            <div class="api-card">
+                <div class="api-card-header">
+                    <span class="api-method get">GET</span>
+                    <span class="api-path">/api/preset-apps</span>
+                    <span class="api-desc">Готовый пресет приложений</span>
+                </div>
+                <div class="api-card-body">
+                    <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 8px;">
+                        JSON с двумя наборами: <code>red</code> — приложения, которые всегда идут мимо туннеля,
+                        <code>orange</code> — по умолчанию мимо, пользователь может вернуть их в туннель.
+                        Подключается к правилу флагом <code>preset_apps: true</code>.
+                    </p>
+                    <pre class="api-code-block"><code>{
+  "red": [{"package": "ru.example.red", "name": "Пример"}],
+  "orange": [{"package": "ru.example.orange", "name": "Пример"}]
+}</code></pre>
                 </div>
             </div>
 
@@ -11726,6 +12081,11 @@ const PANEL_HTML_TEMPLATE: &str = r##"
                 const domainsCount = (rule.domains || []).length;
                 const targetGroups = (rule.target_group_ids || []).length;
                 const targetClients = (rule.target_client_passwords || []).length;
+                const templateParts = [];
+                if (rule.preset_apps) templateParts.push('Приложения');
+                if (rule.template_domains) templateParts.push('Домены');
+                if (rule.template_ips) templateParts.push('Адреса');
+                const templateLabel = templateParts.length ? templateParts.join(' + ') : 'Выкл';
                 return `
                 <div class="rule-card">
                     <div class="rule-card-header">
@@ -11742,7 +12102,7 @@ const PANEL_HTML_TEMPLATE: &str = r##"
                         <span class="rule-chip">Приложений: ${appsCount}</span>
                         <span class="rule-chip">Доменов: ${domainsCount}</span>
                         <span class="rule-chip">Адресов: ${(rule.ips || []).length}</span>
-                        <span class="rule-chip">Шаблоны: ${rule.template_domains ? 'Вкл' : 'Выкл'}</span>
+                        <span class="rule-chip">Шаблоны: ${templateLabel}</span>
                         <span class="rule-chip">Целей: ${targetGroups} групп, ${targetClients} клиентов</span>
                     </div>
                 </div>
@@ -11753,6 +12113,14 @@ const PANEL_HTML_TEMPLATE: &str = r##"
         function onRuleDomainsModeChange() {
             const mode = document.getElementById('ruleDomainsMode').value;
             const row = document.getElementById('ruleTemplateDomainsRow');
+            if (row) {
+                row.style.display = (mode === 'whitelist') ? 'none' : 'flex';
+            }
+        }
+
+        function onRuleIpModeChange() {
+            const mode = document.getElementById('ruleIpMode').value;
+            const row = document.getElementById('ruleTemplateIpsRow');
             if (row) {
                 row.style.display = (mode === 'whitelist') ? 'none' : 'flex';
             }
@@ -11842,6 +12210,8 @@ const PANEL_HTML_TEMPLATE: &str = r##"
             document.getElementById('ruleTemplateDomains').checked = rule ? Boolean(rule.template_domains) : false;
             document.getElementById('rulePresetApps').checked = rule ? Boolean(rule.preset_apps) : true;
             document.getElementById('ruleIpMode').value = rule ? (rule.ip_mode || (rule.ip_is_whitelist ? 'whitelist' : 'blacklist')) : 'blacklist';
+            onRuleIpModeChange();
+            document.getElementById('ruleTemplateIps').checked = rule ? Boolean(rule.template_ips) : false;
             document.getElementById('ruleIps').value = rule && rule.ips ? rule.ips.join('\n') : '';
             document.getElementById('ruleDeleteBtn').style.display = rule ? 'inline-block' : 'none';
 
@@ -11938,6 +12308,7 @@ const PANEL_HTML_TEMPLATE: &str = r##"
             const domains_mode = document.getElementById('ruleDomainsMode').value;
             const template_domains = (domains_mode === 'whitelist') ? false : document.getElementById('ruleTemplateDomains').checked;
             const ip_mode = document.getElementById('ruleIpMode').value;
+            const template_ips = (ip_mode === 'whitelist') ? false : document.getElementById('ruleTemplateIps').checked;
             const rawIps = document.getElementById('ruleIps').value.split(/[\n,]/);
             const ips = [];
             const seenIps = new Set();
@@ -11975,6 +12346,7 @@ const PANEL_HTML_TEMPLATE: &str = r##"
                     preset_apps: document.getElementById('rulePresetApps').checked,
                     ip_mode,
                     ip_is_whitelist: ip_mode === 'whitelist',
+                    template_ips,
                     ips,
                     assigned_groups: target_group_ids,
                     assigned_clients: target_client_passwords
@@ -12319,6 +12691,54 @@ const PANEL_HTML_TEMPLATE: &str = r##"
             }
             const filtered = templateDomainsCache.filter(d => d.toLowerCase().includes(q));
             renderTemplateDomainsList(filtered);
+        }
+
+        let templateIpsCache = null;
+        async function openTemplateIpsDlg() {
+            const listEl = document.getElementById('templateIpsList');
+            const countEl = document.getElementById('templateIpsCount');
+            const filterEl = document.getElementById('templateIpsFilter');
+            if (filterEl) filterEl.value = '';
+            document.getElementById('templateIpsDlg').showModal();
+            if (!templateIpsCache) {
+                listEl.innerHTML = '<div style="color: var(--text-muted); text-align: center; padding: 20px;">Загрузка...</div>';
+                try {
+                    const r = await api('/api/template-ips');
+                    if (r.ok) {
+                        const txt = await r.text();
+                        templateIpsCache = txt.split('\n')
+                            .map(s => s.trim())
+                            .filter(s => s && !s.startsWith('#'));
+                    } else {
+                        templateIpsCache = [];
+                    }
+                } catch(e) {
+                    templateIpsCache = [];
+                }
+            }
+            if (countEl) countEl.textContent = templateIpsCache.length;
+            renderTemplateIpsList(templateIpsCache);
+        }
+
+        function renderTemplateIpsList(list) {
+            const listEl = document.getElementById('templateIpsList');
+            if (!listEl) return;
+            if (!list || list.length === 0) {
+                listEl.innerHTML = '<div style="color: var(--text-muted); text-align: center; padding: 10px;">Ничего не найдено</div>';
+                return;
+            }
+            listEl.innerHTML = list.map(ip => `<div style="padding: 2px 0;">${esc(ip)}</div>`).join('');
+        }
+
+        function filterTemplateIps(value) {
+            if (!templateIpsCache) return;
+            const q = value.trim().toLowerCase();
+            if (!q) {
+                renderTemplateIpsList(templateIpsCache);
+                return;
+            }
+            const filtered = templateIpsCache.filter(ip => ip.toLowerCase().includes(q));
+            renderTemplateIpsList(filtered);
         }
 
         async function deleteRoutingRule(ruleId) {
@@ -13318,12 +13738,226 @@ mod tests {
     use super::{
         CLIENT_SUB_HTML, CreateRoutingRuleRequest, DNS_PROVIDERS, GROUP_ADMIN_HTML, GROUP_SUB_HTML,
         LOGIN_HTML, MAX_CLIENT_NAME_BYTES, PANEL_HTML, PWA_ICON_192_PNG, PWA_ICON_512_PNG,
-        PWA_MANIFEST, PWA_SERVICE_WORKER, THEME_TOKENS, count_active_sessions, decrypt_csqtt_link,
-        deploy_dns_profile_or_yandex, dns_provider_by_id, dns_provider_id, encrypt_csqtt_link,
-        make_client_link, manual_dns, normalize_client_vk_hashes, normalize_vk_access_token,
-        process_memory, process_memory_rollup, provider_dns, validate_client_name,
+        PWA_MANIFEST, PWA_SERVICE_WORKER, THEME_TOKENS, batch_group_affected_passwords,
+        count_active_sessions, decrypt_csqtt_link, deploy_dns_profile_or_yandex,
+        dns_provider_by_id, dns_provider_id, encrypt_csqtt_link, group_affected_passwords,
+        make_client_link, manual_dns, merge_affected_passwords, normalize_client_vk_hashes,
+        normalize_vk_access_token, process_memory, process_memory_rollup, provider_dns,
+        routing_rule_validation_response, rule_affected_passwords, validate_client_name,
         validate_proxy_profile_name, validate_workers,
     };
+
+    /// База с одним правилом `rule_1`, прямым клиентом, группой и main.
+    fn affected_fixture() -> crate::model::Database {
+        let mut db = crate::model::Database {
+            main_password: "main-pass".to_owned(),
+            ..Default::default()
+        };
+        db.passwords.insert(
+            "direct-pass".to_owned(),
+            crate::model::PasswordEntry {
+                routing_rule_id: "rule_1".to_owned(),
+                ..Default::default()
+            },
+        );
+        db.passwords.insert(
+            "group-pass".to_owned(),
+            crate::model::PasswordEntry {
+                group_id: "g1".to_owned(),
+                ..Default::default()
+            },
+        );
+        db.passwords.insert(
+            "overridden-pass".to_owned(),
+            crate::model::PasswordEntry {
+                group_id: "g1".to_owned(),
+                // Собственное правило важнее группового: этого клиента
+                // `rule_1` не касается, даже если его группу привязали к нему.
+                routing_rule_id: "rule_2".to_owned(),
+                ..Default::default()
+            },
+        );
+        db.groups.insert(
+            "g1".to_owned(),
+            crate::model::ClientGroup {
+                id: "g1".to_owned(),
+                routing_rule_id: "rule_1".to_owned(),
+                ..Default::default()
+            },
+        );
+        db
+    }
+
+    #[test]
+    fn rule_affected_passwords_covers_direct_clients_and_group_members() {
+        let affected = rule_affected_passwords(&affected_fixture(), "rule_1");
+        assert_eq!(
+            affected,
+            vec!["direct-pass".to_owned(), "group-pass".to_owned()],
+            "прямые владельцы правила и члены привязанной группы без собственного правила"
+        );
+        assert!(
+            !affected.contains(&"overridden-pass".to_owned()),
+            "клиент с собственным правилом не зависит от групповой привязки"
+        );
+        assert!(
+            !affected.contains(&"main-pass".to_owned()),
+            "main привязывается отдельно и не попадает в набор по умолчанию"
+        );
+    }
+
+    #[test]
+    fn rule_affected_passwords_includes_main_only_for_its_own_binding() {
+        let mut db = affected_fixture();
+        db.main_routing_rule_id = "rule_1".to_owned();
+        let affected = rule_affected_passwords(&db, "rule_1");
+        assert!(affected.contains(&"main-pass".to_owned()));
+        // Другое правило main не имеет отношения к затронутым.
+        assert_eq!(
+            rule_affected_passwords(&db, "rule_2"),
+            vec!["overridden-pass".to_owned()]
+        );
+    }
+
+    #[test]
+    fn rule_affected_passwords_ignores_empty_rule_id() {
+        // Отвязка «на ничего» никого не зовёт на GETCONF: пустой идентификатор
+        // правила — не сигнал изменения.
+        assert!(rule_affected_passwords(&affected_fixture(), "").is_empty());
+    }
+
+    #[test]
+    fn group_affected_passwords_covers_members_and_skips_clients_with_own_rule() {
+        // Группа g1 привязана к rule_1: участников касается, клиента с
+        // собственным rule_2 — нет (его групповое правило не пересекает).
+        assert_eq!(
+            group_affected_passwords(&affected_fixture(), "g1"),
+            vec!["group-pass".to_owned()]
+        );
+        // Незнакомая группа — пустой набор, а не паника.
+        assert!(group_affected_passwords(&affected_fixture(), "nope").is_empty());
+    }
+
+    #[test]
+    fn group_affected_passwords_never_includes_main() {
+        let mut db = affected_fixture();
+        // Даже при совпадении с правилом группы main резолвится только через
+        // `main_routing_rule_id` и на членство в группе не опирается.
+        db.main_routing_rule_id = "rule_1".to_owned();
+        assert_eq!(
+            group_affected_passwords(&db, "g1"),
+            vec!["group-pass".to_owned()]
+        );
+        db.main_routing_rule_id = "rule_other".to_owned();
+        assert_eq!(
+            group_affected_passwords(&db, "g1"),
+            vec!["group-pass".to_owned()]
+        );
+    }
+
+    /// Union «до/после» сохраняет участника и после снятия правила с группы:
+    /// набор строится по членству, поэтому участник остаётся в обеих частях.
+    #[test]
+    fn group_rebinding_keeps_the_member_in_the_union() {
+        let mut db = affected_fixture();
+        db.main_routing_rule_id = "rule_1".to_owned();
+        let before = group_affected_passwords(&db, "g1");
+        assert_eq!(before, vec!["group-pass".to_owned()]);
+
+        db.groups
+            .get_mut("g1")
+            .expect("группа из фикстуры")
+            .routing_rule_id
+            .clear();
+        let after = group_affected_passwords(&db, "g1");
+        assert_eq!(after, vec!["group-pass".to_owned()]);
+
+        let merged = merge_affected_passwords(&before, &after);
+        assert_eq!(
+            merged,
+            vec!["group-pass".to_owned()],
+            "main не наследует группу и в набор не попадает"
+        );
+    }
+
+    #[test]
+    fn merge_affected_passwords_is_deduped_and_ordered() {
+        let before = vec!["b".to_owned(), "a".to_owned()];
+        let after = vec!["a".to_owned(), "c".to_owned()];
+        assert_eq!(
+            merge_affected_passwords(&before, &after),
+            vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]
+        );
+        assert!(merge_affected_passwords(&[], &[]).is_empty());
+        assert_eq!(
+            merge_affected_passwords(&["a".to_owned()], &["a".to_owned()]),
+            vec!["a".to_owned()]
+        );
+    }
+
+    #[test]
+    fn batch_group_affected_passwords_notifies_only_moved_clients_without_own_rule() {
+        let mut db = affected_fixture();
+        db.passwords.insert(
+            "b-pass".to_owned(),
+            crate::model::PasswordEntry {
+                group_id: "g1".to_owned(),
+                ..Default::default()
+            },
+        );
+        let moved = vec![
+            "group-pass".to_owned(),
+            "overridden-pass".to_owned(),
+            "direct-pass".to_owned(),
+            "b-pass".to_owned(),
+        ];
+        assert_eq!(
+            batch_group_affected_passwords(&db, &moved, "g2"),
+            vec!["b-pass".to_owned(), "group-pass".to_owned()],
+            "клиенты с собственным правилом от группы не зависят; будим только тех, кто без него"
+        );
+    }
+
+    #[test]
+    fn batch_group_affected_passwords_skips_same_group_but_unbind_notifies() {
+        let db = affected_fixture();
+        // Перевод в ту же группу ничего не меняет.
+        assert!(batch_group_affected_passwords(&db, &["group-pass".to_owned()], "g1").is_empty());
+        // Снятие с группы (пустая цель) меняет разрешённое правило участника.
+        assert_eq!(
+            batch_group_affected_passwords(&db, &["group-pass".to_owned()], ""),
+            vec!["group-pass".to_owned()]
+        );
+    }
+
+    #[test]
+    fn batch_group_affected_passwords_dedups_and_skips_unknown_or_empty() {
+        let db = affected_fixture();
+        let moved = vec![
+            "group-pass".to_owned(),
+            "group-pass".to_owned(),
+            "nonexistent".to_owned(),
+            String::new(),
+        ];
+        assert_eq!(
+            batch_group_affected_passwords(&db, &moved, "g2"),
+            vec!["group-pass".to_owned()]
+        );
+        assert!(batch_group_affected_passwords(&db, &[], "g2").is_empty());
+    }
+
+    #[test]
+    fn undeliverable_rule_is_rejected_with_400() {
+        let mut rule = crate::model::RoutingRule {
+            id: "r1".to_owned(),
+            ..Default::default()
+        };
+        rule.ips = (0..513)
+            .map(|i| format!("10.0.{}.{}/32", (i / 256) % 256, i % 256))
+            .collect();
+        let response = routing_rule_validation_response(&rule).expect("rule must be rejected");
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
 
     #[test]
     fn dns_provider_catalog_is_complete_and_has_exact_yandex_default() {
@@ -13454,6 +14088,37 @@ mod tests {
         assert!(PANEL_HTML.contains("text-size-adjust: none"));
         assert!(PANEL_HTML.contains(".toggle-row label"));
         assert!(PANEL_HTML.contains("white-space: nowrap"));
+    }
+
+    #[test]
+    fn routing_rule_dialog_reads_mode_then_list_then_hint_then_template_in_both_blocks() {
+        let html = PANEL_HTML.as_str();
+        let expected_order = [
+            "id=\"ruleDomainsMode\"",
+            "id=\"ruleDomains\"",
+            "id=\"ruleTemplateDomainsRow\"",
+            "Вместе с готовым списком RU — до 1024 доменов;",
+            "id=\"ruleIpMode\"",
+            "id=\"ruleIps\"",
+            "До 512 адресов.",
+            "id=\"ruleTemplateIpsRow\"",
+            "Применить правило к:",
+        ];
+        let mut previous = 0usize;
+        for marker in expected_order {
+            let at = html
+                .find(marker)
+                .unwrap_or_else(|| panic!("в разметке панели нет маркера {marker}"));
+            assert!(
+                at > previous,
+                "маркер {marker} стоит раньше предыдущего блока разметки"
+            );
+            previous = at;
+        }
+        assert!(
+            !html.contains("До 512 адресов;"),
+            "единый хинт про лимиты должен быть разбит на доменный и адресный"
+        );
     }
 
     #[test]
@@ -13781,6 +14446,33 @@ mod tests {
                     "{name} still contains hardcoded {hardcoded}"
                 );
             }
+        }
+    }
+
+    /// Карточка правила обязана показывать включённый пресет приложений:
+    /// раньше «Шаблоны:» строились только из доменов и адресов.
+    #[test]
+    fn routing_rule_card_shows_the_app_preset() {
+        assert!(PANEL_HTML.contains("if (rule.preset_apps) templateParts.push('Приложения');"));
+        assert!(PANEL_HTML.contains("Шаблоны: ${templateLabel}"));
+    }
+
+    /// Справочник API обязан документировать все три готовых списка, а не
+    /// только адреса: домены и пресет приложений — такие же части правила.
+    #[test]
+    fn api_reference_mentions_domains_ips_and_apps_templates() {
+        for path in [
+            "/api/template-domains",
+            "/api/template-ips",
+            "/api/preset-apps",
+        ] {
+            assert!(PANEL_HTML.contains(path), "API reference misses {path}");
+        }
+        for field in ["preset_apps", "template_domains", "template_ips"] {
+            assert!(
+                PANEL_HTML.contains(field),
+                "API reference misses the {field} flag"
+            );
         }
     }
 }

@@ -181,10 +181,12 @@ build_input_files() {
         rust-server/Cargo.lock \
         rust-server/rust-toolchain.toml \
         rust-server/ru_apps_preset.json \
-        app/src/main/assets/domains.txt \
+        rust-server/data/domains_ru.txt \
+        rust-server/data/ips_ru.txt \
         scripts/server_asset_provenance.sh
 
     find "$ROOT/rust-server" -maxdepth 1 -type f -name '*.rs' -printf 'rust-server/%P\n'
+    find "$ROOT/rust-server/data" -maxdepth 1 -type f -name '*.txt' -printf 'rust-server/data/%P\n'
     find "$ROOT/shared" -maxdepth 1 -type f -name '*.rs' -printf 'shared/%P\n'
 
     # Cargo config files, same reasoning as on the client side: they set the build

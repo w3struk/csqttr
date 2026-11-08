@@ -115,6 +115,8 @@ pub struct RuntimeParams {
     pub password: Arc<str>,
     pub workers: Arc<AtomicUsize>,
     pub configured_workers: usize,
+    pub routing_ips_sha: Option<Arc<str>>,
+    pub routing_content_sha_file: Option<std::path::PathBuf>,
 }
 
 pub struct GroupContext {
@@ -852,6 +854,8 @@ async fn worker_loop(
             repair: context.repair.clone(),
             turn_endpoint_cursor,
             configured_workers: context.params.configured_workers,
+            routing_ips_sha: context.params.routing_ips_sha.clone(),
+            routing_content_sha_file: context.params.routing_content_sha_file.clone(),
         };
         let (ready_tx, mut ready_rx) = oneshot::channel();
         let (allocation_started_tx, mut allocation_started_rx) = oneshot::channel();

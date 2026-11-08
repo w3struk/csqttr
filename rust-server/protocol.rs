@@ -15,6 +15,7 @@ use ctr::cipher::{InnerIvInit, KeyInit, StreamCipher};
 use hmac::{Hmac, Mac};
 use rand::{Rng, RngCore, SeedableRng, rngs::OsRng, rngs::SmallRng};
 use sha1::Sha1;
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -49,6 +50,19 @@ const DIAGNOSTIC_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const DIAGNOSTIC_LEASE: Duration = Duration::from_secs(5 * 60);
 const SESSION_LEASE: &[u8] = b"\xffCSQTT_LEASE";
 pub const PANEL_RESTART_NOTICE: &[u8] = b"\xffCSQTT_PANEL_RESTART_V1\x00\x91\x7d\x03\xa8";
+/// «Правило маршрутизации изменилось» — push-сигнал живым сессиям.
+///
+/// Без него решение о маршрутизации вообще существует только как ответ на
+/// `GETCONF`, который клиент отправляет при старте коннекта: правка или отвязка
+/// правила в панели до живого туннеля не доходила, и ветка
+/// `RELOAD_ROUTING reason=routing_cleared` в приложении была недостижима.
+///
+/// Форма — как у `PANEL_RESTART_NOTICE`: `\xff` + имя + `\x00` + четыре
+/// уникальных magic-байта. Старый клиент не знает этот бинарь и молча
+/// отбрасывает его как не-IP пакет, поэтому сигнал безопасен для смешанных
+/// версий; деградация односторонняя — новый клиент со старым сервером просто
+/// никогда его не получает и живёт по-прежнему, только на `GETCONF`.
+pub const ROUTING_CHANGED_NOTICE: &[u8] = b"\xffCSQTT_ROUTING_CHANGED_V1\x00\x5c\x2a\xef\x19";
 const STREAM_REPAIR_PREFIX: &[u8] = b"\xffCSQTT_STREAM_REPAIR_V1";
 const STREAM_ALIVE_PREFIX: &[u8] = b"\xffCSQTT_STREAM_ALIVE_V1";
 pub(crate) const MAX_STREAM_WORKERS: usize = 100;
@@ -153,6 +167,7 @@ fn is_dpi_control(plain: &[u8]) -> bool {
     plain.starts_with(b"GETCONF:")
         || plain.starts_with(b"TUNCONF:")
         || plain.starts_with(b"ROUTING:")
+        || plain.starts_with(b"ROUTING2:")
         || plain.starts_with(b"WORKERS:")
         || plain.starts_with(b"GETWORKERS:")
         || plain.starts_with(b"TUNWORKERS:")
@@ -245,6 +260,7 @@ pub fn record_packet_dpi(
         b"GETCONF:".as_slice(),
         b"TUNCONF:".as_slice(),
         b"ROUTING:".as_slice(),
+        b"ROUTING2:".as_slice(),
         b"WORKERS:".as_slice(),
         b"GETWORKERS:".as_slice(),
         b"TUNWORKERS:".as_slice(),
@@ -629,6 +645,63 @@ impl PasswordEpochSlot {
 pub struct PasswordEpochState {
     generation_id: u64,
     session_salt: String,
+    /// Какая сессия-владелец и когда получала чанкованное решение
+    /// (`None` — ещё не уезжало). Гасит только повтор её же `GETCONF` внутри
+    /// окна дубля. Живёт вместе с epoch-слотом, поэтому свипер чистит его
+    /// автоматически.
+    owner_routing_delivered: Option<RoutingDeliveryMark>,
+    /// Поколение, которому решение воркеру без метки `owner` уже отдали
+    /// (`None` — ни одному). Строгое «один раз на поколение», без времени:
+    /// отметка независима от доставки владельцу, чтобы config-owner не мог
+    /// лишать legacy-клиент его единственного решения.
+    worker_delivered_generation: Option<u64>,
+}
+
+/// Отметка о доставке чанкованного решения `ROUTING` config-owner'у за
+/// текущее поколение.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RoutingDeliveryMark {
+    generation_id: u64,
+    /// Сессия, получившая решение как config-owner: подавляется только повтор
+    /// той же сессии, чужая доставка владельца правила не лишает.
+    session_id: u64,
+    /// Монотонный момент доставки: нужен только для окна подавления дубля
+    /// `GETCONF`, строгая отметка поколения от него не зависит.
+    delivered_at: std::time::Instant,
+}
+
+/// Сколько секунд повторный `GETCONF` той же сессии не получает чанкованное
+/// правило.
+///
+/// Клиент намеренно дублирует `GETCONF` (`send_bytes_duplicate`), и обе копии
+/// доходят до сервера подряд — без подавления на один коннект уезжают две
+/// последовательности `ROUTING`, а хвост второй ломает `RoutingReassembler`
+/// (ложный фатальный `routing_payload_incomplete`).
+///
+/// Окно касается только чанков: `ROUTING:ABSENT` уходит на каждый запрос
+/// config-owner'а (`routing_delivery_decision`).
+///
+/// 1 с выбрана потому, что она одновременно:
+/// - много больше микросекундного разрыва между двумя копиями одного дубля —
+///   обе склеиваются в одну доставку;
+/// - много меньше клиентского повторного `GETCONF` при незавершённой сборке
+///   (`REASSEMBLY_TIMEOUT` 3 с + тик watchdog 500 мс ≈ 3.5 с) — легальная
+///   потеря чанка по-прежнему получает новую доставку, а не отказ.
+const ROUTING_DUPLICATE_DELIVERY_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Кто просит решение о маршрутизации.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoutingRequester {
+    /// config-owner — единственный, кто применяет правило и шлёт событие в
+    /// приложение. Повтор его же `GETCONF` подавляется только внутри окна
+    /// дубля и только для чанкованного правила, чтобы не потерять легальный
+    /// retry потерянного чанка. Отметка воркера на него не влияет.
+    ConfigOwner { session_id: u64 },
+    /// Воркер без метки `owner` (в том числе старый клиент): решение ему
+    /// отдаётся строго один раз на поколение — рассылка каждому воркеру
+    /// переполняет очередь UDP-TX. Отметка для этого независима от доставки
+    /// config-owner'у.
+    Worker,
 }
 
 impl PasswordEpochState {
@@ -636,6 +709,8 @@ impl PasswordEpochState {
         Self {
             generation_id,
             session_salt,
+            owner_routing_delivered: None,
+            worker_delivered_generation: None,
         }
     }
 
@@ -643,10 +718,83 @@ impl PasswordEpochState {
         if generation_id != self.generation_id || session_salt != self.session_salt {
             self.generation_id = generation_id;
             self.session_salt = session_salt.to_owned();
+            self.owner_routing_delivered = None;
+            self.worker_delivered_generation = None;
             PasswordEpochDecision::Replaced
         } else {
             PasswordEpochDecision::Current
         }
+    }
+
+    /// Берёт ли этот запрос доставку чанкованного решения о маршрутизации.
+    ///
+    /// Две независимые отметки, и смешивать их нельзя:
+    /// - config-owner получает решение в каждом своём запросе, кроме повтора
+    ///   той же сессии в окне дубля `GETCONF`
+    ///   (см. `ROUTING_DUPLICATE_DELIVERY_WINDOW`);
+    /// - воркер без метки `owner` — строго один раз на поколение, независимо
+    ///   от того, успел ли получить решение config-owner того же поколения.
+    ///
+    /// Обе отметки живут вместе с поколением: `admit` при смене
+    /// `generation`/`salt` сбрасывает их, и доставка разрешается заново.
+    ///
+    /// Отказ здесь гасит только чанкованное правило: `ROUTING:ABSENT`
+    /// доставляется независимо от ответа (см. `routing_delivery_decision`).
+    fn claim_routing_delivery(&mut self, generation_id: u64, requester: RoutingRequester) -> bool {
+        self.claim_routing_delivery_at(generation_id, requester, std::time::Instant::now())
+    }
+
+    fn claim_routing_delivery_at(
+        &mut self,
+        generation_id: u64,
+        requester: RoutingRequester,
+        now: std::time::Instant,
+    ) -> bool {
+        match requester {
+            // Подавляется только повтор этой же сессии внутри окна дубля:
+            // чужая доставка (другой воркер, другое подключение) не имеет
+            // права лишать config-owner правила.
+            RoutingRequester::ConfigOwner { session_id } => {
+                let duplicate = self.owner_routing_delivered.is_some_and(|mark| {
+                    mark.generation_id == generation_id
+                        && mark.session_id == session_id
+                        && now
+                            .checked_duration_since(mark.delivered_at)
+                            .is_some_and(|elapsed| elapsed < ROUTING_DUPLICATE_DELIVERY_WINDOW)
+                });
+                if duplicate {
+                    return false;
+                }
+                self.owner_routing_delivered = Some(RoutingDeliveryMark {
+                    generation_id,
+                    session_id,
+                    delivered_at: now,
+                });
+                true
+            }
+            // Клиент без метки `owner`: одно решение на поколение, отметка не
+            // «протухает» и не зависит от того, что получил владелец.
+            RoutingRequester::Worker => {
+                if self.worker_delivered_generation == Some(generation_id) {
+                    return false;
+                }
+                self.worker_delivered_generation = Some(generation_id);
+                true
+            }
+        }
+    }
+
+    /// Сбросить отметку доставки чанкованного правила config-owner'у, ничего
+    /// не отправляя.
+    ///
+    /// Нужно для push-сигнала «правило изменилось»: без сброса немедленный
+    /// `GETCONF` на живом туннеле попал бы в окно подавления дубля (1 с) и
+    /// остался бы без ответа — клиент получил бы `TUNCONF`, но не новое
+    /// правило. Отметку воркера (`worker_delivered_generation`) не трогаем:
+    /// строгое «одно решение на поколение» для legacy-клиента — его собственный
+    /// инвариант, а не защита от дублей.
+    fn invalidate_owner_routing_delivery(&mut self) {
+        self.owner_routing_delivered = None;
     }
 
     fn matches(&self, generation_id: u64, session_salt: &str) -> bool {
@@ -1686,6 +1834,95 @@ pub fn notify_panel_restart(app: &Arc<App>) -> Result<()> {
             payload: PANEL_RESTART_NOTICE.to_vec(),
         },
     )
+}
+
+/// Забыть отметку доставки правила владельцу по паролю.
+///
+/// Вызывается перед `notify_routing_changed`, чтобы немедленный `GETCONF` на
+/// живом туннеле не был подавлен окном дубля. Отсутствующий слот — не ошибка:
+/// туннела по этому паролю нет, сбрасывать нечего.
+pub async fn invalidate_routing_delivery(app: &Arc<App>, password: &str) {
+    if password.is_empty() {
+        return;
+    }
+    // Ref DashMap живёт только до `.clone()`: держать его через `.await`
+    // нельзя, иначе блокировка шарда переживает снятие блокировки epoch.
+    let Some(slot) = app
+        .password_epochs
+        .get(password)
+        .map(|entry| entry.value().clone())
+    else {
+        return;
+    };
+    slot.epoch.lock().await.invalidate_owner_routing_delivery();
+}
+
+/// Сообщение «правило изменилось» живым сессиям затронутых паролей.
+///
+/// В отличие от `notify_panel_restart` рассылка адресная: `BroadcastPlain`
+/// ударил бы по всем подключениям, включая тех, чьё правило не менялось, а
+/// повторный `GETCONF` для них означает полную переоткачку blob'а.
+///
+/// `Ok(())`, если слать некому: пустой набор, пустые пароли или нет ни одной
+/// живой сессии — нормальный исход (например, правка правила, когда клиент
+/// вообще не подключён).
+pub async fn notify_routing_changed(app: &Arc<App>, passwords: &[String]) -> Result<()> {
+    let wanted: HashSet<&str> = passwords
+        .iter()
+        .map(String::as_str)
+        .filter(|password| !password.is_empty())
+        .collect();
+    if wanted.is_empty() {
+        return Ok(());
+    }
+    for password in &wanted {
+        invalidate_routing_delivery(app, password).await;
+    }
+    // Дедуп по id сессии: у одного пароля их несколько (воркеры), а `passwords`
+    // может пересекаться (main входит и в список клиентов).
+    let mut targets: Vec<u64> = Vec::new();
+    let mut seen = HashSet::new();
+    for entry in app.sessions.iter() {
+        let session = entry.value();
+        if wanted.contains(session.password.as_str()) && seen.insert(session.id) {
+            targets.push(session.id);
+        }
+    }
+    let mut failures = 0usize;
+    for session_id in &targets {
+        if command(
+            app,
+            ProtocolCommand::SendPlain {
+                session_id: *session_id,
+                payload: ROUTING_CHANGED_NOTICE.to_vec(),
+            },
+        )
+        .is_err()
+        {
+            failures += 1;
+        }
+    }
+    // Отдельный отказ — не ошибка: часть сессий могла умереть между снимком и
+    // отправкой. Проблемой считаем только случай, когда не поставился НИ ОДИН
+    // сигнал — это признак неработающего датаплейна, а не гонки.
+    if failures > 0 && failures == targets.len() {
+        bail!("routing change notice was not queued for any of {failures} session(s)");
+    }
+    // Частичный отказ не ошибка ответа, но должен оставлять след: сессия, чья
+    // очередь не приняла notice, останется со старым правилом до следующего
+    // сохранения/переподключения.
+    if failures > 0 {
+        log_event(
+            app,
+            "WARN",
+            "routing",
+            &format!(
+                "routing_changed_notice partial: {failures}/{} session(s) not queued",
+                targets.len()
+            ),
+        );
+    }
+    Ok(())
 }
 
 pub async fn compact_memory(app: &Arc<App>) -> Result<bool> {
@@ -3977,6 +4214,7 @@ fn should_flush_udp_immediately(payload: &[u8]) -> bool {
     payload.starts_with(b"GETCONF:")
         || payload.starts_with(b"TUNCONF:")
         || payload.starts_with(b"ROUTING:")
+        || payload.starts_with(b"ROUTING2:")
         || payload.starts_with(b"WORKERS:")
         || payload.starts_with(b"GETWORKERS:")
         || payload.starts_with(b"TUNWORKERS:")
@@ -3987,6 +4225,7 @@ fn should_flush_udp_immediately(payload: &[u8]) -> bool {
         || payload == b"READY"
         || payload == b"READY_OK"
         || payload == PANEL_RESTART_NOTICE
+        || payload == ROUTING_CHANGED_NOTICE
 }
 
 fn session_is_retired_by_epoch(
@@ -4633,31 +4872,345 @@ fn purge_replaced_worker_sessions(
     }
 }
 
-fn routing_rule_json(rule: &crate::model::RoutingRule) -> serde_json::Value {
-    serde_json::json!({
+/// Маркер «у этого подключения правила маршрутизации нет».
+///
+/// Один `ROUTING:`-префикс с рессемблером: старый клиент видит обычный
+/// `ROUTING:`-пакет, `RoutingReassembler::feed` его не разбирает и молча
+/// отбрасывает, поэтому маркер безопасен для смешанных версий. Новый клиент
+/// распознаёт его до рессемблера и шлёт в приложение `ROUTING_ABSENT`, по
+/// которому приложение очищает ранее полученное правило.
+///
+/// Без маркера отсутствие правила неотличимо от «в конфиге правила нет»:
+/// после отвязки правила оператором приложение держало бы старый whitelist.
+pub const ROUTING_ABSENT: &[u8] = b"ROUTING:ABSENT";
+
+/// Просит ли этот GETCONF решение о маршрутизации.
+///
+/// Решение нужно только config-owner'у: событие `CONFIG` в приложение шлёт
+/// именно он, и план VPN собирается из его ответа. Рассылка правила каждому
+/// воркеру давала шесть приоритетных пакетов на каждый `GETCONF`: при 80–100
+/// воркерах очередь UDP-TX (1024 слота) переполнялась, `TUNCONF` не доходил,
+/// клиент повторял запрос с первым таймаутом 400 мс — лавина.
+///
+/// Поле `owner` стоит седьмым: старый сервер его игнорирует, а клиент без
+/// поля получает прежнюю доставку — один раз на поколение.
+fn getconf_requests_routing(parts: &[&str]) -> bool {
+    parts
+        .get(2)
+        .and_then(|value| parse_generation_id(value.trim()))
+        .is_some()
+        && parts.get(6).is_some_and(|value| value.trim() == "owner")
+}
+
+// Обе доставки живут в epoch-слоте (`PasswordEpochState::claim_routing_delivery`),
+// но у каждой — своя отметка: клиент без метки `owner` — строго одно решение на
+// поколение (`worker_delivered_generation`), config-owner — в каждом своём
+// запросе, кроме повтора той же сессии внутри окна дубля `GETCONF`
+// (`owner_routing_delivered`, `ROUTING_DUPLICATE_DELIVERY_WINDOW`). Отметки не
+// пересекаются: доставка владельцу не съедает слот воркера и наоборот. Обе
+// сбрасывает `admit` при смене `generation`/`salt`.
+// Окно подавления относится только к чанкованному правилу — см.
+// `routing_delivery_decision`.
+
+/// Что уезжает на этот `GETCONF`: чанкованное правило, маркер его отсутствия
+/// или ничего.
+///
+/// Ветки намеренно имеют РАЗНУЮ реакцию на окно подавления дубля, и это надо
+/// читать вместе с `claim_routing_delivery`:
+///
+/// - `chunks` — единственная ветка, которую окно вообще защищает: клиент
+///   дублирует `GETCONF`, и две последовательности `ROUTING:i:N` подряд
+///   сбивали `RoutingReassembler` и роняли туннель ложным
+///   `routing_payload_incomplete`.
+/// - `absent` — под подавление попадать НЕ должна. `ROUTING:ABSENT` — одиночный
+///   датаграмм: клиент распознаёт его до рессемблера, он не чанкуется, не
+///   подтверждается и не порождает клиентский повтор `GETCONF` (повтор
+///   вызывается только незавершённой сборкой чанков). Его потеря значит, что
+///   приложение не узнает об отвязке правила и продолжит применять снятый
+///   whitelist молча, без единого события — ровно тот тихий fail-open, ради
+///   которого маркер и вводился. Повтор маркера безвреден: он идемпотентен и
+///   на клиенте, и в приложении.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RoutingDeliveryDecision {
+    /// Шлём `ROUTING:START` → чанки → `ROUTING:FINISH`.
+    chunks: bool,
+    /// Шлём одиночный `ROUTING:ABSENT`.
+    absent: bool,
+}
+
+/// Развязка: `claimed` — ответ окна подавления (`claim_routing_delivery`),
+/// `config_owner` — метка `owner` в запросе, `has_rule` — есть ли правило у
+/// этих учётных данных.
+fn routing_delivery_decision(
+    config_owner: bool,
+    has_rule: bool,
+    claimed: bool,
+) -> RoutingDeliveryDecision {
+    RoutingDeliveryDecision {
+        chunks: claimed && has_rule,
+        // Отсутствие правила сообщается на каждый запрос владельца — окно
+        // подавления дубля его не трогает.
+        absent: config_owner && !has_rule,
+    }
+}
+
+/// Готовые строки доставки чанкованного правила: `START`, каждый чанк ОДИН раз,
+/// `FINISH`. Построение вынесено из async-цикла, чтобы форма доставки была
+/// юнит-тестируемой, а цикл только писал то, что ему дали.
+///
+/// Про дублирование чанков (было в `3e7ed70`, отменено). Идея была в том, чтобы
+/// вернуть избыточность на уровень чанка: клиентский рессемблер дедуплицирует по
+/// `seq`, так что вторая копия не плодит событие. На живом стенде это не
+/// помогло: при 16 слотах входящего SPSC-кольца (`rust-client/turn.rs`) холодная
+/// доставка теряла ~50 датаграмм из ~104 (`queue_drops=52`, `pool_drops=0`),
+/// потому что обе копии одного чанка попадают в одно и то же окно переполнения и
+/// дропаются вместе. Надёжность теперь даёт кольцо приёмника (256 слотов) плюс
+/// retry-политика клиента, поэтому вторая копия осталась бы чистым удвоением
+/// бурста — и удвоением приоритетной нагрузки на UDP-TX.
+///
+/// Если кольцо приёмника снова окажется узким местом, лечить его, а не число
+/// копий: при том же переполнении дублирование не помогает ни при какой доле
+/// потерь.
+#[cfg(test)]
+fn routing_delivery_lines(encoded: &str, chunk_size: usize) -> Vec<String> {
+    routing_delivery_lines_with_nonce(encoded, chunk_size, None)
+}
+
+/// Строки доставки правила. `delivery_nonce: Some` — формат `ROUTING2:` с
+/// идентификатором доставки, который клиент обязан повторить во всех чанках;
+/// без него — прежний `ROUTING:` для старых клиентов.
+///
+/// Идентификатор закрывает остаточный риск: при потере `START` новая доставка
+/// с тем же числом чанков больше не может быть принята за хвост старой —
+/// чанки с чужим nonce отбрасываются, а не смешиваются.
+fn routing_delivery_lines_with_nonce(
+    encoded: &str,
+    chunk_size: usize,
+    delivery_nonce: Option<u64>,
+) -> Vec<String> {
+    let total_chunks = encoded.len().div_ceil(chunk_size);
+    let total_chunks = if total_chunks == 0 { 1 } else { total_chunks };
+    let mut lines = Vec::with_capacity(total_chunks + 2);
+    let nonce = delivery_nonce.map(|value| format!("{value:016x}"));
+    match &nonce {
+        Some(nonce) => lines.push(format!("ROUTING2:START:{nonce}:{total_chunks}")),
+        None => lines.push(format!("ROUTING:START:{total_chunks}")),
+    }
+    for i in 1..=total_chunks {
+        let start = (i - 1) * chunk_size;
+        let end = std::cmp::min(i * chunk_size, encoded.len());
+        let chunk = if start < encoded.len() {
+            &encoded[start..end]
+        } else {
+            ""
+        };
+        match &nonce {
+            Some(nonce) => lines.push(format!("ROUTING2:{nonce}:{i}:{total_chunks}:{chunk}")),
+            None => lines.push(format!("ROUTING:{i}:{total_chunks}:{chunk}")),
+        }
+    }
+    match &nonce {
+        Some(nonce) => lines.push(format!("ROUTING2:FINISH:{nonce}:{total_chunks}")),
+        None => lines.push(format!("ROUTING:FINISH:{total_chunks}")),
+    }
+    lines
+}
+
+/// Сколько строк доставки уходит залпом перед паузой.
+///
+/// Замер холодного старта на устройстве после расширения кольца приёмника:
+/// `queue_full_drops`/`pool_deficit_drops` = 0, но сокет терял
+/// `RcvbufErrors=588`, а 3 из 10 стартов не добирали 2–7 чанков из 51. Причина
+/// — залп: `routing_delivery_lines` даёт ≤ 137 (в поле ~53) подряд идущих
+/// приоритетных датаграмм, и очередь приёма сокета не успевает опустошаться.
+/// Вероятность потери из-за всплеска обратно пропорциональна длине очереди на
+/// bottleneck, поэтому доставку разносят по времени вместо слепого
+/// дублирования — `DEEP_RESEARCH_ingress_ring_capacity.md`, раздел про pacing
+/// (и рекомендация там же: порции по 8–16 пакетов с паузой 1–2 мс).
+const ROUTING_DELIVERY_BATCH: usize = 16;
+/// Пауза между порциями. 1 мс на доставку из 53 строк даёт ~3 паузы (≈3–4 мс
+/// сверх самой отправки) — незаметно для пользователя, но достаточно, чтобы
+/// приёмник успел сливать очередь между порциями.
+const ROUTING_DELIVERY_PAUSE: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// Нужна ли пауза после `sent`-й строки из `total`.
+///
+/// Вынесено из цикла, чтобы грани были тестируемыми: после ПОСЛЕДНЕЙ строки
+/// спать нельзя — `FINISH` должен уйти сразу, а следующая за ним запись это
+/// уже `TUNCONF`, который и так ждёт очереди.
+fn routing_delivery_pause_after(sent: usize, total: usize) -> bool {
+    sent < total && sent.is_multiple_of(ROUTING_DELIVERY_BATCH)
+}
+
+fn merged_domains(rule: &crate::model::RoutingRule) -> (Vec<String>, usize) {
+    let mut domains = rule.direct_domains.clone();
+    if rule.template_domains {
+        for asset_domain in &crate::routing_assets::ASSETS.domains {
+            if !domains
+                .iter()
+                .any(|domain| domain.eq_ignore_ascii_case(asset_domain))
+            {
+                domains.push(asset_domain.clone());
+            }
+        }
+    }
+    let original_len = domains.len();
+    domains.truncate(1024);
+    (domains, original_len.saturating_sub(1024))
+}
+
+fn getconf_client_ips_sha<'a>(parts: &[&'a str], config_owner: bool) -> Option<&'a str> {
+    if !config_owner {
+        return None;
+    }
+    let sha = parts.get(7)?.trim();
+    (sha.len() == 64 && sha.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(sha)
+}
+
+/// Девятое поле GETCONF — sha кэша доменов и приложений. Читается только у
+/// config-owner'а и только в форме 64 hex; иначе сервер шлёт полный набор.
+fn getconf_client_content_sha<'a>(parts: &[&'a str], config_owner: bool) -> Option<&'a str> {
+    if !config_owner {
+        return None;
+    }
+    let sha = parts.get(8)?.trim();
+    (sha.len() == 64 && sha.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(sha)
+}
+
+/// Клиент умеет `ROUTING2:` с идентификатором доставки.
+///
+/// config-owner кладёт метку десятым полем (после ips/content sha), воркер —
+/// седьмым (после desired_count); старые клиенты её не шлют и получают прежний
+/// формат. Пароль, случайно равный `routing2`, не считается: поле проверяется
+/// только в этих двух позициях.
+const ROUTING2_CAPABILITY: &str = "routing2";
+
+fn getconf_supports_routing2(parts: &[&str]) -> bool {
+    parts.get(9) == Some(&ROUTING2_CAPABILITY) || parts.get(6) == Some(&ROUTING2_CAPABILITY)
+}
+
+/// Версия канонического хэша «тяжёлой» части правила — доменов и приложений.
+///
+/// Хэш считается по ДОСТАВЛЯЕМЫМ массивам (после `merged_domains` и раскрытия
+/// пресета), а не по сырым полям БД: клиент кэширует ровно то, что получил.
+/// Формат: префикс версии, затем для каждого массива — число элементов и для
+/// каждой строки — длина в байтах UTF-8 и сами байты. Длины фиксированной
+/// ширины исключают склейку соседних строк в одинаковый поток байтов.
+const ROUTING_CONTENT_HASH_VERSION: &[u8] = b"CSQTT_ROUTING_CONTENT_V1";
+
+fn hash_routing_content_list(hasher: &mut Sha256, list: &[String]) {
+    hasher.update((list.len() as u64).to_le_bytes());
+    for item in list {
+        hasher.update((item.len() as u64).to_le_bytes());
+        hasher.update(item.as_bytes());
+    }
+}
+
+fn routing_content_sha(
+    packages: &[String],
+    preset_red: &[String],
+    preset_orange: &[String],
+    domains: &[String],
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(ROUTING_CONTENT_HASH_VERSION);
+    hash_routing_content_list(&mut hasher, packages);
+    hash_routing_content_list(&mut hasher, preset_red);
+    hash_routing_content_list(&mut hasher, preset_orange);
+    hash_routing_content_list(&mut hasher, domains);
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn routing_rule_json(
+    rule: &crate::model::RoutingRule,
+    client_ips_sha: Option<&str>,
+) -> serde_json::Value {
+    routing_rule_json_with_content(rule, client_ips_sha, None)
+}
+
+/// Полный JSON правила; при совпавшем `content_sha` клиента «тяжёлые» массивы
+/// не отправляются, а `content_cached: true` говорит приложению взять их из кеша.
+fn routing_rule_json_with_content(
+    rule: &crate::model::RoutingRule,
+    client_ips_sha: Option<&str>,
+    client_content_sha: Option<&str>,
+) -> serde_json::Value {
+    let (domains, _) = merged_domains(rule);
+    let preset_red = if rule.preset_apps {
+        crate::preset_apps::red_packages()
+    } else {
+        Vec::new()
+    };
+    let preset_orange = if rule.preset_apps {
+        crate::preset_apps::orange_packages()
+    } else {
+        Vec::new()
+    };
+    let content_sha = routing_content_sha(&rule.packages, &preset_red, &preset_orange, &domains);
+    let content_cached = client_content_sha == Some(content_sha.as_str());
+    let mut json = serde_json::json!({
         "version": 3,
         "name": rule.name,
         "mode": if rule.is_whitelist { "whitelist" } else { "blacklist" },
         "is_whitelist": rule.is_whitelist,
-        "packages": &rule.packages,
         "domains_mode": if rule.domains_is_whitelist { "whitelist" } else { "blacklist" },
         "domains_is_whitelist": rule.domains_is_whitelist,
-        "domains": &rule.direct_domains,
-        "template_domains": rule.template_domains,
         "ip_mode": if rule.ip_is_whitelist { "whitelist" } else { "blacklist" },
         "ip_is_whitelist": rule.ip_is_whitelist,
         "ips": &rule.ips,
-        "preset_red": if rule.preset_apps {
-            crate::preset_apps::red_packages()
-        } else {
-            Vec::<String>::new()
-        },
-        "preset_orange": if rule.preset_apps {
-            crate::preset_apps::orange_packages()
-        } else {
-            Vec::<String>::new()
+        "content_sha": content_sha,
+        "content_cached": content_cached,
+    });
+    if !content_cached {
+        json["packages"] = serde_json::json!(&rule.packages);
+        json["preset_red"] = serde_json::json!(&preset_red);
+        json["preset_orange"] = serde_json::json!(&preset_orange);
+        json["domains"] = serde_json::json!(&domains);
+    }
+    if rule.template_ips {
+        let assets = &crate::routing_assets::ASSETS;
+        json["ips_sha"] = serde_json::Value::String(assets.ips.sha256.clone());
+        if client_ips_sha != Some(assets.ips.sha256.as_str()) {
+            json["ips_blob"] = serde_json::Value::String(assets.ips.blob_base64_gzip.clone());
         }
-    })
+    }
+    json
+}
+
+fn routing_event_line(raw_json: &str) -> String {
+    format!(
+        "__CSQTT_EVENT__|ROUTING|{}",
+        serde_json::json!({ "routing": raw_json })
+    )
+}
+
+pub(crate) fn validate_routing_rule(rule: &crate::model::RoutingRule) -> Result<(), String> {
+    if rule.template_ips && rule.ip_is_whitelist {
+        return Err("Готовый список RU адресов доступен только в чёрном режиме адресов".to_owned());
+    }
+    if rule.template_domains && rule.domains_is_whitelist {
+        return Err("Готовый список RU доменов доступен только в чёрном режиме доменов".to_owned());
+    }
+    if rule.ips.len() > 512 {
+        return Err(format!("явных адресов больше 512: {}", rule.ips.len()));
+    }
+    if merged_domains(rule).1 > 0 {
+        return Err("объединённых доменов больше 1024".to_owned());
+    }
+    let raw =
+        serde_json::to_string(&routing_rule_json(rule, None)).map_err(|error| error.to_string())?;
+    let line = routing_event_line(&raw);
+    if line.len() > 65_536 {
+        return Err(format!(
+            "правило не доставляется: событие {} байт при пределе 65536",
+            line.len()
+        ));
+    }
+    Ok(())
 }
 
 async fn handle_getconf(
@@ -4708,6 +5261,11 @@ async fn handle_getconf(
             parts.get(6).copied().unwrap_or("").trim(),
         )
     };
+
+    let config_owner = getconf_requests_routing(&parts);
+    let client_ips_sha = getconf_client_ips_sha(&parts, config_owner);
+    let client_content_sha = getconf_client_content_sha(&parts, config_owner);
+    let supports_routing2 = getconf_supports_routing2(&parts);
 
     let Some(generation_id) = parse_generation_id(generation_text) else {
         log_getconf_result(
@@ -5056,49 +5614,149 @@ async fn handle_getconf(
             },
         )?;
     }
-    writer.write(response.as_bytes()).await?;
-    if !reject_session
-        && worker_id <= 1
-        && let Some(rule) = routing_rule
-    {
-        let json_val = routing_rule_json(&rule);
-        let raw_json = serde_json::to_string(&json_val).unwrap_or_default();
-        use flate2::Compression;
-        use flate2::write::GzEncoder;
-        use std::io::Write;
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        let payload_bytes = if encoder.write_all(raw_json.as_bytes()).is_ok()
-            && let Ok(finish) = encoder.finish()
-        {
-            finish
+    // Решение о маршрутизации уходит только тому, кто его применит:
+    // config-owner'у (он помечает GETCONF полем `owner`) и — для старых
+    // клиентов без метки, в том же поколении и по своей отметке — одному
+    // воркеру. Рассылка каждому воркеру давала шесть приоритетных пакетов на
+    // каждый GETCONF; при 80–100 воркерах очередь UDP-TX (1024 слота)
+    // переполнялась, TUNCONF не доходил, клиент повторял запрос — лавина.
+    //
+    // Обе ветки проходят через `claim_routing_delivery`: клиент намеренно
+    // дублирует GETCONF, и раньше на одно подключение уезжали две полные
+    // последовательности ROUTING. Хвост второй доставки сбивал
+    // RoutingReassembler на клиенте и ронял туннель ложным
+    // routing_payload_incomplete. Подавление гасит именно их — чанки правила;
+    // `ROUTING:ABSENT` уезжает мимо окна (см. `routing_delivery_decision`).
+    if !reject_session && response.starts_with("TUNCONF:") {
+        let requester = if config_owner {
+            RoutingRequester::ConfigOwner {
+                session_id: session.id,
+            }
         } else {
-            raw_json.into_bytes()
+            RoutingRequester::Worker
         };
-        use base64::Engine;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(&payload_bytes);
-        let chunk_size = 650;
-        let total_chunks = encoded.len().div_ceil(chunk_size);
-        let total_chunks = if total_chunks == 0 { 1 } else { total_chunks };
-
-        let _ = writer
-            .write(format!("ROUTING:START:{total_chunks}").as_bytes())
-            .await;
-        for i in 1..=total_chunks {
-            let start = (i - 1) * chunk_size;
-            let end = std::cmp::min(i * chunk_size, encoded.len());
-            let chunk = if start < encoded.len() {
-                &encoded[start..end]
-            } else {
-                ""
+        let claimed = epoch.claim_routing_delivery(generation_id, requester);
+        let has_rule = routing_rule.is_some();
+        let delivery = routing_delivery_decision(config_owner, has_rule, claimed);
+        if delivery.chunks || delivery.absent {
+            let mode = if config_owner { "owner" } else { "legacy" };
+            let ips_sha_state = match client_ips_sha {
+                Some(sha) if sha == crate::routing_assets::ASSETS.ips.sha256.as_str() => "hit",
+                Some(_) => "miss",
+                None => "none",
             };
-            let _ = writer
-                .write(format!("ROUTING:{i}:{total_chunks}:{chunk}").as_bytes())
-                .await;
+            // Ровно одна строка на фактическую доставку: `rule=true` — ушло
+            // чанкованное правило, `rule=false` — ушёл `ROUTING:ABSENT`.
+            log_event(
+                app,
+                "INFO",
+                "routing",
+                &format!(
+                    "ROUTING pass={} gen={} to={} rule={} ips_sha={}",
+                    secret_tag(password),
+                    generation_id,
+                    mode,
+                    has_rule,
+                    ips_sha_state
+                ),
+            );
         }
-        let _ = writer
-            .write(format!("ROUTING:FINISH:{total_chunks}").as_bytes())
-            .await;
+        if delivery.chunks {
+            if let Some(rule) = routing_rule {
+                let (_, dropped_domains) = merged_domains(&rule);
+                if dropped_domains > 0 {
+                    log_event(
+                        app,
+                        "WARN",
+                        "routing",
+                        &format!("domains_truncated={dropped_domains} rule={}", rule.id),
+                    );
+                }
+                let json_val =
+                    routing_rule_json_with_content(&rule, client_ips_sha, client_content_sha);
+                let content_state = if json_val["content_cached"].as_bool() == Some(true) {
+                    "hit"
+                } else {
+                    "full"
+                };
+                let raw_json = serde_json::to_string(&json_val).unwrap_or_default();
+                use flate2::Compression;
+                use flate2::write::GzEncoder;
+                use std::io::Write;
+                let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+                let payload_bytes = if encoder.write_all(raw_json.as_bytes()).is_ok()
+                    && let Ok(finish) = encoder.finish()
+                {
+                    finish
+                } else {
+                    raw_json.into_bytes()
+                };
+                use base64::Engine;
+                let encoded = base64::engine::general_purpose::STANDARD.encode(&payload_bytes);
+                let chunk_size = 650;
+                // Цикл только пишет готовые строки: `START`, каждый чанк по
+                // одному разу, `FINISH` — форма доставки разобрана в
+                // `routing_delivery_lines`.
+                //
+                // Счётчики — диагностика холодной доставки. ВАЖНО для чтения:
+                // `writer.write` возвращает результат ПОСТАНОВКИ в команду
+                // датаплейна (`DataplaneHandle::try_send`, `async_mpsc` на
+                // 4096 команд по умолчанию), а не факта отправки в UDP. Поэтому
+                // поле называется `queued`: `queued == lines` означает лишь
+                // «очередь приняла всё», а `errors > 0` — «очередь была полна
+                // или закрыта». Реальные потери UDP-TX отсюда не видны в
+                // принципе, они только в счётчиках датаплейна; отсюда и
+                // невидимость клиентских дропов в серверном журнале.
+                // Одна строка на доставку, на каждый чанк ничего не логируется.
+                // Новый клиент получает `ROUTING2:` с nonce этой доставки.
+                let delivery_nonce = supports_routing2.then(rand::random::<u64>);
+                let lines = routing_delivery_lines_with_nonce(&encoded, chunk_size, delivery_nonce);
+                let mut queued = 0usize;
+                let mut enqueue_errors = 0usize;
+                for (index, line) in lines.iter().enumerate() {
+                    if writer.write(line.as_bytes()).await.is_ok() {
+                        queued += 1;
+                    } else {
+                        enqueue_errors += 1;
+                    }
+                    // Pacing вместо залпа (см. `ROUTING_DELIVERY_BATCH`).
+                    // Держим паузу ПОСЛЕ записи и НЕ после последней строки.
+                    //
+                    // Для будущего читателя: на время этих пауз удерживается
+                    // owned-гвард `epoch` (tokio Mutex по паролю) — он
+                    // освобождается только после записи TUNCONF. Значит
+                    // конкурентный GETCONF того же пароля подождёт на
+                    // `lock_password_epoch` лишние ~3–4 мс. Это приемлемо:
+                    // доставка происходит раз на поколение/владельца, а не на
+                    // каждый пакет, и альтернатива (отпустить гвард на время
+                    // сна) открыла бы окно для второго GETCONF с его же
+                    // последовательностью ROUTING — ровно тот дефект, который
+                    // мы подавили окном дубля.
+                    if routing_delivery_pause_after(index + 1, lines.len()) {
+                        tokio::time::sleep(ROUTING_DELIVERY_PAUSE).await;
+                    }
+                }
+                log_event(
+                    app,
+                    "INFO",
+                    "routing",
+                    &format!(
+                        "ROUTING delivery gen={generation_id} worker={worker_id} lines={} queued={queued} errors={enqueue_errors} content={content_state} routing2={supports_routing2}",
+                        lines.len()
+                    ),
+                );
+            }
+        } else if delivery.absent {
+            // Вне окна подавления: вторая копия дубля обязана получить маркер
+            // снова, иначе потеря одного датаграмма оставила бы приложение на
+            // уже снятом правиле без единого события.
+            let _ = writer.write(ROUTING_ABSENT).await;
+        }
     }
+    // Правило уходит до TUNCONF: приложение собирает VPN-план из ответа
+    // конфигурации, и если правило приходит следом, первый коннект после
+    // очистки правила падает в локальном режиме (гонка «план раньше правила»).
+    writer.write(response.as_bytes()).await?;
     drop(epoch);
     if reject_session {
         drop_exact_session(app, session);
@@ -6287,6 +6945,7 @@ mod tests {
             is_whitelist: true,
             packages: vec!["com.example.app".to_owned(), "com.example.two".to_owned()],
             template_domains: true,
+            template_ips: false,
             preset_apps,
             direct_domains: vec!["example.com".to_owned()],
             domains_is_whitelist: false,
@@ -6296,8 +6955,675 @@ mod tests {
     }
 
     #[test]
+    fn routing_absent_marker_is_a_routing_control_packet() {
+        // Маркер должен остаться в семействе `ROUTING:`: клиент считает такие
+        // пакеты управляющими и не отдаёт их в поток данных, а старый
+        // рессемблер молча отбрасывает неразобранный формат.
+        assert!(ROUTING_ABSENT.starts_with(b"ROUTING:"));
+        assert!(should_flush_udp_immediately(ROUTING_ABSENT));
+    }
+
+    /// Push-сигнал «правило изменилось» обязан уходить вне общей очереди, как
+    /// остальные control-уведомления: иначе он доедет до клиента за очередью
+    /// media-пакетов и потеряет смысл немедленного обновления.
+    #[test]
+    fn routing_changed_notice_is_flushed_immediately() {
+        assert!(should_flush_udp_immediately(ROUTING_CHANGED_NOTICE));
+        // Та же форма, что у `PANEL_RESTART_NOTICE`: `\xff` + имя + `\x00` +
+        // четыре magic-байта.
+        assert!(ROUTING_CHANGED_NOTICE.starts_with(b"\xffCSQTT_ROUTING_CHANGED_V1\x00"));
+        assert_eq!(ROUTING_CHANGED_NOTICE.len(), 30);
+    }
+
+    /// Notice обязан быть отличим от соседних бинарей: клиент сравнивает его
+    /// целиком (`==`), и любое совпадение с другим уведомлением молча
+    /// перенаправит сигнал в чужую ветку обработки.
+    #[test]
+    fn routing_changed_notice_cannot_be_confused_with_other_packets() {
+        assert_ne!(ROUTING_CHANGED_NOTICE, PANEL_RESTART_NOTICE);
+        assert!(!ROUTING_CHANGED_NOTICE.starts_with(STREAM_REPAIR_PREFIX));
+        assert!(!ROUTING_CHANGED_NOTICE.starts_with(STREAM_ALIVE_PREFIX));
+        assert!(!ROUTING_CHANGED_NOTICE.starts_with(b"ROUTING:"));
+        assert!(!ROUTING_CHANGED_NOTICE.starts_with(b"TUNCONF:"));
+        // Оба уведомления — один класс пакетов, различаются только байтами.
+        assert!(should_flush_udp_immediately(PANEL_RESTART_NOTICE));
+        assert!(!PANEL_RESTART_NOTICE.starts_with(ROUTING_CHANGED_NOTICE));
+    }
+
+    #[test]
+    fn only_the_owner_request_asks_for_routing() {
+        assert!(getconf_requests_routing(&[
+            "9000", "pass", "7", "salt", "4", "10", "owner"
+        ]));
+        assert!(!getconf_requests_routing(&[
+            "9000", "pass", "7", "salt", "4", "10"
+        ]));
+        // Старый формат: parts[6] — desired_count, а не метка.
+        assert!(!getconf_requests_routing(&[
+            "9000", "token", "pass", "7", "salt", "4", "10"
+        ]));
+    }
+
+    #[test]
+    fn client_sha_is_read_only_from_the_owner_field() {
+        let owner_hit = [
+            "9000",
+            "pass",
+            "7",
+            "salt",
+            "4",
+            "10",
+            "owner",
+            "5cf0b8862ad4f3318831dcf2e94076e221320ff47d77f1a12ebe661f613f70f6",
+        ];
+        assert_eq!(getconf_client_ips_sha(&owner_hit, true), Some(owner_hit[7]));
+        assert_eq!(owner_hit[7].len(), 64); // sha256 — 64 hex, не 32
+        assert_eq!(getconf_client_ips_sha(&owner_hit[..7], true), None);
+        assert_eq!(getconf_client_ips_sha(&owner_hit, false), None); // не-owner поле не читает
+        let malformed = ["9000", "pass", "7", "salt", "4", "10", "owner", "not-a-sha"];
+        assert_eq!(getconf_client_ips_sha(&malformed, true), None);
+    }
+
+    #[test]
+    fn content_sha_is_read_only_from_the_ninth_owner_field() {
+        let ips_sha = "5cf0b8862ad4f3318831dcf2e94076e221320ff47d77f1a12ebe661f613f70f6";
+        let content_sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let full = [
+            "9000",
+            "pass",
+            "7",
+            "salt",
+            "4",
+            "10",
+            "owner",
+            ips_sha,
+            content_sha,
+        ];
+        assert_eq!(getconf_client_content_sha(&full, true), Some(content_sha));
+        // Восьмое поле — ips; девятое без восьмого не читается.
+        assert_eq!(getconf_client_content_sha(&full[..8], true), None);
+        assert_eq!(getconf_client_content_sha(&full, false), None);
+        // Пустое восьмое поле допустимо: контент есть, кеша адресов нет.
+        let empty_ips = [
+            "9000",
+            "pass",
+            "7",
+            "salt",
+            "4",
+            "10",
+            "owner",
+            "",
+            content_sha,
+        ];
+        assert_eq!(
+            getconf_client_content_sha(&empty_ips, true),
+            Some(content_sha)
+        );
+        let malformed = [
+            "9000",
+            "pass",
+            "7",
+            "salt",
+            "4",
+            "10",
+            "owner",
+            "",
+            "not-a-sha",
+        ];
+        assert_eq!(getconf_client_content_sha(&malformed, true), None);
+    }
+
+    #[test]
+    fn routing_is_delivered_once_per_generation_for_legacy_clients() {
+        let mut state = PasswordEpochState::default();
+        assert!(state.claim_routing_delivery(7, RoutingRequester::Worker));
+        assert!(!state.claim_routing_delivery(7, RoutingRequester::Worker));
+        // Новое поколение сбрасывает отметку доставки.
+        state.admit(8, "new-salt");
+        assert!(state.claim_routing_delivery(8, RoutingRequester::Worker));
+        assert!(!state.claim_routing_delivery(8, RoutingRequester::Worker));
+    }
+
+    #[test]
+    fn epoch_claim_resets_only_when_the_epoch_is_replaced() {
+        let mut state = PasswordEpochState::new(7, "salt".to_owned());
+        assert!(state.claim_routing_delivery(7, RoutingRequester::Worker));
+        assert!(!state.claim_routing_delivery(7, RoutingRequester::Worker));
+
+        // Тот же generation и salt — epoch не заменён, повторной доставки нет.
+        state.admit(7, "salt");
+        assert!(!state.claim_routing_delivery(7, RoutingRequester::Worker));
+
+        // Смена соли — новый epoch, решение доставляется снова.
+        state.admit(7, "other-salt");
+        assert!(state.claim_routing_delivery(7, RoutingRequester::Worker));
+    }
+
+    /// Корень дефекта доставки: клиент дублирует `GETCONF`, и на одно подключение
+    /// приезжали две последовательности `ROUTING`. Вторая копия запроса того же
+    /// config-owner обязана получить только `TUNCONF`.
+    #[test]
+    fn owner_routing_delivery_is_suppressed_only_inside_the_duplicate_window() {
+        let mut state = PasswordEpochState::default();
+        let now = std::time::Instant::now();
+        let owner = RoutingRequester::ConfigOwner { session_id: 11 };
+
+        assert!(state.claim_routing_delivery_at(7, owner, now));
+        // Back-to-back копия дубля — склеивается.
+        assert!(!state.claim_routing_delivery_at(
+            7,
+            owner,
+            now + ROUTING_DUPLICATE_DELIVERY_WINDOW / 2
+        ));
+        // Повторный `GETCONF` клиента при незавершённой сборке приходит не
+        // раньше ~3.5 с (3 с idle-дедлайн + тик watchdog 500 мс): окно обязано
+        // пропустить его, иначе законная потеря чанка станет фатальной.
+        assert!(state.claim_routing_delivery_at(
+            7,
+            owner,
+            now + ROUTING_DUPLICATE_DELIVERY_WINDOW + std::time::Duration::from_millis(1)
+        ));
+        // Другое подключение того же поколения (переподключение владельца) —
+        // не «повтор дубля», ему доставляем.
+        assert!(state.claim_routing_delivery_at(
+            7,
+            RoutingRequester::ConfigOwner { session_id: 12 },
+            now + ROUTING_DUPLICATE_DELIVERY_WINDOW + std::time::Duration::from_millis(2)
+        ));
+    }
+
+    /// Смена поколения или соли сбрасывает и owner-отметку: окно не переживает
+    /// замену эпохи.
+    #[test]
+    fn owner_routing_delivery_resets_with_the_epoch() {
+        let mut state = PasswordEpochState::new(7, "salt".to_owned());
+        let now = std::time::Instant::now();
+        let owner = RoutingRequester::ConfigOwner { session_id: 11 };
+
+        assert!(state.claim_routing_delivery_at(7, owner, now));
+        assert!(!state.claim_routing_delivery_at(7, owner, now));
+
+        state.admit(7, "other-salt");
+        assert!(state.claim_routing_delivery_at(7, owner, now));
+
+        state.admit(8, "other-salt");
+        assert!(state.claim_routing_delivery_at(8, owner, now));
+    }
+
+    /// Отметка воркера не имеет права лишать правила config-owner'а: именно он
+    /// применяет его и шлёт событие в приложение.
+    #[test]
+    fn owner_is_not_starved_by_a_worker_delivery() {
+        let mut state = PasswordEpochState::default();
+        let now = std::time::Instant::now();
+
+        assert!(state.claim_routing_delivery_at(7, RoutingRequester::Worker, now));
+        assert!(state.claim_routing_delivery_at(
+            7,
+            RoutingRequester::ConfigOwner { session_id: 21 },
+            now
+        ));
+        // ...но повтор той же сессии уже не получит второй ROUTING.
+        assert!(!state.claim_routing_delivery_at(
+            7,
+            RoutingRequester::ConfigOwner { session_id: 21 },
+            now + ROUTING_DUPLICATE_DELIVERY_WINDOW / 2
+        ));
+    }
+
+    /// Исходный дефект (дубль `GETCONF`) не требовал трогать legacy-ветку:
+    /// доставка config-owner'у живёт в своей отметке и НЕ съедает единственный
+    /// слот воркера без метки `owner` того же поколения.
+    #[test]
+    fn owner_delivery_does_not_consume_the_worker_slot_of_the_generation() {
+        let mut state = PasswordEpochState::default();
+        let now = std::time::Instant::now();
+        let owner = RoutingRequester::ConfigOwner { session_id: 31 };
+
+        assert!(state.claim_routing_delivery_at(7, owner, now));
+        // Первый воркер того же поколения получает своё решение.
+        assert!(state.claim_routing_delivery_at(7, RoutingRequester::Worker, now));
+        // ...но по-прежнему строго один раз на поколение: второй воркер того же
+        // поколения его не получает, и истечение окна дубля его не оживляет.
+        assert!(!state.claim_routing_delivery_at(7, RoutingRequester::Worker, now));
+        assert!(!state.claim_routing_delivery_at(
+            7,
+            RoutingRequester::Worker,
+            now + ROUTING_DUPLICATE_DELIVERY_WINDOW * 4
+        ));
+
+        // Смена поколения сбрасывает обе отметки, а не только «последнюю».
+        state.admit(8, "salt-8");
+        assert!(state.claim_routing_delivery_at(8, RoutingRequester::Worker, now));
+        assert!(state.claim_routing_delivery_at(8, owner, now));
+    }
+
+    /// Обратный порядок в том же поколении: оба получают своё, и ни одна
+    /// отметка не зависит от времени доставки другой.
+    #[test]
+    fn owner_and_worker_both_get_their_delivery_in_the_same_generation() {
+        let mut state = PasswordEpochState::default();
+        let now = std::time::Instant::now();
+
+        assert!(state.claim_routing_delivery_at(7, RoutingRequester::Worker, now));
+        assert!(state.claim_routing_delivery_at(
+            7,
+            RoutingRequester::ConfigOwner { session_id: 32 },
+            now + ROUTING_DUPLICATE_DELIVERY_WINDOW * 4
+        ));
+        // Отметка воркера не «протухает» от времени и не меняется владельцем:
+        // второй воркер того же поколения по-прежнему ни с чем.
+        assert!(!state.claim_routing_delivery_at(
+            7,
+            RoutingRequester::Worker,
+            now + ROUTING_DUPLICATE_DELIVERY_WINDOW * 8
+        ));
+    }
+
+    /// Ветки доставки решения реагируют на окно подавления РАЗНО: оно гасит
+    /// чанки правила и не имеет права гасить `ROUTING:ABSENT`.
+    #[test]
+    fn duplicate_window_suppresses_chunks_but_never_absent() {
+        // config-owner, правило есть: первая копия дубля получает всё.
+        assert_eq!(
+            routing_delivery_decision(true, true, true),
+            RoutingDeliveryDecision {
+                chunks: true,
+                absent: false
+            }
+        );
+        // ...а подавленная повторная копия — ни одного чанка `ROUTING:`.
+        assert_eq!(
+            routing_delivery_decision(true, true, false),
+            RoutingDeliveryDecision {
+                chunks: false,
+                absent: false
+            }
+        );
+        // config-owner, правила нет: ABSENT уходит и на первую, и на вторую
+        // копию — ответ окна подавления на него не влияет.
+        assert_eq!(
+            routing_delivery_decision(true, false, true),
+            RoutingDeliveryDecision {
+                chunks: false,
+                absent: true
+            }
+        );
+        assert_eq!(
+            routing_delivery_decision(true, false, false),
+            RoutingDeliveryDecision {
+                chunks: false,
+                absent: true
+            }
+        );
+        // Воркер без метки `owner`: правило — строго одна доставка на
+        // поколение, а ABSENT ему не отправляется вовсе (он его не применяет).
+        assert_eq!(
+            routing_delivery_decision(false, true, true),
+            RoutingDeliveryDecision {
+                chunks: true,
+                absent: false
+            }
+        );
+        assert_eq!(
+            routing_delivery_decision(false, true, false),
+            RoutingDeliveryDecision {
+                chunks: false,
+                absent: false
+            }
+        );
+        assert_eq!(
+            routing_delivery_decision(false, false, true),
+            RoutingDeliveryDecision {
+                chunks: false,
+                absent: false
+            }
+        );
+    }
+
+    /// Инвариант развязки: ветки исключают друг друга, `chunks` полностью
+    /// управляется окном подавления, а `absent` — нет.
+    #[test]
+    fn routing_delivery_branches_are_exclusive_and_absent_ignores_the_window() {
+        for config_owner in [false, true] {
+            for has_rule in [false, true] {
+                for claimed in [false, true] {
+                    let decision = routing_delivery_decision(config_owner, has_rule, claimed);
+                    assert!(
+                        !(decision.chunks && decision.absent),
+                        "чанки и ABSENT одновременно: owner={config_owner} \
+                         rule={has_rule} claimed={claimed}"
+                    );
+                    assert_eq!(
+                        decision.chunks,
+                        claimed && has_rule,
+                        "окно подавления должно управлять чанками"
+                    );
+                    assert_eq!(
+                        decision.absent,
+                        config_owner && !has_rule,
+                        "окно подавления не имеет права управлять ABSENT"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Сквозная связка с настоящим окном подавления: отказ `claim` убирает
+    /// чанки, но не убирает маркер отсутствия правила — потеря одиночного
+    /// датаграмма иначе осталась бы тихим fail-open.
+    #[test]
+    fn owner_duplicate_request_drops_chunks_but_keeps_absent() {
+        let now = std::time::Instant::now();
+        let owner = RoutingRequester::ConfigOwner { session_id: 41 };
+        let repeat = now + ROUTING_DUPLICATE_DELIVERY_WINDOW / 2;
+
+        // Снятое правило: оба запроса config-owner'а доставляют ABSENT.
+        let mut state = PasswordEpochState::default();
+        let first = state.claim_routing_delivery_at(7, owner, now);
+        let second = state.claim_routing_delivery_at(7, owner, repeat);
+        assert!(first && !second, "окно обязано подавить повтор чанков");
+        let absent_first = routing_delivery_decision(true, false, first);
+        let absent_second = routing_delivery_decision(true, false, second);
+        assert!(absent_first.absent && !absent_first.chunks);
+        assert!(absent_second.absent && !absent_second.chunks);
+
+        // То же окно при наличии правила: повтор не получает ничего.
+        let mut state = PasswordEpochState::default();
+        let chunked_first =
+            routing_delivery_decision(true, true, state.claim_routing_delivery_at(7, owner, now));
+        let chunked_second = routing_delivery_decision(
+            true,
+            true,
+            state.claim_routing_delivery_at(7, owner, repeat),
+        );
+        assert!(chunked_first.chunks && !chunked_first.absent);
+        assert_eq!(
+            chunked_second,
+            RoutingDeliveryDecision {
+                chunks: false,
+                absent: false
+            }
+        );
+    }
+
+    /// Разбор `ROUTING:<seq>:<total>:<chunk>` — для проверок формы доставки.
+    fn routing_chunk_line_parts(line: &str) -> (usize, usize, String) {
+        let rest = line
+            .strip_prefix("ROUTING:")
+            .expect("чанк-строка обязана начинаться с ROUTING:");
+        let mut parts = rest.splitn(3, ':');
+        let seq = parts
+            .next()
+            .expect("seq")
+            .parse()
+            .expect("seq обязан быть числом");
+        let total = parts
+            .next()
+            .expect("total")
+            .parse()
+            .expect("total обязан быть числом");
+        (seq, total, parts.next().expect("chunk").to_owned())
+    }
+
+    /// Только чанк-строки, без `START`/`FINISH`, в порядке отправки.
+    fn routing_sent_chunks(lines: &[String]) -> Vec<(usize, usize, String)> {
+        lines
+            .iter()
+            .filter(|line| {
+                !line.starts_with("ROUTING:START:") && !line.starts_with("ROUTING:FINISH:")
+            })
+            .map(|line| routing_chunk_line_parts(line))
+            .collect()
+    }
+
+    /// Форма доставки: `START`, каждый чанк РОВНО один раз, `FINISH`. Дубли
+    /// чанков (`3e7ed70`) отменены — на живом стенде они не помогали, а этот
+    /// тест не пускает их обратно: он падает на любом повторе `seq`.
+    #[test]
+    fn delivery_lines_are_start_then_each_chunk_once_then_finish() {
+        // 12 символов при chunk_size = 4 → ровно N = 3.
+        let lines = routing_delivery_lines("Ab1Cd2Ef3Gh4", 4);
+
+        // 1 START + 3 чанк-строки + 1 FINISH.
+        assert_eq!(
+            lines,
+            vec![
+                "ROUTING:START:3".to_owned(),
+                "ROUTING:1:3:Ab1C".to_owned(),
+                "ROUTING:2:3:d2Ef".to_owned(),
+                "ROUTING:3:3:3Gh4".to_owned(),
+                "ROUTING:FINISH:3".to_owned(),
+            ]
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with("ROUTING:START:"))
+                .count(),
+            1,
+            "START ровно один"
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with("ROUTING:FINISH:"))
+                .count(),
+            1,
+            "FINISH ровно один"
+        );
+
+        let chunks = routing_sent_chunks(&lines);
+        let seqs: Vec<usize> = chunks.iter().map(|(seq, _, _)| *seq).collect();
+        assert_eq!(seqs, vec![1, 2, 3], "чанки идут по одному, без копий");
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|(seq, _, _)| *seq)
+                .collect::<HashSet<_>>()
+                .len(),
+            chunks.len(),
+            "ни один seq не встречается дважды"
+        );
+        for (_, total, _) in &chunks {
+            assert_eq!(*total, 3, "total обязан быть одинаковым во всех строках");
+        }
+    }
+
+    /// N = 1 (короткий payload): один чанк между `START` и `FINISH` — ровно три
+    /// датаграмма на доставку.
+    #[test]
+    fn single_chunk_delivery_is_start_then_chunk_then_finish() {
+        assert_eq!(
+            routing_delivery_lines("Ab1C", 650),
+            vec![
+                "ROUTING:START:1".to_owned(),
+                "ROUTING:1:1:Ab1C".to_owned(),
+                "ROUTING:FINISH:1".to_owned(),
+            ]
+        );
+
+        // Прежнее поведение для пустого payload сохранено: total = 1 и один
+        // пустой чанк.
+        let empty = routing_delivery_lines("", 650);
+        assert_eq!(empty.len(), 3);
+        assert_eq!(empty[1], "ROUTING:1:1:");
+    }
+
+    /// Склейка чанков в исходном порядке обязана дать исходный `encoded` байт
+    /// в байт и остаться валидным base64 — то есть нарезка не теряет и не
+    /// добавляет байт, а `total` позволяет клиенту собрать правило без запасных
+    /// копий.
+    #[test]
+    fn delivery_lines_concatenate_back_to_the_original_payload() {
+        // Полные N чанков без хвостового неполного — как живой прогон с blob'ом.
+        let chunk_size = 650;
+        let chunk_count = 46;
+        let encoded: String = (0..chunk_count * chunk_size)
+            .map(|k| char::from(b'A' + (k % 26) as u8))
+            .collect();
+
+        let lines = routing_delivery_lines(&encoded, chunk_size);
+        assert_eq!(
+            lines.len(),
+            chunk_count + 2,
+            "доставка = START + N чанков + FINISH, без дублей"
+        );
+
+        let chunks = routing_sent_chunks(&lines);
+        let seqs: HashSet<usize> = chunks.iter().map(|(seq, _, _)| *seq).collect();
+        assert_eq!(
+            seqs.len(),
+            chunk_count,
+            "каждый чанк представлен ровно одним пакетом"
+        );
+        let mut by_seq: Vec<(usize, String)> = chunks
+            .into_iter()
+            .map(|(seq, _total, chunk)| (seq, chunk))
+            .collect();
+        by_seq.sort_by_key(|(seq, _)| *seq);
+        let glued: String = by_seq.iter().map(|(_, chunk)| chunk.as_str()).collect();
+        assert_eq!(glued, encoded, "склейка чанков обязана совпасть с encoded");
+
+        use base64::Engine;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(glued.trim())
+            .expect("склейка обязана оставаться валидным base64");
+        assert_eq!(
+            decoded.len(),
+            encoded.len() / 4 * 3,
+            "полный блок base64 без padding декодируется целиком"
+        );
+    }
+
+    /// `ROUTING2` несёт один nonce во всех строках доставки.
+    #[test]
+    fn routing2_delivery_carries_one_nonce_in_every_line() {
+        let nonce = 0x0123_4567_89ab_cdefu64;
+        let lines = routing_delivery_lines_with_nonce("ABCDEFGHIJ", 4, Some(nonce));
+        assert_eq!(lines[0], "ROUTING2:START:0123456789abcdef:3");
+        assert_eq!(lines[1], "ROUTING2:0123456789abcdef:1:3:ABCD");
+        assert_eq!(lines[2], "ROUTING2:0123456789abcdef:2:3:EFGH");
+        assert_eq!(lines[3], "ROUTING2:0123456789abcdef:3:3:IJ");
+        assert_eq!(lines[4], "ROUTING2:FINISH:0123456789abcdef:3");
+        assert!(lines.iter().all(|line| line.contains("0123456789abcdef")));
+
+        let legacy = routing_delivery_lines_with_nonce("ABCDEFGHIJ", 4, None);
+        assert_eq!(legacy[0], "ROUTING:START:3");
+        assert_eq!(legacy.last().map(String::as_str), Some("ROUTING:FINISH:3"));
+        assert!(should_flush_udp_immediately(lines[0].as_bytes()));
+    }
+
+    #[test]
+    fn routing2_capability_is_read_from_owner_and_worker_positions() {
+        let owner = [
+            "9000", "pass", "7", "salt", "1", "10", "owner", "", "", "routing2",
+        ];
+        assert!(getconf_supports_routing2(&owner));
+        let worker = ["9000", "pass", "7", "salt", "1", "10", "routing2"];
+        assert!(getconf_supports_routing2(&worker));
+        assert!(!getconf_supports_routing2(&[
+            "9000", "pass", "7", "salt", "1", "10"
+        ]));
+        assert!(!getconf_supports_routing2(&[
+            "9000", "pass", "7", "salt", "1", "10", "owner"
+        ]));
+        // Пароль, случайно равный метке, не включает формат.
+        assert!(!getconf_supports_routing2(&[
+            "routing2", "pass", "7", "salt", "1", "10"
+        ]));
+    }
+
+    /// Границы pacing'а: пауза после каждых `ROUTING_DELIVERY_BATCH` строк и
+    /// НИКОГДА после последней — `FINISH` и следующий за ним `TUNCONF` не
+    /// должны разрываться сном.
+    #[test]
+    fn delivery_pauses_fall_between_batches_and_never_after_the_last_line() {
+        assert_eq!(ROUTING_DELIVERY_BATCH, 16);
+        assert_eq!(ROUTING_DELIVERY_PAUSE, std::time::Duration::from_millis(1));
+
+        // Ровно одна граница: после 16-й, 32-й, 48-й.
+        for sent in 1..=16 {
+            assert_eq!(
+                routing_delivery_pause_after(sent, 53),
+                sent == 16,
+                "пауза после {sent}-й из 53"
+            );
+        }
+        assert!(routing_delivery_pause_after(32, 53));
+        assert!(routing_delivery_pause_after(48, 53));
+        // Последняя строка — никогда, даже если она кратна батчу.
+        assert!(!routing_delivery_pause_after(53, 53));
+        assert!(
+            !routing_delivery_pause_after(16, 16),
+            "доставка короче батча не спит"
+        );
+        assert!(!routing_delivery_pause_after(32, 32));
+        // Ровно 3 паузы на 53 строки — то, что обещано в комментарии.
+        let pauses = (1..=53)
+            .filter(|sent| routing_delivery_pause_after(*sent, 53))
+            .count();
+        assert_eq!(pauses, 3);
+
+        // Худший легитимный бурст (137 строк) — 8 пауз, то есть ~8 мс сверху,
+        // и ни одной после FINISH.
+        let worst = (1..=137)
+            .filter(|sent| routing_delivery_pause_after(*sent, 137))
+            .count();
+        assert_eq!(worst, 137 / ROUTING_DELIVERY_BATCH);
+    }
+
+    /// Сброс отметки — единственная легитимная причина доставить правило
+    /// повторно внутри окна дубля: именно так push-сигнал «правило изменилось»
+    /// получает немедленный `GETCONF` на живом туннеле.
+    #[test]
+    fn invalidated_owner_delivery_is_available_inside_the_duplicate_window() {
+        let mut state = PasswordEpochState::default();
+        let now = std::time::Instant::now();
+        let owner = RoutingRequester::ConfigOwner { session_id: 51 };
+
+        assert!(state.claim_routing_delivery_at(7, owner, now));
+        assert!(
+            !state.claim_routing_delivery_at(7, owner, now + ROUTING_DUPLICATE_DELIVERY_WINDOW / 2),
+            "без сброса повтор гасится окном"
+        );
+
+        state.invalidate_owner_routing_delivery();
+        assert!(
+            state.claim_routing_delivery_at(7, owner, now + ROUTING_DUPLICATE_DELIVERY_WINDOW / 2),
+            "после сброса тот же интервал обязан вернуть доставку"
+        );
+    }
+
+    /// Сброс касается только отметки владельца: строгое «одно решение на
+    /// поколение» для клиента без метки `owner` — отдельный инвариант, и
+    /// правка правила не должна рассылать blob каждому legacy-воркеру.
+    #[test]
+    fn invalidated_owner_delivery_keeps_the_worker_slot_once_per_generation() {
+        let mut state = PasswordEpochState::default();
+        let now = std::time::Instant::now();
+
+        assert!(state.claim_routing_delivery_at(7, RoutingRequester::Worker, now));
+        state.invalidate_owner_routing_delivery();
+        assert!(!state.claim_routing_delivery_at(7, RoutingRequester::Worker, now));
+        assert!(!state.claim_routing_delivery_at(
+            7,
+            RoutingRequester::Worker,
+            now + ROUTING_DUPLICATE_DELIVERY_WINDOW * 4
+        ));
+
+        // Владельцу после сброса доставляем, воркеру — по-прежнему нет.
+        assert!(state.claim_routing_delivery_at(
+            7,
+            RoutingRequester::ConfigOwner { session_id: 61 },
+            now
+        ));
+        assert!(!state.claim_routing_delivery_at(7, RoutingRequester::Worker, now));
+    }
+
+    #[test]
     fn routing_json_bumps_version_and_includes_preset_when_enabled() {
-        let json = routing_rule_json(&routing_fixture_rule(true));
+        let json = routing_rule_json(&routing_fixture_rule(true), None);
 
         assert_eq!(json["version"], 3);
         let red = json["preset_red"]
@@ -6316,7 +7642,7 @@ mod tests {
 
     #[test]
     fn routing_json_keeps_empty_preset_arrays_when_disabled() {
-        let json = routing_rule_json(&routing_fixture_rule(false));
+        let json = routing_rule_json(&routing_fixture_rule(false), None);
 
         assert_eq!(json["version"], 3);
         assert_eq!(json["preset_red"], serde_json::json!([]));
@@ -6326,7 +7652,7 @@ mod tests {
     #[test]
     fn routing_json_keeps_existing_fields_intact() {
         let rule = routing_fixture_rule(true);
-        let json = routing_rule_json(&rule);
+        let json = routing_rule_json(&rule, None);
 
         assert_eq!(json["name"], rule.name);
         assert_eq!(json["mode"], "whitelist");
@@ -6334,10 +7660,195 @@ mod tests {
         assert_eq!(json["packages"], serde_json::json!(&rule.packages));
         assert_eq!(json["domains_mode"], "blacklist");
         assert_eq!(json["domains_is_whitelist"], false);
-        assert_eq!(json["domains"], serde_json::json!(&rule.direct_domains));
-        assert_eq!(json["template_domains"], true);
+        assert!(json.get("template_domains").is_none());
+        let domains = json["domains"]
+            .as_array()
+            .expect("domains is an array")
+            .iter()
+            .map(|value| value.as_str().expect("domain is a string"))
+            .collect::<Vec<_>>();
+        assert!(domains.contains(&"example.com"));
+        assert!(domains.contains(&"vk.com"));
         assert_eq!(json["ip_mode"], "whitelist");
         assert_eq!(json["ip_is_whitelist"], true);
         assert_eq!(json["ips"], serde_json::json!(&rule.ips));
+    }
+
+    #[test]
+    fn template_domains_expands_to_the_server_asset_and_drops_the_flag() {
+        let json = routing_rule_json(&routing_fixture_rule(true), None);
+        assert!(json.get("template_domains").is_none());
+        let domains: Vec<&str> = json["domains"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect();
+        assert!(domains.contains(&"vk.com"));
+        assert!(domains.contains(&"example.com"));
+        assert!(domains.len() >= 515);
+        assert_eq!(domains.iter().filter(|d| **d == "vk.com").count(), 1);
+        assert!(domains.len() <= 1024);
+    }
+
+    #[test]
+    fn merged_domains_are_capped_at_1024_and_report_the_dropped_count() {
+        let mut rule = routing_fixture_rule(true);
+        rule.direct_domains = (0..1024).map(|i| format!("d{i}.example.com")).collect();
+        let (domains, dropped) = merged_domains(&rule);
+        assert_eq!(domains.len(), 1024);
+        assert!(dropped > 0);
+    }
+
+    #[test]
+    fn template_ips_without_client_sha_ships_sha_and_blob() {
+        let mut rule = routing_fixture_rule(true);
+        rule.template_ips = true;
+        let json = routing_rule_json(&rule, None);
+        assert_eq!(
+            json["ips_sha"],
+            crate::routing_assets::ASSETS.ips.sha256.as_str()
+        );
+        assert_eq!(
+            json["ips_blob"],
+            crate::routing_assets::ASSETS.ips.blob_base64_gzip.as_str()
+        );
+        assert_eq!(json["ips"], serde_json::json!(["10.66.67.0/24"]));
+    }
+
+    #[test]
+    fn matching_client_sha_omits_the_blob() {
+        let mut rule = routing_fixture_rule(true);
+        rule.template_ips = true;
+        let json = routing_rule_json(
+            &rule,
+            Some(crate::routing_assets::ASSETS.ips.sha256.as_str()),
+        );
+        assert!(json.get("ips_blob").is_none());
+        assert!(json.get("ips_sha").is_some());
+    }
+
+    #[test]
+    fn routing_json_content_sha_is_stable_and_sensitive_to_content() {
+        let rule = routing_fixture_rule(true);
+        let first = routing_rule_json(&rule, None);
+        let second = routing_rule_json(&rule, None);
+        assert_eq!(first["content_sha"], second["content_sha"]);
+        assert_eq!(
+            first["content_sha"].as_str().map(str::len),
+            Some(64),
+            "content_sha — sha256 в hex"
+        );
+        assert_eq!(first["content_cached"], false);
+        assert!(first.get("domains").is_some());
+
+        let mut changed = routing_fixture_rule(true);
+        changed.packages.push("com.example.three".to_owned());
+        let changed_json = routing_rule_json(&changed, None);
+        assert_ne!(changed_json["content_sha"], first["content_sha"]);
+    }
+
+    #[test]
+    fn matching_content_sha_omits_domains_and_apps() {
+        let rule = routing_fixture_rule(true);
+        let full = routing_rule_json(&rule, None);
+        let sha = full["content_sha"].as_str().unwrap().to_owned();
+        let cached = routing_rule_json_with_content(&rule, None, Some(sha.as_str()));
+        assert_eq!(cached["content_cached"], true);
+        assert_eq!(cached["content_sha"], sha);
+        assert!(cached.get("domains").is_none());
+        assert!(cached.get("packages").is_none());
+        assert!(cached.get("preset_red").is_none());
+        assert!(cached.get("preset_orange").is_none());
+        assert!(cached.get("ips").is_some(), "явные адреса не кешируются");
+
+        let wrong_sha = "0".repeat(64);
+        let wrong = routing_rule_json_with_content(&rule, None, Some(wrong_sha.as_str()));
+        assert_eq!(wrong["content_cached"], false);
+        assert!(wrong.get("domains").is_some());
+        assert!(wrong.get("packages").is_some());
+    }
+
+    #[test]
+    fn template_ips_off_ships_neither_sha_nor_blob() {
+        let rule = routing_fixture_rule(true);
+        let json = routing_rule_json(&rule, None);
+        assert!(json.get("ips_sha").is_none());
+        assert!(json.get("ips_blob").is_none());
+    }
+
+    #[test]
+    fn worst_case_rule_event_line_fits_the_transport_limit() {
+        let mut rule = routing_fixture_rule(true);
+        rule.template_ips = true;
+        rule.ips = (0..512)
+            .map(|i| format!("10.{}.{}.{}/32", i / 65536, (i / 256) % 256, i % 256))
+            .collect();
+        let raw = serde_json::to_string(&routing_rule_json(&rule, None)).unwrap();
+        let line = routing_event_line(&raw);
+        assert!(line.len() <= 65_536, "{}", line.len());
+    }
+
+    #[test]
+    fn validation_rejects_rules_that_cannot_be_delivered() {
+        let mut too_many_ips = routing_fixture_rule(true);
+        too_many_ips.ips = (0..513)
+            .map(|i| format!("10.0.{}.{}/32", (i / 256) % 256, i % 256))
+            .collect();
+        assert!(validate_routing_rule(&too_many_ips).is_err());
+
+        let mut too_big = routing_fixture_rule(true);
+        too_big.template_ips = true;
+        too_big.direct_domains = (0..1024).map(|i| format!("d{i}.example.com")).collect();
+        too_big.ips = (0..512)
+            .map(|i| format!("10.{}.{}.{}/32", i / 65536, (i / 256) % 256, i % 256))
+            .collect();
+        assert!(
+            validate_routing_rule(&too_big).is_err(),
+            "1024 явных + 515 шаблонных доменов > 1024"
+        );
+    }
+
+    #[test]
+    fn deliverable_maximum_passes_validation() {
+        let mut rule = routing_fixture_rule(true);
+        rule.template_domains = false;
+        rule.template_ips = true;
+        rule.ip_is_whitelist = false;
+        rule.direct_domains = (0..1024).map(|i| format!("d{i}.ru")).collect();
+        rule.ips = (0..512)
+            .map(|i| format!("10.{}.{}.{}/32", i / 65536, (i / 256) % 256, i % 256))
+            .collect();
+        assert!(validate_routing_rule(&rule).is_ok());
+        let raw = serde_json::to_string(&routing_rule_json(&rule, None)).unwrap();
+        assert!(routing_event_line(&raw).len() <= 65_536);
+    }
+
+    #[test]
+    fn long_domains_are_rejected_by_event_size() {
+        let mut rule = routing_fixture_rule(true);
+        rule.template_domains = false;
+        rule.template_ips = true;
+        rule.ip_is_whitelist = false;
+        rule.direct_domains = (0..1024)
+            .map(|i| format!("{}{}.ru", "d".repeat(54), i))
+            .collect();
+        rule.ips = (0..512)
+            .map(|i| format!("10.{}.{}.{}/32", i / 65536, (i / 256) % 256, i % 256))
+            .collect();
+        assert!(validate_routing_rule(&rule).is_err());
+    }
+
+    #[test]
+    fn template_modes_require_the_black_list() {
+        let mut rule = routing_fixture_rule(true);
+        rule.template_ips = true;
+        rule.ip_is_whitelist = true;
+        assert!(validate_routing_rule(&rule).is_err());
+
+        let mut rule = routing_fixture_rule(true);
+        rule.template_domains = true;
+        rule.domains_is_whitelist = true;
+        assert!(validate_routing_rule(&rule).is_err());
     }
 }

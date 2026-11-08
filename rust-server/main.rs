@@ -30,6 +30,7 @@ mod path_probe;
 mod preset_apps;
 mod protocol;
 mod proxy_route;
+mod routing_assets;
 mod tokio_io;
 mod tproxy;
 mod tun_device;
@@ -983,6 +984,8 @@ async fn async_main() -> Result<()> {
     }
 
     let args = Args::parse();
+    // Невалидный ассет должен ронять старт до открытия сокетов, а не первый GETCONF.
+    let _ = &*routing_assets::ASSETS;
 
     if args.protocol_revision {
         println!("{}", WIRE_PROTOCOL_REVISION);

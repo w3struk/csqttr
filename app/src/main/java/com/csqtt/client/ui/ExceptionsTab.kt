@@ -26,7 +26,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.SwapVert
 import androidx.compose.material.icons.outlined.Apps
-import androidx.compose.material.icons.outlined.Language
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Checkbox
@@ -164,41 +163,6 @@ fun ExceptionsTab(
     @Suppress("DEPRECATION")
     val clipboardManager = LocalClipboardManager.current
 
-    fun cleanDomain(raw: String): String {
-        return raw.trim()
-            .lowercase()
-            .removePrefix("https://")
-            .removePrefix("http://")
-            .removePrefix("www.")
-            .substringBefore('/')
-            .substringBefore(':')
-            .substringBefore('?')
-            .substringBefore('#')
-            .trim(',', ';', ' ', '\t', '\n', '\r', '.', '(', ')', '[', ']', '"', '\'')
-    }
-
-    val domainPattern = remember {
-        Regex("^[a-z0-9\u0400-\u04ff]([a-z0-9\u0400-\u04ff\\-]{0,61}[a-z0-9\u0400-\u04ff])?\$")
-    }
-
-    fun isValidDomain(domain: String): Boolean {
-        if (domain.length < 3 || domain.length > 253) return false
-        val parts = domain.split('.')
-        if (parts.size < 2) return false
-        val tld = parts.last()
-        if (tld.length < 2 || !tld.any { it.isLetter() }) return false
-        return parts.all { it.matches(domainPattern) }
-    }
-
-    fun parseDomainsFromText(text: String): List<String> {
-        return text
-            .split(Regex("[,;\\s\\n\\r]+"))
-            .map { cleanDomain(it) }
-            .filter { isValidDomain(it) }
-            .distinct()
-            .take(1024)
-    }
-
     val packagePattern = remember {
         Regex("^[a-zA-Z][a-zA-Z0-9_]*(\\.[a-zA-Z0-9_]+)+$")
     }
@@ -256,13 +220,6 @@ fun ExceptionsTab(
 
         if (!headerFound) return null
         return Pair(black, white)
-    }
-
-    val templateDomains = remember {
-        val text = runCatching {
-            context.assets.open("domains.txt").bufferedReader().use { it.readText() }
-        }.getOrNull().orEmpty()
-        parseDomainsFromText(text)
     }
 
     val persistedBlacklist = remember(savedExcluded) {
@@ -631,161 +588,6 @@ fun ExceptionsTab(
                         softWrap = false,
                         overflow = TextOverflow.Ellipsis,
                     )
-                }
-            }
-
-            if (serverRuleActive) {
-                AppSectionCard(
-                    contentPadding = PaddingValues(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp),
-                ) {
-                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        Text(
-                            text = "Маршрутизация доменов",
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.Bold,
-                            maxLines = 1,
-                            softWrap = false,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                        val domainsStatusText = if (serverRule != null) {
-                            when {
-                                serverRule.domainsIsWhite ->
-                                    "Правило сервера: белый список, ${serverRule.domains.size} доменов в туннеле"
-                                serverRule.templateDomains && serverRule.domains.isNotEmpty() ->
-                                    "Правило сервера: чёрный список, ${templateDomains.size} готовых + " +
-                                        "${serverRule.domains.size} своих исключено"
-                                serverRule.templateDomains ->
-                                    "Правило сервера: чёрный список, ${templateDomains.size} исключено " +
-                                        "(Готовый список RU)"
-                                serverRule.domains.isEmpty() ->
-                                    "Правило сервера: чёрный список, 0 доменов исключено"
-                                else ->
-                                    "Правило сервера: чёрный список, ${serverRule.domains.size} исключено"
-                            }
-                        } else {
-                            ""
-                        }
-                        Text(
-                            text = domainsStatusText,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = if (serverRuleActive) Int.MAX_VALUE else 1,
-                            softWrap = serverRuleActive,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
-
-                    OutlinedButton(
-                        onClick = {},
-                        enabled = !serverRuleActive,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(CsqttSizes.ControlHeight),
-                        shape = CsqttShapes.Pill,
-                        colors = ButtonDefaults.outlinedButtonColors(
-                            containerColor = Color.Transparent,
-                            contentColor = MaterialTheme.colorScheme.onSurface,
-                        ),
-                        border = BorderStroke(
-                            1.dp,
-                            MaterialTheme.colorScheme.outline.copy(alpha = 0.5f),
-                        ),
-                    ) {
-                        Icon(
-                            imageVector = Icons.Outlined.Language,
-                            contentDescription = null,
-                            modifier = Modifier.size(18.dp),
-                            tint = MaterialTheme.colorScheme.onSurface,
-                        )
-                        Spacer(Modifier.width(8.dp))
-                        Text(
-                            text = "Список доменов",
-                            fontWeight = FontWeight.SemiBold,
-                            maxLines = 1,
-                            softWrap = false,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
-                    if (serverRuleActive) {
-                        Text(
-                            text = "Задано правилом сервера",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                }
-
-                AppSectionCard(
-                    contentPadding = PaddingValues(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp),
-                ) {
-                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        Text(
-                            text = "Маршрутизация адресов",
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.Bold,
-                            maxLines = 1,
-                            softWrap = false,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                        val ipsStatusText = if (serverRule != null) {
-                            if (serverRule.ipIsWhite) {
-                                "Правило сервера: белый список, ${serverRule.ips.size} в туннеле"
-                            } else {
-                                "Правило сервера: чёрный список, ${serverRule.ips.size} исключено"
-                            }
-                        } else {
-                            ""
-                        }
-                        Text(
-                            text = ipsStatusText,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = if (serverRuleActive) Int.MAX_VALUE else 1,
-                            softWrap = serverRuleActive,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
-
-                    OutlinedButton(
-                        onClick = {},
-                        enabled = !serverRuleActive,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(CsqttSizes.ControlHeight),
-                        shape = CsqttShapes.Pill,
-                        colors = ButtonDefaults.outlinedButtonColors(
-                            containerColor = Color.Transparent,
-                            contentColor = MaterialTheme.colorScheme.onSurface,
-                        ),
-                        border = BorderStroke(
-                            1.dp,
-                            MaterialTheme.colorScheme.outline.copy(alpha = 0.5f),
-                        ),
-                    ) {
-                        Icon(
-                            painter = painterResource(R.drawable.ic_ip),
-                            contentDescription = null,
-                            modifier = Modifier.size(18.dp),
-                            tint = MaterialTheme.colorScheme.onSurface,
-                        )
-                        Spacer(Modifier.width(8.dp))
-                        Text(
-                            text = "Список адресов",
-                            fontWeight = FontWeight.SemiBold,
-                            maxLines = 1,
-                            softWrap = false,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
-                    if (serverRuleActive) {
-                        Text(
-                            text = "Задано правилом сервера",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
                 }
             }
 

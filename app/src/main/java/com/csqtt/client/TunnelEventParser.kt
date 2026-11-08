@@ -44,6 +44,7 @@ object TunnelEventParser {
         data class Progress(val kind: String) : Event()
         data class Dtls(val worker: Int, val message: String = "") : Event()
         data class Routing(val routing: String) : Event()
+        data object RoutingAbsent : Event()
         data class Workers(val workers: Int) : Event()
         data object TunLost : Event()
     }
@@ -91,6 +92,7 @@ object TunnelEventParser {
             }
             "CONFIG" -> Event.Config(payload.optString("config", ""))
             "ROUTING" -> Event.Routing(payload.optString("routing", ""))
+            "ROUTING_ABSENT" -> Event.RoutingAbsent
             "TUN_LOST" -> Event.TunLost
             "WORKERS" -> payload.optInt("workers", -1)
                 .takeIf { it == 0 || it in MIN_SERVER_WORKERS..CsqttConstants.Tunnel.MAX_WORKERS }

@@ -45,7 +45,6 @@ class PackageChangePolicyTest {
         isWhite = isWhite,
         packages = packages,
         domains = emptyList(),
-        templateDomains = false,
         presetRed = preset.red.toList(),
         presetOrange = preset.orange.toList(),
     )

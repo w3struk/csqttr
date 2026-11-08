@@ -123,20 +123,20 @@ struct Arguments {
     validate_vk_hashes: bool,
     #[arg(long = "domain-routing", default_value_t = false)]
     domain_routing: bool,
-    #[arg(long = "template-domains", default_value_t = false)]
-    template_domains: bool,
     #[arg(long = "domain-whitelist", default_value_t = false)]
     domain_whitelist: bool,
     #[arg(long = "direct-domains", default_value = "")]
     direct_domains: String,
     #[arg(long = "domains-file")]
     domains_file: Vec<String>,
-    #[arg(long = "ip-routing", default_value_t = false)]
-    ip_routing: bool,
     #[arg(long = "ip-whitelist", default_value_t = false)]
     ip_whitelist: bool,
     #[arg(long = "direct-ips", default_value = "")]
     direct_ips: String,
+    #[arg(long = "routing-ips-sha", default_value = "")]
+    routing_ips_sha: String,
+    #[arg(long = "routing-content-sha-file", default_value = "")]
+    routing_content_sha_file: String,
     #[arg(long = "exact-workers", default_value_t = false)]
     exact_workers: bool,
 }
@@ -307,16 +307,21 @@ async fn run(arguments: Arguments) -> Result<i32> {
         }
     }
     direct_domains.truncate(1024);
-    let ip_rules = crate::sni::parse_ip_rules(&arguments.direct_ips);
     let domain_routing = dispatcher::DomainRoutingConfig {
         enabled: arguments.domain_routing,
-        template_domains: arguments.template_domains,
         direct_domains: Arc::new(direct_domains),
         is_whitelist: arguments.domain_whitelist,
-        ip_routing_enabled: arguments.ip_routing,
         ip_is_whitelist: arguments.ip_whitelist,
-        ip_rules: Arc::new(ip_rules),
+        ip_rules: Arc::new(sni::IpRuleSet::parse(&arguments.direct_ips)),
+        template_ip_rules: Arc::new(sni::IpRuleSet::default()),
     };
+    let routing_ips_sha = protocol::parse_routing_ips_sha(&arguments.routing_ips_sha);
+    if routing_ips_sha.is_none() && !arguments.routing_ips_sha.trim().is_empty() {
+        crate::log_error!("[КЛИЕНТ] -routing-ips-sha проигнорирован: ожидается 64 hex");
+    }
+    let routing_ips_sha: Option<Arc<str>> = routing_ips_sha.map(Arc::from);
+    let routing_content_sha_file = (!arguments.routing_content_sha_file.trim().is_empty())
+        .then(|| std::path::PathBuf::from(arguments.routing_content_sha_file.trim()));
     let dispatcher_result = Dispatcher::start_with_domain_routing(
         &arguments.listen,
         tun_uds,
@@ -375,6 +380,8 @@ async fn run(arguments: Arguments) -> Result<i32> {
         password: Arc::from(password.as_str()),
         workers: params_workers,
         configured_workers: workers,
+        routing_ips_sha: routing_ips_sha.clone(),
+        routing_content_sha_file: routing_content_sha_file.clone(),
     });
     print_configuration(
         &arguments,
@@ -577,13 +584,13 @@ fn normalize_cli_argument(argument: String) -> String {
         "tun-uds",
         "validate-vk-hashes",
         "domain-routing",
-        "template-domains",
         "domain-whitelist",
         "direct-domains",
         "domains-file",
-        "ip-routing",
         "ip-whitelist",
         "direct-ips",
+        "routing-ips-sha",
+        "routing-content-sha-file",
         "runtime-threads",
         "workers",
         "exact-workers",
@@ -791,6 +798,16 @@ fn start_control_input(
                         }
                     } else if let Some(payload) = line.strip_prefix("UPDATE_DOMAINS|") {
                         dispatcher.update_domain_routing(payload);
+                    } else if let Some(payload) = line.strip_prefix("UPDATE_IPS|") {
+                        let (sha, blob) = payload.split_once('|').unwrap_or((payload, ""));
+                        if let Err(error) = dispatcher
+                            .update_template_ip_rules(sha, (!blob.is_empty()).then_some(blob))
+                        {
+                            crate::log_error!("[КЛИЕНТ] Ошибка UPDATE_IPS: {error}");
+                            if control_required {
+                                cancel.cancel();
+                            }
+                        }
                     }
                 }
             }
@@ -803,6 +820,10 @@ fn loggable_stdin_line(line: &str) -> &str {
         "CAPTCHA_RESULT|<скрыто>"
     } else if line.starts_with("VK_JS_BOOTSTRAP:") {
         "VK_JS_BOOTSTRAP:<скрыто>"
+    } else if line.starts_with("UPDATE_IPS|") {
+        "UPDATE_IPS|<скрыто>"
+    } else if line.starts_with("UPDATE_DOMAINS|") {
+        "UPDATE_DOMAINS|<скрыто>"
     } else {
         line
     }
@@ -967,6 +988,10 @@ mod worker_count_tests {
             normalize_cli_argument("-client-ids".to_owned()),
             "--client-ids"
         );
+        assert_eq!(
+            normalize_cli_argument("-routing-content-sha-file".to_owned()),
+            "--routing-content-sha-file"
+        );
         assert_eq!(normalize_cli_argument("-Wabc".to_owned()), "-Wabc");
     }
 
@@ -1051,11 +1076,19 @@ mod worker_count_tests {
     }
 
     #[test]
-    fn single_dash_domain_flags_and_files_parse_correctly() {
+    fn stdin_logging_hides_payload_lines() {
         assert_eq!(
-            normalize_cli_argument("-template-domains".to_owned()),
-            "--template-domains"
+            loggable_stdin_line("UPDATE_IPS|abc|def"),
+            "UPDATE_IPS|<скрыто>"
         );
+        assert_eq!(
+            loggable_stdin_line("UPDATE_DOMAINS|enabled=1;domains=vk.com"),
+            "UPDATE_DOMAINS|<скрыто>"
+        );
+    }
+
+    #[test]
+    fn single_dash_domain_flags_and_files_parse_correctly() {
         assert_eq!(
             normalize_cli_argument("-domains-file".to_owned()),
             "--domains-file"
@@ -1066,7 +1099,6 @@ mod worker_count_tests {
             "abc",
             "--peer",
             "127.0.0.1:9000",
-            "-template-domains",
             "-domains-file",
             "domains.txt",
         ];
@@ -1074,7 +1106,6 @@ mod worker_count_tests {
             .iter()
             .map(|s| normalize_cli_argument(s.to_string()));
         let arguments = Arguments::try_parse_from(normalized).unwrap();
-        assert!(arguments.template_domains);
         assert_eq!(arguments.domains_file, vec!["domains.txt"]);
     }
 }

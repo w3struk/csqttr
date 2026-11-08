@@ -4,7 +4,7 @@ use socket2::SockRef;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, OnceLock, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
@@ -111,14 +111,11 @@ async fn run_full_preresolve_task(
     domain_routing: Arc<ArcSwap<crate::dispatcher::DomainRoutingConfig>>,
     generation: u64,
     current_generation: Arc<std::sync::atomic::AtomicU64>,
-    include_template: bool,
     custom_domains: Vec<String>,
 ) {
     let mut domains_to_resolve = Vec::new();
-    if include_template {
-        for &d in PRERESOLVE_DOMAINS {
-            domains_to_resolve.push(d.to_string());
-        }
+    for &d in PRERESOLVE_DOMAINS {
+        domains_to_resolve.push(d.to_string());
     }
     for d in custom_domains {
         let trimmed = d.trim().to_lowercase();
@@ -212,6 +209,53 @@ fn is_local_or_private_ip(ip: &IpAddr) -> bool {
     }
 }
 
+const MAX_UDP_VERDICTS: usize = 4096;
+const UDP_VERDICT_TTL: Duration = Duration::from_secs(120);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct VerdictKey {
+    src: SocketAddr,
+    dst: SocketAddr,
+    protocol: u8,
+}
+
+#[derive(Default)]
+struct VerdictCache {
+    entries: HashMap<VerdictKey, (crate::sni::RouteVerdict, Instant)>,
+}
+
+impl VerdictCache {
+    fn get(&self, key: &VerdictKey, now: Instant) -> Option<crate::sni::RouteVerdict> {
+        self.entries.get(key).and_then(|(verdict, seen)| {
+            (now.duration_since(*seen) < UDP_VERDICT_TTL).then_some(*verdict)
+        })
+    }
+
+    fn insert(&mut self, key: VerdictKey, verdict: crate::sni::RouteVerdict, now: Instant) {
+        if self.entries.len() >= MAX_UDP_VERDICTS {
+            self.retain_fresh(now);
+            if self.entries.len() >= MAX_UDP_VERDICTS {
+                self.entries.clear();
+            }
+        }
+        self.entries.insert(key, (verdict, now));
+    }
+
+    fn retain_fresh(&mut self, now: Instant) {
+        self.entries
+            .retain(|_, (_, seen)| now.duration_since(*seen) < UDP_VERDICT_TTL);
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 pub struct DirectRelay {
     domain_routing: Arc<ArcSwap<crate::dispatcher::DomainRoutingConfig>>,
     direct_ips: Arc<ArcSwap<std::collections::HashSet<IpAddr>>>,
@@ -220,6 +264,7 @@ pub struct DirectRelay {
     inbound_tx: mpsc::Sender<PacketBuf>,
     direct_pkt_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     active_tcp: Arc<RwLock<HashMap<(SocketAddr, SocketAddr), std::time::Instant>>>,
+    udp_verdicts: Arc<RwLock<VerdictCache>>,
     udp_sessions: Arc<RwLock<HashMap<SocketAddr, Arc<tokio::net::UdpSocket>>>>,
     preresolve_generation: Arc<std::sync::atomic::AtomicU64>,
     shutdown: CancellationToken,
@@ -250,7 +295,6 @@ impl DirectRelay {
             let dns_map_clone = dns_domain_map.clone();
             let routing_clone = domain_routing.clone();
             let generation_clone = preresolve_generation.clone();
-            let include_template = config.template_domains;
             let custom_domains = config.direct_domains.to_vec();
             handle.spawn(async move {
                 run_full_preresolve_task(
@@ -259,7 +303,6 @@ impl DirectRelay {
                     routing_clone,
                     generation_id,
                     generation_clone,
-                    include_template,
                     custom_domains,
                 )
                 .await;
@@ -348,6 +391,7 @@ impl DirectRelay {
 
         let active_tcp = Arc::new(RwLock::new(HashMap::new()));
         let active_tcp_c = active_tcp.clone();
+        let udp_verdicts = Arc::new(RwLock::new(VerdictCache::default()));
 
         if let Some(mut listener) = tcp_listener {
             let shutdown_listener = shutdown.clone();
@@ -416,6 +460,7 @@ impl DirectRelay {
         }
 
         let active_tcp_cleanup = active_tcp.clone();
+        let udp_verdicts_cleanup = udp_verdicts.clone();
         let shutdown_cleanup = shutdown.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
@@ -430,6 +475,9 @@ impl DirectRelay {
                         now.duration_since(*last_seen) < Duration::from_secs(120)
                     });
                 }
+                if let Ok(mut cache) = udp_verdicts_cleanup.write() {
+                    cache.retain_fresh(now);
+                }
             }
         });
 
@@ -441,10 +489,20 @@ impl DirectRelay {
             inbound_tx,
             direct_pkt_tx,
             active_tcp,
+            udp_verdicts,
             udp_sessions: Arc::new(RwLock::new(HashMap::new())),
             preresolve_generation,
             shutdown,
         })
+    }
+
+    pub fn invalidate_route_caches(&self) {
+        if let Ok(mut guard) = self.active_tcp.write() {
+            guard.clear();
+        }
+        if let Ok(mut cache) = self.udp_verdicts.write() {
+            cache.clear();
+        }
     }
 
     pub fn sync_domain_routing(&self, config: &crate::dispatcher::DomainRoutingConfig) {
@@ -452,8 +510,9 @@ impl DirectRelay {
             .preresolve_generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             + 1;
+        self.invalidate_route_caches();
         if !config.enabled {
-            if !config.ip_routing_enabled {
+            if !config.ip_routing_enabled() {
                 self.direct_ips
                     .store(Arc::new(std::collections::HashSet::new()));
             }
@@ -471,7 +530,6 @@ impl DirectRelay {
             let dns_map_clone = self.dns_domain_map.clone();
             let routing_clone = self.domain_routing.clone();
             let generation_clone = self.preresolve_generation.clone();
-            let include_template = config.template_domains;
             let custom_domains = config.direct_domains.to_vec();
             handle.spawn(async move {
                 run_full_preresolve_task(
@@ -480,7 +538,6 @@ impl DirectRelay {
                     routing_clone,
                     generation_id,
                     generation_clone,
-                    include_template,
                     custom_domains,
                 )
                 .await;
@@ -498,7 +555,6 @@ impl DirectRelay {
             let dns_map_clone = self.dns_domain_map.clone();
             let routing_clone = self.domain_routing.clone();
             let generation_clone = self.preresolve_generation.clone();
-            let include_template = self.domain_routing.load().template_domains;
             handle.spawn(async move {
                 run_full_preresolve_task(
                     ips_clone,
@@ -506,7 +562,6 @@ impl DirectRelay {
                     routing_clone,
                     generation_id,
                     generation_clone,
-                    include_template,
                     domains,
                 )
                 .await;
@@ -524,7 +579,7 @@ impl DirectRelay {
 
     pub async fn try_handle(&self, packet: &PacketBuf) -> bool {
         let config = self.domain_routing.load();
-        if !config.enabled && !config.ip_routing_enabled {
+        if !config.enabled && !config.ip_routing_enabled() {
             return false;
         }
         let slice = packet.as_slice();
@@ -543,21 +598,20 @@ impl DirectRelay {
                     let is_direct = crate::sni::is_direct_domain_mode(
                         &domain,
                         config.is_whitelist,
-                        config.template_domains,
                         &config.direct_domains,
                     );
                     if is_direct {
                         self.handle_dns_query(slice, &domain, true);
                         return true;
                     }
-                } else if config.ip_routing_enabled {
+                } else if config.ip_routing_enabled() {
                     let is_tunnel_dns = if let Some(dst_addr) = crate::sni::extract_dst_addr(slice)
                     {
                         let dst_ip = dst_addr.ip();
                         if config.ip_is_whitelist {
-                            config.ip_rules.iter().any(|r| r.matches(&dst_ip))
+                            config.ip_matches(&dst_ip)
                         } else {
-                            !config.ip_rules.iter().any(|r| r.matches(&dst_ip))
+                            !config.ip_matches(&dst_ip)
                         }
                     } else {
                         false
@@ -662,31 +716,36 @@ impl DirectRelay {
             }
         }
 
-        let domain = self.dns_domain_map.get(&dst_ip);
-        let verdict = crate::sni::evaluate_route(
-            &dst_ip,
-            domain.as_deref(),
-            config.enabled,
-            config.is_whitelist,
-            config.template_domains,
-            &config.direct_domains,
-            config.ip_routing_enabled,
-            config.ip_is_whitelist,
-            &config.ip_rules,
-        );
-
-        let is_candidate_direct = if self.is_direct_ip(&dst_ip) {
-            if config.ip_routing_enabled && config.ip_is_whitelist && !config.ip_rules.is_empty() {
-                !config.ip_rules.iter().any(|r| r.matches(&dst_ip))
-            } else {
-                true
-            }
-        } else {
-            matches!(verdict, crate::sni::RouteVerdict::Direct)
-        };
-
         if protocol == 17 {
-            if !is_candidate_direct {
+            let verdict_key = VerdictKey {
+                src: src_addr,
+                dst: dst_addr,
+                protocol,
+            };
+            let now = Instant::now();
+            let cached = self
+                .udp_verdicts
+                .read()
+                .ok()
+                .and_then(|cache| cache.get(&verdict_key, now));
+            let direct = if let Some(verdict) = cached {
+                matches!(verdict, crate::sni::RouteVerdict::Direct)
+            } else {
+                let direct = self.packet_is_direct(&config, &dst_ip);
+                if let Ok(mut cache) = self.udp_verdicts.write() {
+                    cache.insert(
+                        verdict_key,
+                        if direct {
+                            crate::sni::RouteVerdict::Direct
+                        } else {
+                            crate::sni::RouteVerdict::Tunnel
+                        },
+                        now,
+                    );
+                }
+                direct
+            };
+            if !direct {
                 return false;
             }
             return self
@@ -698,7 +757,7 @@ impl DirectRelay {
             return false;
         }
 
-        if is_candidate_direct {
+        if self.packet_is_direct(&config, &dst_ip) {
             if let Ok(mut guard) = self.active_tcp.write() {
                 guard.insert(key, std::time::Instant::now());
             }
@@ -707,6 +766,34 @@ impl DirectRelay {
         }
 
         false
+    }
+
+    fn packet_is_direct(
+        &self,
+        config: &crate::dispatcher::DomainRoutingConfig,
+        dst_ip: &IpAddr,
+    ) -> bool {
+        let domain = self.dns_domain_map.get(dst_ip);
+        let verdict = crate::sni::evaluate_route(
+            dst_ip,
+            domain.as_deref(),
+            config.enabled,
+            config.is_whitelist,
+            &config.direct_domains,
+            config.ip_routing_enabled(),
+            config.ip_is_whitelist,
+            &config.ip_rules,
+            &config.template_ip_rules,
+        );
+        if self.is_direct_ip(dst_ip) {
+            if config.ip_routing_enabled() && config.ip_is_whitelist && config.has_ip_rules() {
+                !config.ip_matches(dst_ip)
+            } else {
+                true
+            }
+        } else {
+            matches!(verdict, crate::sni::RouteVerdict::Direct)
+        }
     }
 
     async fn handle_direct_udp_packet(
@@ -1308,11 +1395,10 @@ mod tests {
             crate::dispatcher::DomainRoutingConfig {
                 enabled: true,
                 is_whitelist: false,
-                template_domains: false,
                 direct_domains: vec!["example.com".to_string()].into(),
-                ip_routing_enabled: false,
                 ip_is_whitelist: false,
-                ip_rules: vec![].into(),
+                ip_rules: std::sync::Arc::new(crate::sni::IpRuleSet::default()),
+                template_ip_rules: std::sync::Arc::new(crate::sni::IpRuleSet::default()),
             },
         ));
         let direct_ips = Arc::new(ArcSwap::from_pointee(std::collections::HashSet::new()));
@@ -1394,11 +1480,10 @@ mod tests {
             crate::dispatcher::DomainRoutingConfig {
                 enabled: true,
                 is_whitelist: false,
-                template_domains: false,
                 direct_domains: vec!["example.com".to_string()].into(),
-                ip_routing_enabled: false,
                 ip_is_whitelist: false,
-                ip_rules: vec![].into(),
+                ip_rules: std::sync::Arc::new(crate::sni::IpRuleSet::default()),
+                template_ip_rules: std::sync::Arc::new(crate::sni::IpRuleSet::default()),
             },
         ));
         let direct_ips = Arc::new(ArcSwap::from_pointee(std::collections::HashSet::new()));
@@ -1438,11 +1523,10 @@ mod tests {
             crate::dispatcher::DomainRoutingConfig {
                 enabled: true,
                 is_whitelist: false,
-                template_domains: false,
                 direct_domains: vec!["example.com".to_string()].into(),
-                ip_routing_enabled: false,
                 ip_is_whitelist: false,
-                ip_rules: vec![].into(),
+                ip_rules: std::sync::Arc::new(crate::sni::IpRuleSet::default()),
+                template_ip_rules: std::sync::Arc::new(crate::sni::IpRuleSet::default()),
             },
         ));
         let direct_ips = Arc::new(ArcSwap::from_pointee(std::collections::HashSet::new()));
@@ -1479,17 +1563,181 @@ mod tests {
         assert!(!handled);
     }
 
+    #[test]
+    fn repeated_udp_packets_read_the_cached_verdict() {
+        let mut cache = VerdictCache::default();
+        let mut evaluations = 0;
+        let key = VerdictKey {
+            src: "10.0.0.1:5000".parse().unwrap(),
+            dst: "8.8.8.8:53".parse().unwrap(),
+            protocol: 17,
+        };
+        let now = Instant::now();
+        for _ in 0..5 {
+            if cache.get(&key, now).is_none() {
+                evaluations += 1;
+                cache.insert(key, crate::sni::RouteVerdict::Tunnel, now);
+            }
+        }
+        assert_eq!(evaluations, 1);
+    }
+
+    #[test]
+    fn udp_verdict_is_invisible_to_tcp() {
+        let mut cache = VerdictCache::default();
+        let udp = VerdictKey {
+            src: "10.0.0.1:5000".parse().unwrap(),
+            dst: "8.8.8.8:443".parse().unwrap(),
+            protocol: 17,
+        };
+        let tcp = VerdictKey { protocol: 6, ..udp };
+        let now = Instant::now();
+        cache.insert(udp, crate::sni::RouteVerdict::Direct, now);
+        assert_eq!(cache.get(&udp, now), Some(crate::sni::RouteVerdict::Direct));
+        assert_eq!(cache.get(&tcp, now), None);
+    }
+
+    #[test]
+    fn a_stale_udp_verdict_is_recomputed() {
+        let mut cache = VerdictCache::default();
+        let key = VerdictKey {
+            src: "10.0.0.1:5000".parse().unwrap(),
+            dst: "8.8.8.8:53".parse().unwrap(),
+            protocol: 17,
+        };
+        let now = Instant::now();
+        cache.insert(
+            key,
+            crate::sni::RouteVerdict::Direct,
+            now - Duration::from_secs(130),
+        );
+        assert_eq!(cache.get(&key, now), None);
+    }
+
+    #[test]
+    fn udp_verdict_cache_is_bounded() {
+        let mut cache = VerdictCache::default();
+        let now = Instant::now();
+        for index in 0..(MAX_UDP_VERDICTS + 100) {
+            cache.insert(verdict_key(index), crate::sni::RouteVerdict::Tunnel, now);
+        }
+        assert!(cache.len() <= MAX_UDP_VERDICTS);
+    }
+
+    fn verdict_key(index: usize) -> VerdictKey {
+        let index = index as u32;
+        VerdictKey {
+            src: SocketAddr::from((
+                [10, (index >> 16) as u8, (index >> 8) as u8, index as u8],
+                1000,
+            )),
+            dst: SocketAddr::from(([8, 8, 8, 8], 53)),
+            protocol: 17,
+        }
+    }
+
+    fn test_relay_with_config(
+        config: crate::dispatcher::DomainRoutingConfig,
+    ) -> (DirectRelay, Arc<PacketPool>) {
+        let domain_routing = Arc::new(ArcSwap::from_pointee(config));
+        let direct_ips = Arc::new(ArcSwap::from_pointee(std::collections::HashSet::new()));
+        let dns_domain_map = Arc::new(crate::sni::DnsDomainMap::default());
+        let pool = PacketPool::new(64);
+        let (inbound_tx, _inbound_rx) = mpsc::channel(64);
+        let relay = DirectRelay::new(
+            domain_routing,
+            direct_ips,
+            dns_domain_map,
+            pool.clone(),
+            inbound_tx,
+        )
+        .expect("smoltcp test stack must initialize");
+        (relay, pool)
+    }
+
+    #[tokio::test]
+    async fn udp_flow_is_cached_after_the_first_packet() {
+        let config = crate::dispatcher::DomainRoutingConfig {
+            template_ip_rules: Arc::new(crate::sni::IpRuleSet::parse("93.184.216.34")),
+            ..Default::default()
+        };
+        let (relay, pool) = test_relay_with_config(config);
+        let src: SocketAddr = "10.66.67.2:5000".parse().unwrap();
+        let dst: SocketAddr = "93.184.216.34:5000".parse().unwrap();
+        let raw = build_udp_packet(src, dst, b"hello").unwrap();
+
+        for _ in 0..2 {
+            let mut packet = pool.try_acquire().unwrap();
+            packet.extend_tail(raw.len()).unwrap().copy_from_slice(&raw);
+            assert!(relay.try_handle(&packet).await);
+        }
+        assert_eq!(relay.udp_verdicts.read().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn tcp_syn_does_not_read_the_udp_cache() {
+        let config = crate::dispatcher::DomainRoutingConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let (relay, pool) = test_relay_with_config(config);
+        let src: SocketAddr = "10.66.67.2:5000".parse().unwrap();
+        let dst: SocketAddr = "8.8.8.8:443".parse().unwrap();
+        relay.udp_verdicts.write().unwrap().insert(
+            VerdictKey {
+                src,
+                dst,
+                protocol: 17,
+            },
+            crate::sni::RouteVerdict::Direct,
+            Instant::now(),
+        );
+        let raw = build_tcp_packet(src, dst, 1, 0, 0x02, &[]).unwrap();
+        let mut packet = pool.try_acquire().unwrap();
+        packet.extend_tail(raw.len()).unwrap().copy_from_slice(&raw);
+        assert!(!relay.try_handle(&packet).await);
+    }
+
+    #[tokio::test]
+    async fn routing_config_change_clears_cached_verdicts() {
+        let config = crate::dispatcher::DomainRoutingConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let (relay, _pool) = test_relay_with_config(config);
+        let src: SocketAddr = "10.66.67.2:5000".parse().unwrap();
+        let dst: SocketAddr = "8.8.8.8:443".parse().unwrap();
+        relay
+            .active_tcp
+            .write()
+            .unwrap()
+            .insert((src, dst), Instant::now());
+        relay.udp_verdicts.write().unwrap().insert(
+            VerdictKey {
+                src,
+                dst,
+                protocol: 17,
+            },
+            crate::sni::RouteVerdict::Direct,
+            Instant::now(),
+        );
+
+        relay.sync_domain_routing(&crate::dispatcher::DomainRoutingConfig::default());
+
+        assert!(relay.active_tcp.read().unwrap().is_empty());
+        assert_eq!(relay.udp_verdicts.read().unwrap().len(), 0);
+    }
+
     #[tokio::test]
     async fn test_run_full_preresolve_task_preserves_dynamic_ips() {
         let domain_routing = Arc::new(ArcSwap::from_pointee(
             crate::dispatcher::DomainRoutingConfig {
                 enabled: true,
                 is_whitelist: false,
-                template_domains: false,
                 direct_domains: vec![].into(),
-                ip_routing_enabled: false,
                 ip_is_whitelist: false,
-                ip_rules: vec![].into(),
+                ip_rules: std::sync::Arc::new(crate::sni::IpRuleSet::default()),
+                template_ip_rules: std::sync::Arc::new(crate::sni::IpRuleSet::default()),
             },
         ));
         let dynamic_ip: IpAddr = "123.45.67.89".parse().unwrap();
@@ -1505,7 +1753,6 @@ mod tests {
             domain_routing,
             1,
             current_gen,
-            false,
             vec![],
         )
         .await;
