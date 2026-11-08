@@ -55,6 +55,37 @@ class DeployDomainCheckContractTest {
     }
 
     @Test
+    fun `architecture is checked before asset extraction and the first upload`() {
+        val body = performDeployBody()
+        val uname = body.indexOf("sshClient.execResult(\"uname -m\"")
+        val exitGuard = body.indexOf("if (architectureResult.exitStatus != 0)")
+        val policy = body.indexOf("serverArchitectureForMachine(architectureResult.output)")
+        val firstUpload = body.indexOf("sshClient.upload(")
+        assertTrue("нет запроса архитектуры через uname -m", uname >= 0)
+        assertTrue("нет проверки успешного exit uname -m", exitGuard >= 0)
+        assertTrue("нет вызова policy архитектуры VPS", policy >= 0)
+        assertTrue("первая загрузка на сервер не найдена", firstUpload >= 0)
+        assertTrue("exit uname -m проверяется после команды", uname < exitGuard)
+        assertTrue("exit uname -m проверяется до policy", exitGuard < policy)
+        assertTrue(
+            "неуспешный uname -m должен останавливать установку",
+            body.substring(exitGuard, policy).contains("throw IOException("),
+        )
+        for (preparationCall in listOf(
+            "val workingDir = File(",
+            "val scriptFile = extractAsset(\"deploy.sh\")",
+            "val serverFile = extractAsset(serverArchitecture.assetName)",
+            "val environmentFile = File(",
+            "val overridesFile = File(",
+        )) {
+            val preparation = body.indexOf(preparationCall)
+            assertTrue("подготовка файлов не найдена: $preparationCall", preparation >= 0)
+            assertTrue("policy должна идти до $preparationCall", policy < preparation)
+            assertTrue("$preparationCall должен идти до первой загрузки", preparation < firstUpload)
+        }
+    }
+
+    @Test
     fun `domain probe asks for both address families in one command`() {
         val operations = deployOperations()
         assertEquals(

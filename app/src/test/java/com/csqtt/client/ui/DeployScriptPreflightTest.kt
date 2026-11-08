@@ -34,25 +34,37 @@ class DeployScriptPreflightTest {
     }
 
     @Test
-    fun `installer accepts the supported server architectures`() {
-        val deploy = script()
-        assertTrue(deploy.contains("x86_64|amd64"))
-        assertTrue(deploy.contains("aarch64|arm64"))
-        assertTrue(deploy.contains("armv7l|armv7|armhf"))
-        assertTrue(deploy.contains("Поддерживаются: x86_64, aarch64, armv7l"))
+    fun `installer accepts only amd64 server architecture aliases`() {
+        val runtimeTools = script().substringAfter("require_runtime_tools() {").substringBefore("\n}\n")
+        assertTrue(runtimeTools.contains("x86_64|amd64"))
+        assertTrue(runtimeTools.contains("Поддерживается только x86_64/amd64"))
+        assertFalse(runtimeTools.contains("aarch64|arm64"))
+        assertFalse(runtimeTools.contains("armv7l|armv7|armhf"))
     }
 
     @Test
     fun `client uploads the release before one atomic runtime switch`() {
         val deploy = script()
-        val installBranch = deploy.substringAfter("install|--install|-i)")
+        val installBranch = deploy.substringAfter("install|--install|-i)").substringBefore("\n            ;;")
+        val runtimeTools = installBranch.indexOf("require_runtime_tools")
+        val dockerSetup = installBranch.indexOf("ensure_docker")
+        val dockerCandidate = installBranch.indexOf("prepare_docker_candidate")
+        val cutover = installBranch.indexOf("DEPLOY_PHASE=\"cutover\"")
         val uploadCheck = installBranch.indexOf("prepare_uploaded_release")
         val cleanup = installBranch.indexOf("csqtt_cleanup")
         val binary = installBranch.indexOf("setup_csqtt_binary")
         val preflight = installBranch.indexOf("run_platform_preflight")
         val firewall = installBranch.indexOf("setup_nat_and_firewall")
+        assertTrue(runtimeTools >= 0)
+        assertTrue(dockerSetup >= 0)
+        assertTrue(dockerCandidate >= 0)
+        assertTrue(cutover >= 0)
+        assertTrue(runtimeTools < dockerSetup)
+        assertTrue(runtimeTools < dockerCandidate)
+        assertTrue(runtimeTools < cutover)
         assertTrue(uploadCheck >= 0)
         assertTrue(cleanup >= 0)
+        assertTrue(runtimeTools < cleanup)
         assertTrue(binary >= 0)
         assertTrue(binary > preflight)
         assertTrue(binary > firewall)

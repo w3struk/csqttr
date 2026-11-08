@@ -1177,6 +1177,35 @@ for forbidden in (
         % (forbidden,),
     )
 
+# 10.20 Staging сервера — один явный amd64 source, не ARM и не glob.
+# Проверяем только существующий исходный run-блок, не симулируем раннер.
+stage = by_name["Stage build outputs"]
+stage_run = str(stage.get("run", ""))
+server_sources = re.findall(r"app/build/generated/assets/[^\s\\\"']+", stage_run)
+want(
+    server_sources == ["app/build/generated/assets/csqtt-linux-amd64"],
+    "'Stage build outputs' обязан иметь только один явный amd64 server source, "
+    "получено %r" % (server_sources,),
+)
+want(
+    "csqtt-linux-arm64" not in stage_run and "csqtt-linux-armv7" not in stage_run,
+    "'Stage build outputs' не должен ссылаться на ARM server assets",
+)
+want(
+    not any(char in source for source in server_sources for char in "*?["),
+    "'Stage build outputs' не должен копировать серверные assets глобом",
+)
+want(
+    'cp -f app/build/generated/assets/csqtt-linux-amd64 "$STAGE/assets/"' in stage_run,
+    "'Stage build outputs' обязан явно копировать amd64 server в $STAGE/assets/",
+)
+want(
+    stage.get("id") == "stage"
+    and 'STAGE="$RUNNER_TEMP/build-output"' in stage_run
+    and 'echo "dir=$STAGE" >> "$GITHUB_OUTPUT"' in stage_run,
+    "'Stage build outputs' обязан сохранять id: stage и output dir для build-output",
+)
+
 print("BUILD OK")
 PY
 

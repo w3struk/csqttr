@@ -163,8 +163,6 @@ internal enum class ServerArchitecture(
     val displayName: String,
 ) {
     AMD64("csqtt-linux-amd64", "amd64"),
-    ARM64("csqtt-linux-arm64", "ARM64"),
-    ARMV7("csqtt-linux-armv7", "ARM32"),
 }
 
 internal fun serverArchitectureForMachine(output: String): ServerArchitecture {
@@ -173,10 +171,8 @@ internal fun serverArchitectureForMachine(output: String): ServerArchitecture {
         ?: throw IOException("VPS не вернул архитектуру через uname -m")
     return when (machine) {
         "x86_64", "amd64" -> ServerArchitecture.AMD64
-        "aarch64", "arm64" -> ServerArchitecture.ARM64
-        "armv7l", "armv7", "armhf" -> ServerArchitecture.ARMV7
         else -> throw IOException(
-            "Архитектура VPS $machine пока не поддерживается. Поддерживаются: x86_64, aarch64, armv7l",
+            "Архитектура VPS $machine не поддерживается. Поддерживается только x86_64/amd64",
         )
     }
 }
@@ -184,8 +180,6 @@ internal fun serverArchitectureForMachine(output: String): ServerArchitecture {
 private fun deployAssetLabel(fileName: String): String = when (fileName) {
     "deploy.sh" -> "скрипт установки"
     "csqtt-linux-amd64" -> "сервер CSQTT (amd64)"
-    "csqtt-linux-arm64" -> "сервер CSQTT (ARM64)"
-    "csqtt-linux-armv7" -> "сервер CSQTT (ARM32)"
     "csqtt.env" -> "настройки веб-панели"
     "csqtt-deploy.json" -> "настройки доступа"
     "hev-socks5-tunnel" -> "C-движок туннеля"

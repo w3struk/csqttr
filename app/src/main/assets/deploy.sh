@@ -593,9 +593,7 @@ require_runtime_tools() {
     fi
     case "$(uname -m)" in
         x86_64|amd64) log_info "Архитектура VPS: amd64" ;;
-        aarch64|arm64) log_info "Архитектура VPS: ARM64" ;;
-        armv7l|armv7|armhf) log_info "Архитектура VPS: ARM32" ;;
-        *) die "Архитектура VPS $(uname -m) не поддерживается. Поддерживаются: x86_64, aarch64, armv7l." ;;
+        *) die "Архитектура VPS $(uname -m) не поддерживается. Поддерживается только x86_64/amd64." ;;
     esac
 }
 

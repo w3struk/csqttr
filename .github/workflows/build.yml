@@ -322,8 +322,8 @@ jobs:
       # Сверка установленных нативных артефактов с промежуточными: ловит
       # подменённый или протухший бинарник до публикации. ABI-скоуп обязателен:
       # у native_client_provenance.sh дефолт — все три ABI, и сборка с одним
-      # ABI упала бы на отсутствующем. Серверные бинарники всегда под три
-      # архитектуры, поэтому server_asset_provenance.sh флага не знает.
+      # ABI упала бы на отсутствующем. Серверный бинарник всегда amd64,
+      # поэтому server_asset_provenance.sh флага не знает.
       - name: Verify native provenance
         run: |
           set -euo pipefail
@@ -340,9 +340,7 @@ jobs:
           rm -rf "$STAGE"
           mkdir -p "$STAGE/apk" "$STAGE/assets"
           cp -f app/build/outputs/apk/release/*.apk "$STAGE/apk/"
-          cp -f app/build/generated/assets/csqtt-linux-amd64 \
-                app/build/generated/assets/csqtt-linux-arm64 \
-                app/build/generated/assets/csqtt-linux-armv7 "$STAGE/assets/"
+          cp -f app/build/generated/assets/csqtt-linux-amd64 "$STAGE/assets/"
           compgen -G "$STAGE/apk/*.apk" > /dev/null || {
             echo "no APK produced in app/build/outputs/apk/release" >&2
             exit 1

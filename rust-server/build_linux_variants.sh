@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: 2026 amurcanov
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 #
-# Compile the three Linux musl server variants with cargo-zigbuild.
+# Compile the amd64 Linux musl release server with cargo-zigbuild.
 #
 # Each variant gets its own CARGO_TARGET_DIR ($ROOT/build/csqtt-uring-linux-<asset>)
 # and its own zig cache, so the builds never share state and can run in parallel.
@@ -19,16 +19,16 @@ LOG_DIR="$ROOT/build/csqtt-uring-linux-logs"
 
 TOOLCHAIN="1.97.1"
 
-VARIANT_NAMES=(amd64 arm64 armv7)
-VARIANT_TARGETS=(x86_64-unknown-linux-musl aarch64-unknown-linux-musl armv7-unknown-linux-musleabihf)
-VARIANT_ASSETS=(csqtt-linux-amd64 csqtt-linux-arm64 csqtt-linux-armv7)
+VARIANT_NAMES=(amd64)
+VARIANT_TARGETS=(x86_64-unknown-linux-musl)
+VARIANT_ASSETS=(csqtt-linux-amd64)
 
 usage() {
   cat <<'EOF'
 Usage: build_linux_variants.sh [--jobs=N] [--sequential] [--cargo-feature=NAME]
 
   --jobs=N       maximum number of parallel variant builds (default: nproc / 4)
-  --sequential   compile the variants one at a time (low-RAM hosts)
+  --sequential   use the sequential build path (low-RAM hosts)
   --cargo-feature=NAME  enable a cargo feature (repeatable)
   -h, --help     show this help
 EOF
@@ -153,8 +153,8 @@ TOTAL_START=$SECONDS
 FAILED=0
 
 echo "================================================================================"
-echo "  Building $TOTAL Linux server variants (jobs: $JOBS$([[ "$SEQUENTIAL" == 1 ]] && echo ', sequential'))"
-echo "  Targets: amd64 (x86_64), arm64 (aarch64), armv7 (armv7eabihf)"
+echo "  Building $TOTAL Linux server variant (jobs: $JOBS$([[ "$SEQUENTIAL" == 1 ]] && echo ', sequential'))"
+echo "  Target:  amd64 (x86_64-unknown-linux-musl)"
 echo "  Logs:    ${LOG_DIR#"$ROOT/"}/<name>.log"
 echo "================================================================================"
 
@@ -233,4 +233,4 @@ if ((FAILED != 0)); then
 fi
 
 echo
-echo "All Linux server variants compiled successfully."
+echo "Linux amd64 server compiled successfully."

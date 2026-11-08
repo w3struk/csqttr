@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: 2026 amurcanov
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 #
-# Собирает ассеты релиза: три APK из Gradle, три серверных бинаря и
-# SHA256SUMS. Имена входов жёсткие — никаких глобов «по совпадению имени».
+# Собирает пять ассетов релиза: три APK из Gradle, один серверный бинарь и
+# SHA256SUMS с четырьмя записями. Имена входов жёсткие — никаких глобов.
 #
 # Usage:
 #   collect-release-assets.sh --root DIR [--apk-dir DIR] [--assets-dir DIR]
@@ -16,10 +16,11 @@ usage() {
 Usage: collect-release-assets.sh --root DIR [--apk-dir DIR] [--assets-dir DIR]
                                  --out DIR [--list-file FILE] [--version V]
 
-Copies the three release APKs and the three server binaries into --out,
-renames the APKs to CSQTT-<version>-<abi>.apk and writes SHA256SUMS.
-Prints the seven absolute paths (SHA256SUMS last) to stdout and to the
+Copies the three release APKs and the amd64 server binary into --out,
+renames the APKs to CSQTT-<version>-<abi>.apk and writes four SHA256SUMS entries.
+Prints the five absolute paths (SHA256SUMS last) to stdout and to the
 list file.
+The default list file is --out/asset-paths.txt (not a release asset).
 EOF
 }
 
@@ -126,7 +127,7 @@ if [[ -z "$list_file" ]]; then
 fi
 
 abis=(universal arm64-v8a armeabi-v7a)
-server_binaries=(csqtt-linux-amd64 csqtt-linux-arm64 csqtt-linux-armv7)
+server_binaries=(csqtt-linux-amd64)
 
 require_input() {
     local path="$1"
@@ -151,12 +152,14 @@ for binary in "${server_binaries[@]}"; do
     copied+=("$dst")
 done
 
+# Reused publication directories may contain obsolete ARM servers. Remove
+# only these known names; foreign files must survive and remain unpublished.
+rm -f -- "$out/csqtt-linux-arm64" "$out/csqtt-linux-armv7"
+
 (
     cd -- "$out" || exit 1
     sha256sum \
         "csqtt-linux-amd64" \
-        "csqtt-linux-arm64" \
-        "csqtt-linux-armv7" \
         "CSQTT-$version-universal.apk" \
         "CSQTT-$version-arm64-v8a.apk" \
         "CSQTT-$version-armeabi-v7a.apk" >SHA256SUMS

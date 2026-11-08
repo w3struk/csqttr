@@ -1,5 +1,6 @@
 import com.android.build.api.variant.FilterConfiguration
 import java.io.File
+import java.nio.file.Files
 import java.util.Properties
 import org.gradle.process.CommandLineArgumentProvider
 
@@ -310,7 +311,7 @@ dependencies {
 //
 //   build/generated/jniLibs/debug/<abi>/libclient.so    Cargo "dev" profile
 //   build/generated/jniLibs/release/<abi>/libclient.so Cargo "release" profile
-//   build/generated/assets/csqtt-linux-*               server binaries (release)
+//   build/generated/assets/csqtt-linux-amd64           server binary (release)
 //   build/generated/provenance/*.json                  provenance manifests
 //
 // Debug and release clients are built from separate Cargo target directories, so
@@ -366,8 +367,6 @@ fun clientCargoArtifacts(variant: String): List<File> = buildList {
 
 fun serverCargoArtifacts(): List<File> = listOf(
     "csqtt-linux-amd64" to "x86_64-unknown-linux-musl",
-    "csqtt-linux-arm64" to "aarch64-unknown-linux-musl",
-    "csqtt-linux-armv7" to "armv7-unknown-linux-musleabihf",
 ).map { (asset, target) ->
     rootBuildDir.resolve("csqtt-uring-linux-$asset/$target/release/csqtt")
 }
@@ -493,7 +492,7 @@ val buildNativeServer = tasks.register<Exec>("buildNativeServer") {
     val tests = (providers.gradleProperty("csqtt.nativeTests").orNull ?: "false").toBoolean()
 
     group = "build"
-    description = "Builds the Rust server binaries (static musl) into build/generated/assets."
+    description = "Builds the amd64 Rust server binary (static musl, release) into build/generated/assets."
     workingDir = rootProject.layout.projectDirectory.asFile
     commandLine("bash", "rust-server/build_linux.sh", if (tests) "--tests" else "--no-tests")
 
@@ -502,7 +501,18 @@ val buildNativeServer = tasks.register<Exec>("buildNativeServer") {
     outputs.dir(rustAssetsDir)
     outputs.file(rustProvenanceDir.resolve("csqtt-server.json"))
     val cargoArtifacts = serverCargoArtifacts()
-    outputs.upToDateWhen { cargoArtifacts.all { it.isFile } }
+    // Resolve plain Files before the predicate to keep configuration-cache safety.
+    // Dist is outside outputs.dir, so stale ARM payloads there must also force a build.
+    val staleServerOutputs = listOf(
+        rustAssetsDir.resolve("csqtt-linux-arm64"),
+        rustAssetsDir.resolve("csqtt-linux-armv7"),
+        rootProject.layout.projectDirectory.file("rust-server/dist/csqtt-linux-arm64").asFile,
+        rootProject.layout.projectDirectory.file("rust-server/dist/csqtt-linux-armv7").asFile,
+    )
+    outputs.upToDateWhen {
+        cargoArtifacts.all { it.isFile } &&
+            staleServerOutputs.none { it.exists() || Files.isSymbolicLink(it.toPath()) }
+    }
 
     onlyIf("the Rust server build is disabled") { enabled }
 }
@@ -511,7 +521,7 @@ val verifyNativeServer = tasks.register<Exec>("verifyNativeServer") {
     val skip = (providers.gradleProperty("csqtt.skipNativeVerification").orNull ?: "false").toBoolean()
 
     group = "verification"
-    description = "Verifies assets/csqtt-linux-* against build/generated/provenance/csqtt-server.json."
+    description = "Verifies assets/csqtt-linux-amd64 against build/generated/provenance/csqtt-server.json."
     workingDir = rootProject.layout.projectDirectory.asFile
     commandLine("bash", "scripts/server_asset_provenance.sh", "verify")
     onlyIf("native verification is not skipped") { !skip }
@@ -520,7 +530,7 @@ val verifyNativeServer = tasks.register<Exec>("verifyNativeServer") {
     doLast {
         if (executionResult.get().exitValue != 0) {
             throw GradleException(
-                "Native server assets are missing or stale. Gradle builds them with rust-server/build_linux.sh; " +
+                "Native server asset is missing or stale. Gradle builds it with rust-server/build_linux.sh; " +
                     "see the buildNativeServer output above or run it manually with --no-tests."
             )
         }

@@ -4,14 +4,14 @@
 
 # Writes or verifies the provenance manifest of the server binaries shipped in the
 # APK. Both the binaries and the manifest live under app/build/generated/.
-# Usage: server_asset_provenance.sh <write|verify> [--root DIR] [--assets a,b,c]
+# Usage: server_asset_provenance.sh <write|verify> [--root DIR] [--assets csqtt-linux-amd64]
 #                                         [--assets-dir DIR] [--manifest FILE]
 
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 MODE=""
-ALL_ASSETS=(csqtt-linux-amd64 csqtt-linux-arm64 csqtt-linux-armv7)
+ALL_ASSETS=(csqtt-linux-amd64)
 ASSETS=("${ALL_ASSETS[@]}")
 ASSET_DIR=""
 MANIFEST=""
@@ -37,6 +37,12 @@ require_cmd() {
     command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
 }
 
+select_assets() {
+    # Check the whole value: splitting would hide trailing commas or newlines.
+    [[ "$1" == "csqtt-linux-amd64" ]] || die "--assets must be exactly csqtt-linux-amd64"
+    ASSETS=("$1")
+}
+
 while (($#)); do
     case "$1" in
         write | verify) MODE="$1" ;;
@@ -47,11 +53,11 @@ while (($#)); do
             ;;
         --assets)
             (($# >= 2)) || die "--assets requires a value"
-            IFS=',' read -r -a ASSETS <<<"$2"
+            select_assets "$2"
             shift
             ;;
         --assets=*)
-            IFS=',' read -r -a ASSETS <<<"${1#--assets=}"
+            select_assets "${1#--assets=}"
             ;;
         --assets-dir)
             (($# >= 2)) || die "--assets-dir requires a value"
@@ -103,7 +109,7 @@ WIRE_REVISION_SOURCE="$ROOT/rust-server/main.rs"
 
 valid_asset() {
     case "$1" in
-        csqtt-linux-amd64 | csqtt-linux-arm64 | csqtt-linux-armv7) return 0 ;;
+        csqtt-linux-amd64) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -111,23 +117,18 @@ valid_asset() {
 asset_target() {
     case "$1" in
         csqtt-linux-amd64) printf 'x86_64-unknown-linux-musl\n' ;;
-        csqtt-linux-arm64) printf 'aarch64-unknown-linux-musl\n' ;;
-        csqtt-linux-armv7) printf 'armv7-unknown-linux-musleabihf\n' ;;
     esac
 }
 
 asset_elf_class() {
     case "$1" in
-        csqtt-linux-armv7) printf '1\n' ;;
-        *) printf '2\n' ;;
+        csqtt-linux-amd64) printf '2\n' ;;
     esac
 }
 
 asset_elf_machine() {
     case "$1" in
         csqtt-linux-amd64) printf '62\n' ;;
-        csqtt-linux-arm64) printf '183\n' ;;
-        csqtt-linux-armv7) printf '40\n' ;;
     esac
 }
 
@@ -393,6 +394,11 @@ done
 
 for asset in "${ASSETS[@]}"; do
     valid_asset "$asset" || die "unsupported server asset: $asset"
+done
+
+for stale_asset in csqtt-linux-arm64 csqtt-linux-armv7; do
+    [[ ! -e "$ASSET_DIR/$stale_asset" && ! -L "$ASSET_DIR/$stale_asset" ]] ||
+        die "stale ARM server asset: $ASSET_DIR/$stale_asset"
 done
 
 if [[ "$MODE" == "write" ]]; then

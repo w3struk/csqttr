@@ -4,12 +4,10 @@
 #
 # Linux-only server build pipeline for csqtt.
 #
-# Produces the three release assets shipped inside the APK and in rust-server/dist:
+# Produces one release asset, copied into the APK assets and rust-server/dist:
 #   csqtt-linux-amd64   x86_64-unknown-linux-musl
-#   csqtt-linux-arm64   aarch64-unknown-linux-musl
-#   csqtt-linux-armv7   armv7-unknown-linux-musleabihf
 #
-# Variant compilation is delegated to build_linux_variants.sh (parallel by default).
+# Compilation is delegated to build_linux_variants.sh (parallel by default).
 
 set -euo pipefail
 
@@ -19,8 +17,6 @@ ROOT="$(cd -- "$SERVER_DIR/.." && pwd)"
 TOOLCHAIN="1.97.1"
 MUSL_TARGETS=(
   x86_64-unknown-linux-musl
-  aarch64-unknown-linux-musl
-  armv7-unknown-linux-musleabihf
 )
 
 GENERATED_ROOT="$ROOT/app/build/generated"
@@ -35,9 +31,9 @@ Usage: build_linux.sh [--tests|--no-tests] [--diagnostics] [--jobs=N] [--sequent
 
   --tests         run fmt, clippy and the Linux musl test suite before building
   --no-tests      skip those pre-build checks (the preset file is still validated)
-  --diagnostics   build every variant with the `diagnostics` cargo feature
+  --diagnostics   build the amd64 binary with the `diagnostics` cargo feature
   --jobs=N        maximum number of parallel variant builds (default: nproc / 4)
-  --sequential    compile the variants one at a time (low-RAM hosts)
+  --sequential    use the sequential build path (low-RAM hosts)
   -h, --help      show this help
 
 Without --tests/--no-tests the checks are run unless stdin is a TTY, in which
@@ -238,7 +234,7 @@ else
   section "Pre-build checks skipped"
 fi
 
-section "Building Linux server variants"
+section "Building the amd64 Linux server"
 VARIANT_ARGS=()
 if [[ -n "$JOBS" ]]; then
   VARIANT_ARGS+=("--jobs=$JOBS")
@@ -269,11 +265,13 @@ copy_asset() {
 }
 
 copy_asset x86_64-unknown-linux-musl csqtt-linux-amd64
-copy_asset aarch64-unknown-linux-musl csqtt-linux-arm64
-copy_asset armv7-unknown-linux-musleabihf csqtt-linux-armv7
 
 # Obsolete single-asset name from the pre-variant pipeline.
 rm -f "$ASSETS_DIR/csqtt"
+
+# Remove only the known stale ARM payloads, never other files or build caches.
+rm -f "$ASSETS_DIR/csqtt-linux-arm64" "$ASSETS_DIR/csqtt-linux-armv7" \
+  "$DIST_DIR/csqtt-linux-arm64" "$DIST_DIR/csqtt-linux-armv7"
 
 section "Server asset provenance"
 if [[ ! -f "$PROVENANCE_SCRIPT" ]]; then
@@ -302,5 +300,5 @@ bash "$PROVENANCE_SCRIPT" write "${PROVENANCE_ARGS[@]}"
 bash "$PROVENANCE_SCRIPT" verify "${PROVENANCE_ARGS[@]}"
 
 section "Done"
-echo "Assets: $ASSETS_DIR/csqtt-linux-{amd64,arm64,armv7}"
-echo "Dist:   $DIST_DIR/csqtt-linux-{amd64,arm64,armv7}"
+echo "Assets: $ASSETS_DIR/csqtt-linux-amd64"
+echo "Dist:   $DIST_DIR/csqtt-linux-amd64"

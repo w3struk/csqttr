@@ -1,8 +1,10 @@
 package com.csqtt.client.ui
 
+import java.io.IOException
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -125,17 +127,48 @@ class DeployResultPolicyTest {
 
     @Test
     fun serverAssetMatchesTheRemoteVpsArchitecture() {
-        assertEquals(ServerArchitecture.AMD64, serverArchitectureForMachine("x86_64\n"))
-        assertEquals(ServerArchitecture.AMD64, serverArchitectureForMachine("amd64\n"))
-        assertEquals(ServerArchitecture.ARM64, serverArchitectureForMachine("aarch64\n"))
-        assertEquals(ServerArchitecture.ARM64, serverArchitectureForMachine("arm64\n"))
-        assertEquals(ServerArchitecture.ARMV7, serverArchitectureForMachine("armv7l\n"))
-        assertEquals(ServerArchitecture.ARMV7, serverArchitectureForMachine("armhf\n"))
+        val outputs = listOf(
+            "x86_64\n",
+            "amd64\n",
+            " \n\tX86_64 \t\narm64\n",
+            " \n\tAmD64 \t\nriscv64\n",
+        )
+        for (output in outputs) {
+            val architecture = serverArchitectureForMachine(output)
+            assertEquals(ServerArchitecture.AMD64, architecture)
+            assertEquals("csqtt-linux-amd64", architecture.assetName)
+        }
     }
 
-    @Test(expected = java.io.IOException::class)
-    fun unsupportedRemoteVpsArchitectureStopsBeforeUpload() {
-        serverArchitectureForMachine("riscv64\n")
+    @Test
+    fun armRemoteVpsArchitecturesAreRejectedWithAmd64OnlyHint() {
+        for (machine in listOf("aarch64", "arm64", "armv7l", "armv7", "armhf")) {
+            val error = assertThrows("$machine не должен приниматься", IOException::class.java) {
+                serverArchitectureForMachine("$machine\n")
+            }
+            assertTrue(
+                "$machine: отказ должен объяснять поддерживаемую архитектуру",
+                error.message.orEmpty().contains("Поддерживается только x86_64/amd64"),
+            )
+        }
+    }
+
+    @Test
+    fun unsupportedRemoteVpsArchitectureHasAmd64OnlyHint() {
+        val error = assertThrows(IOException::class.java) {
+            serverArchitectureForMachine("riscv64\n")
+        }
+        assertTrue(error.message.orEmpty().contains("Поддерживается только x86_64/amd64"))
+    }
+
+    @Test
+    fun emptyRemoteVpsArchitectureKeepsMissingUnameMessage() {
+        for (output in listOf("", " \n\t")) {
+            val error = assertThrows(IOException::class.java) {
+                serverArchitectureForMachine(output)
+            }
+            assertEquals("VPS не вернул архитектуру через uname -m", error.message)
+        }
     }
 
     @Test

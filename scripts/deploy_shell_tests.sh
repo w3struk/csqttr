@@ -16,7 +16,8 @@
 #   1. раннер отказывается работать под root (обойти можно только явным
 #      CSQTT_ALLOW_ROOT_TESTS=1, и это осознанное решение того, кто это делает);
 #   2. `csqtt_cleanup` из раннера не вызывается НИКОГДА;
-#   3. certbot, iptables, systemctl, ss, install, docker, ip, openssl и curl
+#   3. certbot, iptables, systemctl, ss, install, docker, ip, openssl, curl,
+#      sysctl и uname -m
 #      подменяются заглушками в $MOCK_BIN, которые первыми стоят в PATH.
 #
 # Запуск: ./scripts/deploy_shell_tests.sh
@@ -65,19 +66,21 @@ STUB_STATE_DIR=""
 T_OWNER_PID=""
 T_TEST_NAME=""
 
-STUB_NAMES=(certbot iptables systemctl ss install docker ip openssl curl)
+STUB_NAMES=(certbot iptables systemctl ss install docker ip openssl curl sysctl uname)
 
 write_stub() {
     local name="$1"
     local file="$MOCK_BIN/$name"
-    local real_openssl real_install
+    local real_openssl real_install real_uname
     real_openssl="$(PATH="$ORIGINAL_PATH" command -v openssl || true)"
     real_install="$(PATH="$ORIGINAL_PATH" command -v install || true)"
+    real_uname="$(PATH="$ORIGINAL_PATH" command -v uname)"
     {
         printf '%s\n' '#!/usr/bin/env bash' 'set -u'
         printf 'stub_name=%q\n' "$name"
         printf 'real_openssl=%q\n' "$real_openssl"
         printf 'real_install=%q\n' "$real_install"
+        printf 'real_uname=%q\n' "$real_uname"
         cat <<'STUB_COMMON'
 state_dir="${STUB_STATE_DIR:?}"
 stdout_file="$state_dir/$stub_name.stdout"
@@ -181,6 +184,24 @@ fi
 print_stdout
 finish
 STUB_CERTBOT
+                ;;
+            uname)
+                cat <<'STUB_UNAME'
+# Подменяется только архитектура VPS; прочие запросы сохраняют настоящий uname.
+if [ "$#" -eq 1 ] && [ "$1" = "-m" ]; then
+    log_call "$@"
+    if consume_fail; then
+        exit 1
+    fi
+    if [ -f "$stdout_file" ]; then
+        print_stdout
+    else
+        printf '%s\n' amd64
+    fi
+    finish
+fi
+exec "$real_uname" "$@"
+STUB_UNAME
                 ;;
             openssl)
                 cat <<'STUB_OPENSSL'
@@ -494,6 +515,50 @@ test_runner_refuses_root() {
     CSQTT_EUID_OVERRIDE=0 CSQTT_ALLOW_ROOT_TESTS=1 require_non_root || \
         t_fail "CSQTT_ALLOW_ROOT_TESTS=1 обязан снимать предохранитель"
     require_non_root || t_fail "без override предохранитель не должен мешать обычному пользователю"
+}
+
+# ---------------------------------------------------------------------------
+# Кейсы: install — архитектура VPS до переключения runtime
+# ---------------------------------------------------------------------------
+
+test_install_architecture_aliases() {
+    t_begin "install accepts exact amd64 architecture aliases in both runtime modes"
+    local mode machine output="$SANDBOX/architecture.out"
+    for mode in systemd docker; do
+        export CSQTT_DEPLOY_MODE="$mode"
+        for machine in x86_64 amd64; do
+            : > "$CALL_LOG"
+            t_stub_stdout uname "$machine"
+            if ! t_run 'cleanup_deploy_uploads() { :; }; require_runtime_tools; printf "CUTOVER_REACHED\n"' > "$output" 2>&1; then
+                t_fail "$mode: архитектура «$machine» обязана пройти require_runtime_tools"
+            fi
+            t_assert_contains "$output" "Архитектура VPS: amd64" "$mode/$machine: определяется amd64"
+            t_assert_contains "$output" "CUTOVER_REACHED" "$mode/$machine: следующий шаг разрешён"
+            t_assert_not_contains "$output" "CSQTT_DEPLOY_ERROR" "$mode/$machine: ошибка не ожидается"
+            t_assert_not_contains "$CALL_LOG" "docker " "$mode/$machine: preflight не активирует Docker"
+            t_assert_not_contains "$CALL_LOG" "systemctl stop" "$mode/$machine: preflight не останавливает runtime"
+        done
+    done
+}
+
+test_install_rejects_unsupported_architectures() {
+    t_begin "install rejects ARM, unknown and blank architectures before the next step"
+    local mode machine output="$SANDBOX/architecture.out"
+    for mode in systemd docker; do
+        export CSQTT_DEPLOY_MODE="$mode"
+        for machine in aarch64 arm64 armv7l armv7 armhf riscv64 "" $' \n\t'; do
+            : > "$CALL_LOG"
+            t_stub_stdout uname "$machine"
+            if t_run 'cleanup_deploy_uploads() { :; }; require_runtime_tools; printf "CUTOVER_REACHED\n"' > "$output" 2>&1; then
+                t_fail "$mode: неподдерживаемая архитектура «$machine» прошла require_runtime_tools"
+            fi
+            t_assert_contains "$output" "Поддерживается только x86_64/amd64" "$mode/$machine: отказ объясняет поддерживаемую архитектуру"
+            t_assert_contains "$output" "CSQTT_DEPLOY_ERROR|" "$mode/$machine: отказ использует die"
+            t_assert_not_contains "$output" "CUTOVER_REACHED" "$mode/$machine: отказ останавливает выполнение до следующего шага"
+            t_assert_not_contains "$CALL_LOG" "docker " "$mode/$machine: отказ не активирует Docker"
+            t_assert_not_contains "$CALL_LOG" "systemctl stop" "$mode/$machine: отказ не останавливает runtime"
+        done
+    done
 }
 
 # ---------------------------------------------------------------------------
@@ -1036,6 +1101,8 @@ TESTS=(
     test_smoke_source_does_not_run_main
     test_smoke_stub_captures_argv
     test_runner_refuses_root
+    test_install_architecture_aliases
+    test_install_rejects_unsupported_architectures
     test_symlinked_config_dir_keeps_link_and_data
     test_dangling_config_symlink_fails_without_deleting
     test_non_directory_config_path_fails_without_deleting

@@ -200,14 +200,11 @@ note="$(
             "- CSQTT-$version-armeabi-v7a.apk"
 
         printf '\nСервер:\n'
-        printf '%s\n' \
-            '- csqtt-linux-amd64' \
-            '- csqtt-linux-arm64' \
-            '- csqtt-linux-armv7'
+        printf '%s\n' '- csqtt-linux-amd64'
 
         printf '\nКонтрольные суммы: SHA256SUMS\n\n'
-        # GitHub не хранит режим файла в ассетах: без chmod бинари не запустятся.
-        printf 'Права после скачивания: chmod +x csqtt-linux-*\n\n'
+        # GitHub не хранит режим файла в ассетах: без chmod бинарь не запустится.
+        printf 'Права после скачивания: chmod +x csqtt-linux-amd64\n\n'
         if [[ -n "$signer" && -n "$fingerprint" ]]; then
             printf 'Подпись: CN=%s, SHA-256 %s\n' "$signer" "$fingerprint"
         fi
