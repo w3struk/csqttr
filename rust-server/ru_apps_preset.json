@@ -141,6 +141,7 @@
     { "package": "ru.mosgorpass", "name": "Московский транспорт" },
     { "package": "ru.yandex.yandexmaps", "name": "Яндекс Карты" },
     { "package": "ru.yandex.yandexnavi", "name": "Яндекс Навигатор" },
+    { "package": "ru.yandex.mobile.gasstations", "name": "Яндекс Заправки" },
     { "package": "ru.dublgis.dgismobile", "name": "2ГИС" },
     { "package": "com.carshering", "name": "Делимобиль" },
     { "package": "youdrive.today", "name": "Ситидрайв" },
@@ -177,6 +178,7 @@
     { "package": "ru.mts.mymts", "name": "Мой МТС" },
     { "package": "ru.beeline.services", "name": "билайн" },
     { "package": "ru.megafon.mlk", "name": "МегаФон" },
+    { "package": "com.dartit.RTcabinet", "name": "Мой Ростелеком" },
 
     { "package": "ru.broker.my", "name": "БКС Мир инвестиций" },
     { "package": "ru.bcs.bcsbank", "name": "БКС Банк" },
@@ -184,7 +186,18 @@
     { "package": "ru.finambank.app", "name": "FinamBank" },
     { "package": "ru.rbc.invest", "name": "РБК Инвестиции" },
     { "package": "ru.sovcombank.investor", "name": "Совкомбанк Инвестиции" },
-    { "package": "ru.region.finance", "name": "МКБ Инвест" }
+    { "package": "ru.region.finance", "name": "МКБ Инвест" },
+
+    { "package": "com.apteka.sklad", "name": "Аптека" },
+    { "package": "ru.mybox.app", "name": "Мой Box" },
+    { "package": "ru.kfc.kfc_delivery", "name": "KFC" },
+    { "package": "ru.yota.android", "name": "Yota" },
+    { "package": "com.yandex.aliceapp", "name": "Алиса" },
+    { "package": "ru.yandex.translate", "name": "Яндекс Переводчик" },
+    { "package": "com.yandex.mobile.plus.game.city", "name": "Яндекс Плюс" },
+    { "package": "com.yandex.tasks.androidapp", "name": "Яндекс Задачи" },
+    { "package": "ru.yandex.searchplugin", "name": "Яндекс" },
+    { "package": "com.yandex.searchapp", "name": "Яндекс с Алисой" }
   ],
 
   "orange": [
