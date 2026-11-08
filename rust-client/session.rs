@@ -116,7 +116,14 @@ pub struct SessionRuntime {
     pub configured_workers: usize,
 }
 
-fn build_registration_payload(config: &SessionConfig) -> Bytes {
+/// Событие маршрутизации эмитит config-owner; legacy `ROUTING:` (старый сервер)
+/// приходит одному worker'у, который может им не быть, поэтому её эмитит любой
+/// принявший воркер. `ROUTING2:` остаётся owner-only.
+fn should_emit_routing(emits_routing: bool, payload: &[u8]) -> bool {
+    emits_routing || payload.starts_with(b"ROUTING:")
+}
+
+fn build_registration_payload(config: &SessionConfig, routing_owner: bool) -> Bytes {
     let routing_content_sha = config
         .routing_content_sha_file
         .as_deref()
@@ -128,7 +135,7 @@ fn build_registration_payload(config: &SessionConfig) -> Bytes {
         &config.salt,
         config.id,
         Some(config.configured_workers.max(1)),
-        config.get_config,
+        routing_owner,
         config.routing_ips_sha.as_deref(),
         routing_content_sha.as_deref(),
         true,
@@ -174,6 +181,68 @@ impl ConfigDeliveryState {
             self.sent.store(true, Ordering::Release);
         }
         self.in_flight.store(false, Ordering::Release);
+    }
+}
+
+/// Роль маршрутизации не привязана к доставке начального CONFIG: её может
+/// взять уже работающая сессия. Lease перемещается в reader, а не клонируется.
+struct ConfigOwnerLease {
+    slot: Arc<AtomicU64>,
+    incarnation_id: u64,
+    acquired: bool,
+}
+
+impl ConfigOwnerLease {
+    fn new(slot: Arc<AtomicU64>, incarnation_id: u64) -> Self {
+        let mut lease = Self {
+            slot,
+            incarnation_id,
+            acquired: false,
+        };
+        lease.try_acquire();
+        lease
+    }
+
+    /// `true` только при новом захвате свободной роли.
+    fn try_acquire(&mut self) -> bool {
+        if self.acquired {
+            return false;
+        }
+        self.acquired = self
+            .slot
+            .compare_exchange(0, self.incarnation_id, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        self.acquired
+    }
+
+    fn is_owner(&self) -> bool {
+        self.acquired
+    }
+}
+
+impl Drop for ConfigOwnerLease {
+    fn drop(&mut self) {
+        if self.acquired {
+            let _ = self.slot.compare_exchange(
+                self.incarnation_id,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+    }
+}
+
+/// Abort родительской сессии не должен оставить detached reader с ролью owner.
+struct SessionIoGuard {
+    writer: tokio::task::AbortHandle,
+    reader: tokio::task::AbortHandle,
+}
+
+impl Drop for SessionIoGuard {
+    fn drop(&mut self) {
+        self.writer.abort();
+        self.reader.abort();
     }
 }
 
@@ -287,6 +356,26 @@ pub struct RoutingReassembler {
     /// Nonce последних собранных `ROUTING2`-доставок (кольцо на 4): их
     /// опоздавшие хвосты игнорируются молча, а не считаются потерянным START.
     recent_assembled_nonces: Vec<u64>,
+    /// Nonce, доставка которых отменена `ROUTING:ABSENT`. Поздние чанки с
+    /// таким nonce не имеют права собрать уже снятое правило.
+    blocked_nonces: Vec<u64>,
+    /// После ABSENT любые поздние доставки игнорируются до отправки нового GETCONF.
+    delivery_blocked: bool,
+    /// Был ли в текущей сборке legacy `ROUTING:` (не `ROUTING2`). Старый
+    /// сервер шлёт её одному worker'у, который может не быть config-owner'ом;
+    /// такой worker всё равно должен эмитить событие и повторять GETCONF.
+    legacy_seen: bool,
+    /// Legacy has no nonce: after its first START, repeats (even with a
+    /// conflicting total) cannot replace a live assembly before reset/expiry.
+    legacy_start_seen: bool,
+    /// Дедлайн ожидания ответа на отправленный GETCONF: если ответ (ROUTING
+    /// или ABSENT) не пришёл вовсе, watchdog повторит запрос, а не оставит
+    /// старое правило навсегда.
+    wait_deadline: Option<std::time::Instant>,
+    /// Был ли за сессию хоть один ответ о маршрутизации (чанк или ABSENT).
+    /// Нужно, чтобы после первичного GETCONF вооружить ожидание, если ответа
+    /// не было вовсе.
+    seen_any: bool,
     oversize: Option<usize>,
     corrupt: bool,
     deadline: Option<std::time::Instant>,
@@ -305,6 +394,84 @@ impl RoutingReassembler {
         std::mem::take(&mut self.corrupt)
     }
 
+    pub fn legacy_seen(&self) -> bool {
+        self.legacy_seen
+    }
+
+    /// Вооружить ожидание ответа на GETCONF.
+    pub fn arm_delivery_wait(&mut self) {
+        // Вызывается после успешной отправки, а не при подготовке запроса:
+        // failed GETCONF не разрешает поздней доставке отменить ABSENT.
+        self.delivery_blocked = false;
+        self.wait_deadline = Some(std::time::Instant::now() + Self::REASSEMBLY_TIMEOUT);
+    }
+
+    pub fn clear_delivery_wait(&mut self) {
+        self.wait_deadline = None;
+    }
+
+    fn accept_delivery_packet(&mut self, legacy: bool) {
+        self.clear_delivery_wait();
+        self.seen_any = true;
+        self.legacy_seen = legacy;
+    }
+
+    pub fn seen_any(&self) -> bool {
+        self.seen_any
+    }
+
+    /// Идёт сборка или уже вооружено ожидание ответа — периодическую сверку
+    /// в этот момент не начинаем.
+    pub fn has_active_delivery(&self) -> bool {
+        self.total_chunks > 0 || self.wait_deadline.is_some()
+    }
+
+    /// Сервер ответил `ROUTING:ABSENT`: ответ получен, ожидание снимается,
+    /// а недостроенная доставка отменяется. Иначе поздние чанки/FINISH
+    /// собрали бы уже снятое правило и опубликовали его заново.
+    pub fn mark_absent(&mut self) {
+        self.seen_any = true;
+        self.wait_deadline = None;
+        if let Some(nonce) = self.active_nonce.take() {
+            self.block_nonce(nonce);
+        }
+        self.delivery_blocked = true;
+        self.total_chunks = 0;
+        self.chunks.clear();
+        self.received_count = 0;
+        self.finished = false;
+        self.assembled_total = None;
+        self.deadline = None;
+        self.awaiting_start = false;
+        self.legacy_seen = false;
+        self.legacy_start_seen = false;
+    }
+
+    fn block_nonce(&mut self, nonce: u64) {
+        if !self.blocked_nonces.contains(&nonce) {
+            self.blocked_nonces.push(nonce);
+            if self.blocked_nonces.len() > 8 {
+                self.blocked_nonces.remove(0);
+            }
+        }
+    }
+
+    /// `true`, если ответ на GETCONF не пришёл за `REASSEMBLY_TIMEOUT`.
+    pub fn take_delivery_timeout(&mut self) -> bool {
+        self.take_delivery_timeout_at(std::time::Instant::now())
+    }
+
+    fn take_delivery_timeout_at(&mut self, now: std::time::Instant) -> bool {
+        let Some(deadline) = self.wait_deadline else {
+            return false;
+        };
+        if now < deadline {
+            return false;
+        }
+        self.wait_deadline = None;
+        true
+    }
+
     /// Начать новую доставку: забыть отметку уже собранной последовательности
     /// и остатки частичной сборки.
     ///
@@ -320,9 +487,12 @@ impl RoutingReassembler {
         self.finished = false;
         self.assembled_total = None;
         self.deadline = None;
+        self.wait_deadline = None;
         self.awaiting_start = true;
         self.active_nonce = None;
-        // `last_assembled_nonce` не сбрасываем: хвост уже собранной доставки
+        self.legacy_seen = false;
+        self.legacy_start_seen = false;
+        // `recent_assembled_nonces` не сбрасываем: хвост уже собранной доставки
         // должен остаться молча проигнорированным.
     }
 
@@ -347,6 +517,7 @@ impl RoutingReassembler {
             finish_seen: self.finished,
         };
         self.deadline = None;
+        self.wait_deadline = None;
         self.chunks.clear();
         self.total_chunks = 0;
         self.received_count = 0;
@@ -357,6 +528,8 @@ impl RoutingReassembler {
         // Данные до нового START — потенциальный хвост потерянной доставки.
         self.awaiting_start = true;
         self.active_nonce = None;
+        self.legacy_seen = false;
+        self.legacy_start_seen = false;
         Some(incomplete)
     }
 
@@ -368,11 +541,18 @@ impl RoutingReassembler {
             return self.feed_v2(v2);
         }
         let rest = text.strip_prefix("ROUTING:")?;
+        if self.delivery_blocked {
+            return None;
+        }
         if let Some(total_str) = rest.strip_prefix("START:") {
             let total: usize = total_str.trim().parse().ok()?;
             if total == 0 || total > MAX_ROUTING_CHUNKS {
                 return None;
             }
+            if self.legacy_start_seen && self.total_chunks > 0 && !self.awaiting_start {
+                return None;
+            }
+            self.accept_delivery_packet(true);
             // После нового запроса всё, что пришло до START, уже отброшено:
             // новый START обязан начать сборку с чистого листа. Без нового
             // запроса (обычное переупорядочивание) чанки до START принадлежат
@@ -386,6 +566,7 @@ impl RoutingReassembler {
             }
             self.awaiting_start = false;
             self.active_nonce = None;
+            self.legacy_start_seen = true;
             // Новый `START` — новая последовательность: она больше не считается
             // уже собранной, даже если `total` совпадает с предыдущей.
             self.assembled_total = None;
@@ -401,10 +582,13 @@ impl RoutingReassembler {
             // быть хвост старой доставки. Ждём START; watchdog по дедлайну
             // повторит GETCONF, если START потерян.
             if self.awaiting_start {
-                self.total_chunks = total;
-                self.chunks = vec![None; total];
-                self.received_count = 0;
-                self.finished = false;
+                self.legacy_seen = true;
+                if self.total_chunks == 0 {
+                    self.total_chunks = total;
+                    self.chunks = vec![None; total];
+                    self.received_count = 0;
+                    self.finished = false;
+                }
                 if self.deadline.is_none() {
                     self.deadline = Some(std::time::Instant::now() + Self::REASSEMBLY_TIMEOUT);
                 }
@@ -416,7 +600,11 @@ impl RoutingReassembler {
             if self.total_chunks == 0 && self.assembled_total == Some(total) {
                 return None;
             }
-            if self.total_chunks != total {
+            if self.total_chunks > 0 && (self.total_chunks != total || self.finished) {
+                return None;
+            }
+            self.accept_delivery_packet(true);
+            if self.total_chunks == 0 {
                 self.total_chunks = total;
                 self.chunks = vec![None; total];
                 self.received_count = 0;
@@ -445,10 +633,13 @@ impl RoutingReassembler {
         // После нового запроса данные до START не буферизуются (см. FINISH):
         // хвост старой доставки не должен засеять новую сборку.
         if self.awaiting_start {
-            self.total_chunks = total;
-            self.chunks = vec![None; total];
-            self.received_count = 0;
-            self.finished = false;
+            self.legacy_seen = true;
+            if self.total_chunks == 0 {
+                self.total_chunks = total;
+                self.chunks = vec![None; total];
+                self.received_count = 0;
+                self.finished = false;
+            }
             if self.deadline.is_none() {
                 self.deadline = Some(std::time::Instant::now() + Self::REASSEMBLY_TIMEOUT);
             }
@@ -461,19 +652,22 @@ impl RoutingReassembler {
         if self.total_chunks == 0 && self.assembled_total == Some(total) {
             return None;
         }
-        if self.total_chunks != total {
+        if self.total_chunks > 0 && (self.total_chunks != total || self.chunks[seq - 1].is_some()) {
+            return None;
+        }
+        self.accept_delivery_packet(true);
+        if self.total_chunks == 0 {
             self.total_chunks = total;
             self.chunks = vec![None; total];
             self.received_count = 0;
             self.finished = false;
         }
-        if self.chunks[seq - 1].is_none() {
-            self.chunks[seq - 1] = Some(chunk_data.to_string());
-            self.received_count += 1;
-        }
+        self.chunks[seq - 1] = Some(chunk_data.to_string());
+        self.received_count += 1;
         // Таймаут — по затишью, а не по общему времени: 41+ чанк на медленном
         // TURN-канале может идти дольше нескольких секунд, но пока чанки
-        // приходят, сборка продолжается. Сбрасываем дедлайн на каждом чанке.
+        // приходят, сборка продолжается. Дедлайн меняют только новые чанки,
+        // а не повторы уже занятого seq (включая конфликтующее содержимое).
         // Дедлайн взводится только для активной последовательности.
         self.deadline = Some(std::time::Instant::now() + Self::REASSEMBLY_TIMEOUT);
         if self.finished && self.received_count == self.total_chunks && self.total_chunks > 0 {
@@ -486,6 +680,20 @@ impl RoutingReassembler {
     /// чужим nonce не может попасть в текущую сборку — это и есть защита от
     /// смешивания доставок при потерянном START.
     fn feed_v2(&mut self, rest: &str) -> Option<String> {
+        if self.delivery_blocked {
+            // Даже ещё не виденный START после ABSENT относится к старой
+            // доставке. Запоминаем её nonce и для следующего настоящего GETCONF.
+            let nonce_text = rest
+                .strip_prefix("START:")
+                .or_else(|| rest.strip_prefix("FINISH:"))
+                .unwrap_or(rest)
+                .split(':')
+                .next()?;
+            if let Some(nonce) = parse_routing_nonce(nonce_text) {
+                self.block_nonce(nonce);
+            }
+            return None;
+        }
         if let Some(rest) = rest.strip_prefix("START:") {
             let (nonce_text, total_text) = rest.split_once(':')?;
             let nonce = parse_routing_nonce(nonce_text)?;
@@ -493,18 +701,25 @@ impl RoutingReassembler {
             if total == 0 || total > MAX_ROUTING_CHUNKS {
                 return None;
             }
-            // Повторный START той же доставки не должен стирать уже собранные
-            // чанки — только освежает дедлайн.
-            if self.active_nonce == Some(nonce) && self.total_chunks == total {
-                self.deadline = Some(std::time::Instant::now() + Self::REASSEMBLY_TIMEOUT);
+            // Nonce отменён ABSENT или это опоздавшая копия собранной
+            // доставки: новый START с ним не открывает сборку.
+            if self.blocked_nonces.contains(&nonce) || self.recent_assembled_nonces.contains(&nonce)
+            {
                 return None;
             }
+            // Duplicate/conflicting START of this nonce is not progress and
+            // cannot answer a newly armed GETCONF wait.
+            if self.active_nonce == Some(nonce) {
+                return None;
+            }
+            self.accept_delivery_packet(false);
             self.active_nonce = Some(nonce);
             self.total_chunks = total;
             self.chunks = vec![None; total];
             self.received_count = 0;
             self.finished = false;
             self.awaiting_start = false;
+            self.legacy_start_seen = false;
             self.assembled_total = None;
             self.deadline = Some(std::time::Instant::now() + Self::REASSEMBLY_TIMEOUT);
             return None;
@@ -520,11 +735,10 @@ impl RoutingReassembler {
                 self.reject_stale_v2(nonce, total);
                 return None;
             }
-            if self.total_chunks != total {
-                self.total_chunks = total;
-                self.chunks = vec![None; total];
-                self.received_count = 0;
+            if self.total_chunks != total || self.finished {
+                return None;
             }
+            self.accept_delivery_packet(false);
             self.finished = true;
             if self.received_count == self.total_chunks && total > 0 {
                 return self.assemble();
@@ -546,16 +760,12 @@ impl RoutingReassembler {
             self.reject_stale_v2(nonce, total);
             return None;
         }
-        if self.total_chunks != total {
-            self.total_chunks = total;
-            self.chunks = vec![None; total];
-            self.received_count = 0;
-            self.finished = false;
+        if self.total_chunks != total || self.chunks[seq - 1].is_some() {
+            return None;
         }
-        if self.chunks[seq - 1].is_none() {
-            self.chunks[seq - 1] = Some(chunk_data.to_string());
-            self.received_count += 1;
-        }
+        self.accept_delivery_packet(false);
+        self.chunks[seq - 1] = Some(chunk_data.to_string());
+        self.received_count += 1;
         self.deadline = Some(std::time::Instant::now() + Self::REASSEMBLY_TIMEOUT);
         if self.finished && self.received_count == self.total_chunks && self.total_chunks > 0 {
             return self.assemble();
@@ -567,10 +777,10 @@ impl RoutingReassembler {
     /// при активной сборке не трогаем её; иначе это новая доставка с потерянным
     /// START — ставим placeholder и дедлайн, чтобы watchdog повторил GETCONF.
     fn reject_stale_v2(&mut self, nonce: u64, total: usize) {
-        if self.recent_assembled_nonces.contains(&nonce) {
+        if self.recent_assembled_nonces.contains(&nonce) || self.blocked_nonces.contains(&nonce) {
             return;
         }
-        if self.active_nonce.is_some() && self.total_chunks > 0 {
+        if self.total_chunks > 0 {
             return;
         }
         self.active_nonce = None;
@@ -585,6 +795,8 @@ impl RoutingReassembler {
 
     fn assemble(&mut self) -> Option<String> {
         self.deadline = None;
+        self.legacy_seen = false;
+        self.legacy_start_seen = false;
         if let Some(nonce) = self.active_nonce.take() {
             self.recent_assembled_nonces.push(nonce);
             if self.recent_assembled_nonces.len() > 4 {
@@ -669,9 +881,7 @@ struct ReaderRuntime {
     shutdown: Arc<ShutdownCoordinator>,
     config_tx: mpsc::Sender<String>,
     routing_reassembler: RoutingReassembler,
-    /// Эмитить ли события маршрутизации: только config-owner, иначе решение,
-    /// разосланное всем воркерам, применилось бы в приложении многократно.
-    emits_routing: bool,
+    config_owner: ConfigOwnerLease,
     scale_notify: Option<Arc<tokio::sync::Notify>>,
     target_workers: Option<Arc<AtomicUsize>>,
     configured_workers: usize,
@@ -1468,6 +1678,8 @@ async fn run_allocated_session(
     .context("инициализация SRTP")?;
     let incarnation_id = NEXT_INCARNATION_ID.fetch_add(1, Ordering::Relaxed).max(1);
     let config_tx = config.get_config.then(|| runtime.config_tx.clone());
+    let config_owner =
+        ConfigOwnerLease::new(runtime.dispatcher.routing_owner_slot(), incarnation_id);
     let mut routing_reassembler = RoutingReassembler::new();
     let config_delivered = match request_configuration(
         &mut writer_transport,
@@ -1476,6 +1688,7 @@ async fn run_allocated_session(
         &runtime.events,
         config_tx.clone(),
         &mut routing_reassembler,
+        config_owner.is_owner(),
         WorkerScale {
             notify: runtime.scale_notify.as_ref(),
             target: runtime.target_workers.as_ref(),
@@ -1545,7 +1758,7 @@ async fn run_allocated_session(
             shutdown: runtime.shutdown.clone(),
             config_tx: runtime.config_tx.clone(),
             routing_reassembler,
-            emits_routing: config.get_config,
+            config_owner,
             scale_notify: runtime.scale_notify.clone(),
             target_workers: runtime.target_workers.clone(),
             configured_workers: runtime.configured_workers,
@@ -1554,6 +1767,10 @@ async fn run_allocated_session(
         },
         session_cancel.clone(),
     ));
+    let _io_guard = SessionIoGuard {
+        writer: writer.abort_handle(),
+        reader: reader.abort_handle(),
+    };
     let repair_generation = config.repair.restart_generation(config.id);
     let (session_result, completed): (Result<()>, u8) = tokio::select! {
         biased;
@@ -1629,6 +1846,7 @@ struct WorkerScale<'a> {
     configured: usize,
 }
 
+#[expect(clippy::too_many_arguments)]
 async fn request_configuration(
     writer: &mut TransportWriter,
     reader: &mut TransportReader,
@@ -1636,12 +1854,11 @@ async fn request_configuration(
     events: &Events,
     config_tx: Option<mpsc::Sender<String>>,
     routing_reassembler: &mut RoutingReassembler,
+    emits_routing: bool,
     scale: WorkerScale<'_>,
 ) -> Result<bool> {
-    // Событие о маршрутизации эмитит только config-owner: сервер отдаёт решение
-    // каждому воркеру (owner выбирается на клиенте и не обязан быть первым),
-    // и без этого гейта приложение получало бы по событию с каждого воркера.
-    let emits_routing = config.get_config;
+    // ROUTING2 эмитит только routing-owner. Legacy ROUTING может доставляться
+    // другому worker'у старым сервером (см. should_emit_routing).
     'attempts: for (attempt, timeout_ms) in CONFIG_RESPONSE_TIMEOUT_MS.into_iter().enumerate() {
         if !config.srtp_mode.uses_dtls()
             && config.client_wrap_key != [0; 32]
@@ -1658,11 +1875,14 @@ async fn request_configuration(
         }
         // Пересобираем перед каждой попыткой: sha кеша доменов/приложений
         // читается из файла и мог обновиться между попытками.
-        let request = build_registration_payload(config);
+        let request = build_registration_payload(config, emits_routing);
         writer
             .send_bytes_duplicate(request.as_ref(), true)
             .await
             .context("отправка GETCONF")?;
+        if emits_routing || routing_reassembler.seen_any() {
+            routing_reassembler.arm_delivery_wait();
+        }
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
         loop {
             match tokio::time::timeout_at(deadline, reader.recv()).await {
@@ -1691,22 +1911,26 @@ async fn request_configuration(
                                 .send_bytes_duplicate(request.as_ref(), true)
                                 .await
                                 .context("повторный GETCONF после изменения правила")?;
+                            routing_reassembler.reset_for_new_delivery();
+                            routing_reassembler.arm_delivery_wait();
                         }
                         continue;
                     }
                     if is_routing_delivery(packet.as_slice()) {
+                        let allow_emit = should_emit_routing(emits_routing, packet.as_slice());
                         if packet.as_slice() == crate::protocol::ROUTING_ABSENT {
-                            if emits_routing {
+                            routing_reassembler.mark_absent();
+                            if allow_emit {
                                 events.routing_absent();
                             }
                             continue;
                         }
                         if let Some(json) = routing_reassembler.feed(packet.as_slice()) {
-                            if emits_routing {
+                            if allow_emit {
                                 events.routing(&json);
                             }
                         } else if let Some(size) = routing_reassembler.take_oversize_error()
-                            && emits_routing
+                            && allow_emit
                         {
                             events.error(
                                 "routing_payload_too_large",
@@ -1715,7 +1939,7 @@ async fn request_configuration(
                                 ),
                                 true,
                             );
-                        } else if routing_reassembler.take_corrupt_error() && emits_routing {
+                        } else if routing_reassembler.take_corrupt_error() && allow_emit {
                             events.error(
                                 "routing_payload_corrupt",
                                 "ROUTING: payload не декодируется (base64/gzip/UTF-8)",
@@ -1918,12 +2142,17 @@ async fn send_writer_bytes_duplicated(
 /// лишние запросы всё равно не превращаются в лишние доставки.
 const ROUTING_CHANGED_REFRESH_WINDOW: std::time::Duration = std::time::Duration::from_millis(1000);
 
-/// Отдать ли повторный `GETCONF` на очередной notice.
-///
-/// Чистая функция: `last` — момент последнего такого запроса (`None` — ещё не
-/// было), `now` — момент получения notice. Отдаём не чаще одного раза за
-/// `ROUTING_CHANGED_REFRESH_WINDOW`; сдвигать отметку обязан вызывающий, иначе
-/// дебаунс превратится в полный запрет повторов.
+/// Периодическая сверка правила: даже если ROUTING_CHANGED_NOTICE потерян,
+/// owner раз в пять минут повторяет GETCONF и забирает актуальную ревизию.
+const ROUTING_REVALIDATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
+fn routing_revalidate_due(last: std::time::Instant, now: std::time::Instant) -> bool {
+    now.checked_duration_since(last)
+        .is_none_or(|elapsed| elapsed >= ROUTING_REVALIDATE_INTERVAL)
+}
+
+/// Отдать ли повторный GETCONF на notice: не чаще одного за окно.
+/// Вызывающий сдвигает `last` после отправки, иначе повтор станет запрещён навсегда.
 fn routing_changed_refresh_due(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
     match last {
         None => true,
@@ -1938,8 +2167,8 @@ fn routing_changed_refresh_due(last: Option<std::time::Instant>, now: std::time:
 /// Первый notice окна уходит сразу (leading edge). Notice, пришедший внутри
 /// окна, подавляется, но оставляет `pending`: по истечении окна уходит один
 /// хвостовой запрос, забирающий последнее состояние правила. Без хвоста
-/// последнее сохранение серии короче окна потерялось бы навсегда — watchdog
-/// будит только несобранную доставку, периодического опроса нет.
+/// последнее сохранение серии короче окна ждало бы пятиминутной сверки —
+/// watchdog будит только несобранную доставку.
 #[derive(Default)]
 struct RoutingRefreshDebounce {
     last: Option<std::time::Instant>,
@@ -1991,28 +2220,105 @@ async fn reader_loop(
         shutdown,
         config_tx,
         mut routing_reassembler,
-        emits_routing,
+        mut config_owner,
         scale_notify,
         target_workers,
         configured_workers,
         writer_tx,
         config,
     } = runtime;
+    let mut emits_routing = config_owner.is_owner();
     let mut dropped_non_ip = 0u64;
     let mut routing_retries = 0u32;
+    // Legacy `ROUTING:` мог прийти ещё до TUNCONF worker'у без owner-метки.
+    // Сохраняем разрешение ожидать ответ и после полного проигрыша ретрая.
+    let mut legacy_wait_allowed = routing_reassembler.legacy_seen();
     // Серия сохранений правила не должна вылиться в серию полных доставок, но
     // последнее сохранение серии обязано забраться (см. RoutingRefreshDebounce).
     let mut routing_refresh = RoutingRefreshDebounce::default();
+    let mut routing_revalidated_at = std::time::Instant::now();
     const MAX_ROUTING_RETRIES: u32 = 2;
     let mut reassembly_tick = tokio::time::interval(std::time::Duration::from_millis(500));
     reassembly_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Первичный GETCONF уже ушёл; если ответа о маршрутизации не было вовсе,
+    // watchdog должен повторить запрос, а не оставить туннель без правила.
+    if emits_routing && !routing_reassembler.seen_any() {
+        routing_reassembler.arm_delivery_wait();
+    }
     loop {
         let packet = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Ok(()),
             _ = reassembly_tick.tick() => {
+                let now = std::time::Instant::now();
+                if config_owner.try_acquire() {
+                    emits_routing = true;
+                    routing_retries = 0;
+                    routing_reassembler.reset_for_new_delivery();
+                    let request = build_registration_payload(&config, true);
+                    if send_writer_bytes_duplicated(&writer_tx, &request).await.is_ok() {
+                        routing_revalidated_at = now;
+                        routing_reassembler.arm_delivery_wait();
+                    } else {
+                        routing_refresh.retry_later();
+                        crate::log_error!("[СЕССИЯ] GETCONF при передаче роли owner не поставлен");
+                    }
+                    continue;
+                }
+                if emits_routing
+                    && routing_revalidate_due(routing_revalidated_at, now)
+                    && !routing_reassembler.has_active_delivery()
+                {
+                    routing_reassembler.reset_for_new_delivery();
+                    let routing_request = build_registration_payload(&config, emits_routing);
+                    if send_writer_bytes_duplicated(&writer_tx, &routing_request)
+                        .await
+                        .is_ok()
+                    {
+                        routing_revalidated_at = now;
+                        routing_reassembler.arm_delivery_wait();
+                    } else {
+                        crate::log_error!("[СЕССИЯ] периодический GETCONF не поставлен");
+                    }
+                    continue;
+                }
+                if routing_reassembler.take_delivery_timeout()
+                    && (emits_routing || legacy_wait_allowed)
+                {
+                    if routing_retries < MAX_ROUTING_RETRIES {
+                        routing_retries += 1;
+                        crate::log_error!(
+                            "[КЛИЕНТ] ответ на GETCONF не получен, повторный запрос #{}",
+                            routing_retries
+                        );
+                        routing_reassembler.reset_for_new_delivery();
+                        let routing_request = build_registration_payload(&config, emits_routing);
+                        if send_writer_bytes_duplicated(&writer_tx, &routing_request)
+                            .await
+                            .is_err()
+                        {
+                            events.error(
+                                "routing_payload_timeout",
+                                "ROUTING: ответ на GETCONF не получен, повтор не отправлен",
+                                true,
+                            );
+                        } else {
+                            routing_reassembler.arm_delivery_wait();
+                        }
+                    } else {
+                        events.error(
+                            "routing_payload_timeout",
+                            "ROUTING: ответ на GETCONF не получен после повторов",
+                            true,
+                        );
+                    }
+                    continue;
+                }
+                // Legacy-доставку мог получить worker, не являющийся owner'ом;
+                // его неполная сборка тоже должна ретраиться.
+                let legacy_partial = routing_reassembler.legacy_seen();
                 if let Some(incomplete) = routing_reassembler.take_incomplete()
-                    && emits_routing
+                    && (emits_routing || legacy_partial)
                 {
                     // Снимок TURN-приёмника на момент срыва. При нехватке пакета
                     // в пуле и при переполнении входящей SPSC-очереди драйвер
@@ -2046,7 +2352,7 @@ async fn reader_loop(
                         // провоцировал ложный routing_payload_incomplete; теперь
                         // безопасно (окно сервера 1 с + игнор хвоста рессемблером),
                         // см. `send_writer_bytes_duplicated`.
-                        let routing_request = build_registration_payload(&config);
+                        let routing_request = build_registration_payload(&config, emits_routing);
                         if send_writer_bytes_duplicated(&writer_tx, &routing_request)
                             .await
                             .is_err()
@@ -2063,6 +2369,8 @@ async fn reader_loop(
                                 ),
                                 true,
                             );
+                        } else {
+                            routing_reassembler.arm_delivery_wait();
                         }
                     } else {
                         events.error(
@@ -2088,12 +2396,13 @@ async fn reader_loop(
                     // Новая доставка обязана собраться с нуля: хвост старой с тем
                     // же числом чанков иначе выглядел бы как её продолжение.
                     routing_reassembler.reset_for_new_delivery();
-                    let routing_request = build_registration_payload(&config);
+                    let routing_request = build_registration_payload(&config, emits_routing);
                     if send_writer_bytes_duplicated(&writer_tx, &routing_request)
                         .await
                         .is_ok()
                     {
                         routing_refresh.sent(std::time::Instant::now());
+                        routing_reassembler.arm_delivery_wait();
                     }
                 }
                 continue;
@@ -2118,7 +2427,7 @@ async fn reader_loop(
                 // Новая доставка не должна смешаться с недостроенной старой —
                 // см. `reset_for_new_delivery`.
                 routing_reassembler.reset_for_new_delivery();
-                let routing_request = build_registration_payload(&config);
+                let routing_request = build_registration_payload(&config, emits_routing);
                 if let Err(error) = send_writer_bytes_duplicated(&writer_tx, &routing_request).await
                 {
                     // Ошибка постановки не фатальна, но и изменение терять нельзя:
@@ -2129,6 +2438,8 @@ async fn reader_loop(
                     crate::log_error!(
                         "[СЕССИЯ] повторный GETCONF после изменения правила не поставлен: {error:#}"
                     );
+                } else {
+                    routing_reassembler.arm_delivery_wait();
                 }
             }
             continue;
@@ -2170,27 +2481,33 @@ async fn reader_loop(
             continue;
         }
         if is_routing_delivery(packet.as_slice()) {
+            let allow_emit = should_emit_routing(emits_routing, packet.as_slice());
+            if packet.as_slice().starts_with(b"ROUTING:") {
+                legacy_wait_allowed = true;
+            }
             if packet.as_slice() == crate::protocol::ROUTING_ABSENT {
-                if emits_routing {
+                routing_reassembler.mark_absent();
+                legacy_wait_allowed = false;
+                if allow_emit {
                     events.routing_absent();
                     routing_retries = 0;
                 }
                 continue;
             }
             if let Some(json) = routing_reassembler.feed(packet.as_slice()) {
-                if emits_routing {
+                if allow_emit {
                     events.routing(&json);
                     routing_retries = 0;
                 }
             } else if let Some(size) = routing_reassembler.take_oversize_error()
-                && emits_routing
+                && allow_emit
             {
                 events.error(
                     "routing_payload_too_large",
                     &format!("ROUTING: {size} байт, предел {MAX_ROUTING_PAYLOAD_BYTES}"),
                     true,
                 );
-            } else if routing_reassembler.take_corrupt_error() && emits_routing {
+            } else if routing_reassembler.take_corrupt_error() && allow_emit {
                 events.error(
                     "routing_payload_corrupt",
                     "ROUTING: payload не декодируется (base64/gzip/UTF-8)",
@@ -2376,7 +2693,7 @@ mod tests {
             routing_content_sha_file: Some(path.clone()),
         };
 
-        let payload = build_registration_payload(&config);
+        let payload = build_registration_payload(&config, true);
         let text = std::str::from_utf8(&payload).expect("GETCONF is utf8");
         assert!(
             text.ends_with(&format!("|owner||{first}|routing2")),
@@ -2384,7 +2701,7 @@ mod tests {
         );
 
         std::fs::write(&path, &second).expect("rewrite sha");
-        let payload = build_registration_payload(&config);
+        let payload = build_registration_payload(&config, true);
         let text = std::str::from_utf8(&payload).expect("GETCONF is utf8");
         assert!(
             text.ends_with(&format!("|owner||{second}|routing2")),
@@ -2392,7 +2709,7 @@ mod tests {
         );
 
         std::fs::remove_file(&path).expect("remove sha");
-        let payload = build_registration_payload(&config);
+        let payload = build_registration_payload(&config, true);
         let text = std::str::from_utf8(&payload).expect("GETCONF is utf8");
         assert!(
             text.ends_with("|owner|||routing2"),
@@ -2402,7 +2719,7 @@ mod tests {
 
     #[test]
     fn first_registration_announces_the_full_stream_set_before_the_feature_reply() {
-        let config = SessionConfig {
+        let mut config = SessionConfig {
             id: 1,
             peer: "127.0.0.1:46000".parse().unwrap(),
             turn_host: None,
@@ -2424,10 +2741,17 @@ mod tests {
             routing_ips_sha: None,
             routing_content_sha_file: None,
         };
-        assert_eq!(
-            build_registration_payload(&config).as_ref(),
-            b"GETCONF:9000|pass1234|7|generation-id|1|18|owner|||routing2"
-        );
+        for initial_config in [true, false] {
+            config.get_config = initial_config;
+            assert_eq!(
+                build_registration_payload(&config, true).as_ref(),
+                b"GETCONF:9000|pass1234|7|generation-id|1|18|owner|||routing2"
+            );
+            assert_eq!(
+                build_registration_payload(&config, false).as_ref(),
+                b"GETCONF:9000|pass1234|7|generation-id|1|18|routing2"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3355,6 +3679,452 @@ mod tests {
         reassembler.feed(format!("ROUTING2:FINISH:{nonce}:{}", chunks.len()).as_bytes())
     }
 
+    fn partial_routing_delivery(legacy: bool) -> (RoutingReassembler, String) {
+        let prefix = if legacy { "ROUTING" } else { "ROUTING2" };
+        let nonce = if legacy { "" } else { "0000000000000041:" };
+        let mut reassembler = RoutingReassembler::new();
+        reassembler.feed(format!("{prefix}:START:{nonce}2").as_bytes());
+        reassembler.feed(format!("{prefix}:{nonce}1:2:first").as_bytes());
+        reassembler.feed(format!("{prefix}:FINISH:{nonce}2").as_bytes());
+        assert_eq!(reassembler.received_count, 1);
+        assert!(reassembler.finished);
+        reassembler.arm_delivery_wait();
+        (reassembler, format!("{prefix}:{nonce}"))
+    }
+
+    fn assert_routing_duplicates_preserve_deadlines(legacy: bool, conflicting: bool) {
+        let (mut reassembler, chunk_prefix) = partial_routing_delivery(legacy);
+        let prefix = if legacy { "ROUTING" } else { "ROUTING2" };
+        let nonce = if legacy { "" } else { "0000000000000041:" };
+        let packets = if conflicting {
+            vec![
+                format!("{prefix}:START:{nonce}3"),
+                format!("{chunk_prefix}1:2:conflicting-content"),
+                format!("{chunk_prefix}1:3:conflicting-total"),
+                format!("{chunk_prefix}2:3:not-the-live-total"),
+                format!("{prefix}:FINISH:{nonce}3"),
+            ]
+        } else {
+            vec![
+                format!("{prefix}:START:{nonce}2"),
+                format!("{chunk_prefix}1:2:first"),
+                format!("{prefix}:FINISH:{nonce}2"),
+            ]
+        };
+        let wait = reassembler.wait_deadline;
+        let progress = reassembler.deadline;
+        let chunks = reassembler.chunks.clone();
+        for packet in packets {
+            assert_eq!(reassembler.feed(packet.as_bytes()), None);
+            assert_eq!(
+                reassembler.wait_deadline, wait,
+                "duplicate answered wait: {packet}"
+            );
+            assert_eq!(
+                reassembler.deadline, progress,
+                "duplicate prolonged progress: {packet}"
+            );
+            assert_eq!(
+                reassembler.chunks, chunks,
+                "duplicate replaced live chunks: {packet}"
+            );
+            assert_eq!(reassembler.total_chunks, 2);
+            assert_eq!(reassembler.received_count, 1);
+            assert!(reassembler.finished);
+        }
+        assert!(reassembler.take_delivery_timeout_at(wait.unwrap()));
+        let incomplete = reassembler.take_incomplete_at(progress.unwrap()).unwrap();
+        assert_eq!(incomplete.received, 1);
+        assert_eq!(incomplete.total, 2);
+    }
+
+    fn assert_one_routing_duplicate(legacy: bool, tail: &str) {
+        let (mut reassembler, _) = partial_routing_delivery(legacy);
+        let prefix = if legacy { "ROUTING" } else { "ROUTING2" };
+        let nonce = if legacy { "" } else { "0000000000000041:" };
+        let packet = if let Some(total) = tail.strip_prefix("FINISH:") {
+            format!("{prefix}:FINISH:{nonce}{total}")
+        } else {
+            format!("{prefix}:{nonce}{tail}")
+        };
+        let wait = reassembler.wait_deadline;
+        let progress = reassembler.deadline;
+        let chunks = reassembler.chunks.clone();
+        assert_eq!(reassembler.feed(packet.as_bytes()), None);
+        assert_eq!(
+            reassembler.wait_deadline, wait,
+            "duplicate answered wait: {packet}"
+        );
+        assert_eq!(
+            reassembler.deadline, progress,
+            "duplicate prolonged progress: {packet}"
+        );
+        assert_eq!(
+            reassembler.chunks, chunks,
+            "duplicate replaced assembly: {packet}"
+        );
+        assert_eq!(reassembler.total_chunks, 2);
+        assert_eq!(reassembler.received_count, 1);
+        assert!(reassembler.finished);
+        assert!(reassembler.take_delivery_timeout_at(wait.unwrap()));
+        assert_eq!(
+            reassembler
+                .take_incomplete_at(progress.unwrap())
+                .unwrap()
+                .received,
+            1
+        );
+    }
+
+    #[test]
+    fn routing_duplicate_legacy_chunk_does_not_answer_rearmed_wait() {
+        assert_one_routing_duplicate(true, "1:2:first");
+    }
+
+    #[test]
+    fn routing_duplicate_v2_chunk_does_not_answer_rearmed_wait() {
+        assert_one_routing_duplicate(false, "1:2:first");
+    }
+
+    #[test]
+    fn routing_duplicate_legacy_finish_does_not_answer_rearmed_wait() {
+        assert_one_routing_duplicate(true, "FINISH:2");
+    }
+
+    #[test]
+    fn routing_duplicate_v2_finish_does_not_answer_rearmed_wait() {
+        assert_one_routing_duplicate(false, "FINISH:2");
+    }
+
+    #[test]
+    fn routing_duplicate_legacy_conflicting_chunk_does_not_answer_rearmed_wait() {
+        assert_one_routing_duplicate(true, "1:2:different");
+    }
+
+    #[test]
+    fn routing_duplicate_v2_conflicting_chunk_does_not_answer_rearmed_wait() {
+        assert_one_routing_duplicate(false, "1:2:different");
+    }
+
+    #[test]
+    fn routing_duplicate_legacy_conflicting_finish_does_not_answer_rearmed_wait() {
+        assert_one_routing_duplicate(true, "FINISH:3");
+    }
+
+    #[test]
+    fn routing_duplicate_v2_conflicting_finish_does_not_answer_rearmed_wait() {
+        assert_one_routing_duplicate(false, "FINISH:3");
+    }
+
+    #[test]
+    fn routing_duplicate_v2_packets_preserve_rearmed_wait_and_progress_deadlines() {
+        assert_routing_duplicates_preserve_deadlines(false, false);
+    }
+
+    #[test]
+    fn routing_duplicate_legacy_packets_preserve_rearmed_wait_and_progress_deadlines() {
+        assert_routing_duplicates_preserve_deadlines(true, false);
+    }
+
+    #[test]
+    fn routing_duplicate_v2_conflicts_cannot_replace_or_prolong_live_assembly() {
+        assert_routing_duplicates_preserve_deadlines(false, true);
+    }
+
+    #[test]
+    fn routing_duplicate_legacy_conflicts_cannot_replace_or_prolong_live_assembly() {
+        assert_routing_duplicates_preserve_deadlines(true, true);
+    }
+
+    #[test]
+    fn routing_unique_progress_still_advances_deadline_and_assembles() {
+        let payload = r#"{"domains":["unique.example"]}"#;
+        let chunks = routing_delivery_chunks(payload, 2);
+        for legacy in [true, false] {
+            let prefix = if legacy { "ROUTING" } else { "ROUTING2" };
+            let nonce = if legacy { "" } else { "0000000000000042:" };
+            let mut reassembler = RoutingReassembler::new();
+            reassembler.feed(format!("{prefix}:START:{nonce}2").as_bytes());
+            reassembler.feed(format!("{prefix}:{nonce}1:2:{}", chunks[0]).as_bytes());
+            reassembler.feed(format!("{prefix}:FINISH:{nonce}2").as_bytes());
+            let old = std::time::Instant::now() - Duration::from_millis(1);
+            reassembler.deadline = Some(old);
+            reassembler.arm_delivery_wait();
+            // FINISH уже виден: уникальный второй чанк сразу завершает сборку.
+            assert_eq!(
+                reassembler.feed(format!("{prefix}:{nonce}2:2:{}", chunks[1]).as_bytes()),
+                Some(payload.to_owned())
+            );
+            assert!(reassembler.wait_deadline.is_none());
+            assert!(reassembler.deadline.is_none());
+
+            reassembler.reset_for_new_delivery();
+            let nonce = if legacy { "" } else { "0000000000000043:" };
+            reassembler.feed(format!("{prefix}:START:{nonce}2").as_bytes());
+            reassembler.deadline = Some(old);
+            reassembler.arm_delivery_wait();
+            reassembler.feed(format!("{prefix}:{nonce}1:2:{}", chunks[0]).as_bytes());
+            assert!(reassembler.deadline.unwrap() > old);
+            assert!(reassembler.wait_deadline.is_none());
+        }
+    }
+
+    #[test]
+    fn routing_owner_lease_has_only_one_concurrent_holder() {
+        const SESSIONS: usize = 16;
+        let slot = Arc::new(AtomicU64::new(0));
+        let holders = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(std::sync::Barrier::new(SESSIONS));
+        std::thread::scope(|scope| {
+            for incarnation_id in 1..=SESSIONS as u64 {
+                let slot = slot.clone();
+                let holders = holders.clone();
+                let barrier = barrier.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    let lease = ConfigOwnerLease::new(slot, incarnation_id);
+                    if lease.is_owner() {
+                        holders.fetch_add(1, Ordering::AcqRel);
+                    }
+                    // Все претенденты проверяют слот, пока победитель жив.
+                    barrier.wait();
+                    drop(lease);
+                });
+            }
+        });
+        assert_eq!(holders.load(Ordering::Acquire), 1);
+        assert_eq!(slot.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn routing_owner_lease_transfers_without_a_stale_drop_clearing_its_successor() {
+        let slot = Arc::new(AtomicU64::new(0));
+        let first = ConfigOwnerLease::new(slot.clone(), 11);
+        let mut survivor = ConfigOwnerLease::new(slot.clone(), 12);
+        let loser = ConfigOwnerLease::new(slot.clone(), 13);
+        assert!(first.is_owner());
+        assert!(!survivor.is_owner());
+        assert!(!loser.is_owner());
+        drop(first);
+        assert!(survivor.try_acquire());
+        assert!(
+            !survivor.try_acquire(),
+            "holding a lease is not a new takeover"
+        );
+        drop(loser);
+        assert_eq!(slot.load(Ordering::Acquire), 12);
+        // CAS при Drop не может стереть слот другой incarnation.
+        slot.store(14, Ordering::Release);
+        drop(survivor);
+        assert_eq!(slot.load(Ordering::Acquire), 14);
+    }
+
+    #[test]
+    fn routing_emission_keeps_legacy_compatible_and_routing2_owner_only() {
+        for payload in [
+            b"ROUTING:START:1".as_slice(),
+            crate::protocol::ROUTING_ABSENT,
+        ] {
+            assert!(should_emit_routing(false, payload));
+            assert!(should_emit_routing(true, payload));
+        }
+        let v2 = b"ROUTING2:START:0000000000000001:1";
+        assert!(!should_emit_routing(false, v2));
+        assert!(should_emit_routing(true, v2));
+    }
+
+    #[test]
+    fn routing_periodic_revalidation_remains_at_300_seconds() {
+        assert_eq!(ROUTING_REVALIDATE_INTERVAL, Duration::from_secs(300));
+        let last = std::time::Instant::now();
+        assert!(!routing_revalidate_due(last, last));
+        assert!(!routing_revalidate_due(
+            last,
+            last + Duration::from_millis(299_999)
+        ));
+        assert!(routing_revalidate_due(
+            last,
+            last + Duration::from_secs(300)
+        ));
+        assert!(routing_revalidate_due(
+            last,
+            last + Duration::from_secs(301)
+        ));
+    }
+
+    #[test]
+    fn routing_cache_hit_preserves_metadata_and_answers_the_delivery_wait() {
+        let payload = serde_json::json!({
+            "version": 2,
+            "content_sha": "a".repeat(64),
+            "content_cached": true,
+            "ips_sha": "b".repeat(64),
+        })
+        .to_string();
+        let chunks = routing_delivery_chunks(&payload, 2);
+        for legacy in [true, false] {
+            let mut reassembler = RoutingReassembler::new();
+            reassembler.reset_for_new_delivery();
+            reassembler.arm_delivery_wait();
+            let received = if legacy {
+                feed_full_delivery(&mut reassembler, &chunks)
+            } else {
+                feed_routing2_delivery(&mut reassembler, "0000000000000031", &chunks)
+            };
+            assert_eq!(received.as_deref(), Some(payload.as_str()));
+            assert!(reassembler.seen_any());
+            assert!(!reassembler.has_active_delivery());
+            let received: serde_json::Value = serde_json::from_str(&received.unwrap()).unwrap();
+            assert_eq!(received["content_cached"], true);
+            assert!(received.get("domains").is_none());
+            assert!(received.get("ips_blob").is_none());
+        }
+    }
+
+    #[test]
+    fn routing2_wait_survives_an_assembled_old_delivery_when_new_response_is_lost() {
+        let payload = r#"{"domains":["old.example"]}"#;
+        let chunks = routing_delivery_chunks(payload, 1);
+        let mut reassembler = RoutingReassembler::new();
+        let nonce = "0000000000000011";
+        assert_eq!(
+            feed_routing2_delivery(&mut reassembler, nonce, &chunks),
+            Some(payload.to_owned())
+        );
+
+        reassembler.reset_for_new_delivery();
+        reassembler.arm_delivery_wait();
+        let deadline = reassembler.wait_deadline.unwrap();
+        for packet in [
+            format!("ROUTING2:START:{nonce}:1"),
+            format!("ROUTING2:{nonce}:1:1:{}", chunks[0]),
+            format!("ROUTING2:FINISH:{nonce}:1"),
+        ] {
+            assert_eq!(reassembler.feed(packet.as_bytes()), None);
+            assert_eq!(reassembler.wait_deadline, Some(deadline), "{packet}");
+        }
+        assert!(reassembler.take_delivery_timeout_at(deadline));
+        assert!(reassembler.take_incomplete_at(deadline).is_none());
+    }
+
+    #[test]
+    fn routing2_wait_survives_a_blocked_tail_when_new_response_is_lost() {
+        let nonce = "0000000000000012";
+        let mut reassembler = RoutingReassembler::new();
+        assert_eq!(
+            reassembler.feed(format!("ROUTING2:START:{nonce}:1").as_bytes()),
+            None
+        );
+        reassembler.mark_absent();
+        reassembler.reset_for_new_delivery();
+        reassembler.arm_delivery_wait();
+        let deadline = reassembler.wait_deadline.unwrap();
+        for packet in [
+            format!("ROUTING2:START:{nonce}:1"),
+            format!("ROUTING2:{nonce}:1:1:e30="),
+            format!("ROUTING2:FINISH:{nonce}:1"),
+        ] {
+            assert_eq!(reassembler.feed(packet.as_bytes()), None);
+            assert_eq!(reassembler.wait_deadline, Some(deadline), "{packet}");
+        }
+        assert!(reassembler.take_delivery_timeout_at(deadline));
+    }
+
+    #[test]
+    fn routing2_wait_is_not_answered_by_malformed_packets() {
+        for packet in [
+            b"ROUTING2:START:not-hex:1".as_slice(),
+            b"ROUTING2:START:0000000000000013:0".as_slice(),
+            b"ROUTING2:0000000000000013:0:1:e30=".as_slice(),
+            b"ROUTING:START:0".as_slice(),
+            b"ROUTING:garbage".as_slice(),
+        ] {
+            let mut reassembler = RoutingReassembler::new();
+            reassembler.arm_delivery_wait();
+            let deadline = reassembler.wait_deadline.unwrap();
+            assert_eq!(reassembler.feed(packet), None);
+            assert!(!reassembler.seen_any(), "{packet:?}");
+            assert!(reassembler.take_delivery_timeout_at(deadline), "{packet:?}");
+        }
+    }
+
+    #[test]
+    fn routing_delivery_wait_times_out_after_reset_and_completely_lost_retries() {
+        let mut reassembler = RoutingReassembler::new();
+        let payload = r#"{"domains":["initial.example"]}"#;
+        let chunks = routing_delivery_chunks(payload, 1);
+        assert_eq!(
+            feed_routing2_delivery(&mut reassembler, "0000000000000014", &chunks),
+            Some(payload.to_owned())
+        );
+        for _ in 0..3 {
+            reassembler.reset_for_new_delivery();
+            reassembler.arm_delivery_wait();
+            let deadline = reassembler.wait_deadline.unwrap();
+            assert!(!reassembler.take_delivery_timeout_at(deadline - Duration::from_millis(1)));
+            assert!(reassembler.take_delivery_timeout_at(deadline));
+            assert!(!reassembler.take_delivery_timeout_at(deadline));
+        }
+    }
+
+    #[test]
+    fn routing_absent_rejects_unseen_old_start_and_tail_until_a_new_request() {
+        let payload = r#"{"domains":["removed.example"]}"#;
+        let chunks = routing_delivery_chunks(payload, 1);
+        let mut reassembler = RoutingReassembler::new();
+        assert_eq!(
+            feed_routing2_delivery(&mut reassembler, "0000000000000021", &chunks),
+            Some(payload.to_owned())
+        );
+        reassembler.reset_for_new_delivery();
+        reassembler.arm_delivery_wait();
+        reassembler.mark_absent();
+
+        // START этой старой доставки ещё никогда не попадал в рессемблер.
+        assert_eq!(
+            feed_routing2_delivery(&mut reassembler, "0000000000000022", &chunks),
+            None,
+            "ABSENT не позволяет поздней доставке воскресить снятое правило"
+        );
+        assert!(!reassembler.has_active_delivery());
+
+        // Подготовка GETCONF, который не был отправлен, не открывает приём.
+        reassembler.reset_for_new_delivery();
+        assert_eq!(
+            feed_routing2_delivery(&mut reassembler, "0000000000000023", &chunks),
+            None
+        );
+        reassembler.arm_delivery_wait();
+        // Наблюдённый во время ABSENT nonce остаётся заблокированным и теперь.
+        assert_eq!(
+            feed_routing2_delivery(&mut reassembler, "0000000000000022", &chunks),
+            None
+        );
+        assert!(reassembler.wait_deadline.is_some());
+        assert_eq!(
+            feed_routing2_delivery(&mut reassembler, "0000000000000024", &chunks),
+            Some(payload.to_owned()),
+            "ответ на настоящий новый запрос принимается"
+        );
+        assert!(reassembler.wait_deadline.is_none());
+    }
+
+    #[test]
+    fn routing_absent_keeps_legacy_blocked_until_the_new_request_is_sent() {
+        let payload = r#"{"domains":["legacy.example"]}"#;
+        let chunks = routing_delivery_chunks(payload, 1);
+        let mut reassembler = RoutingReassembler::new();
+        reassembler.mark_absent();
+        assert_eq!(feed_full_delivery(&mut reassembler, &chunks), None);
+        reassembler.reset_for_new_delivery();
+        assert_eq!(feed_full_delivery(&mut reassembler, &chunks), None);
+        reassembler.arm_delivery_wait();
+        assert_eq!(
+            feed_full_delivery(&mut reassembler, &chunks),
+            Some(payload.to_owned())
+        );
+    }
+
     /// ROUTING2 собирается по nonce; чужие чанки не попадают в сборку.
     #[test]
     fn test_routing2_assembles_only_chunks_of_the_active_nonce() {
@@ -3501,7 +4271,8 @@ mod tests {
         );
     }
 
-    /// FINISH с другим total — порча доставки: не собираем, ждём retry.
+    /// FINISH с другим total не подтверждает и не сбрасывает живую доставку:
+    /// исходный дедлайн остаётся, watchdog ждёт правильный FINISH или retry.
     #[test]
     fn test_routing2_finish_with_mismatched_total_is_not_assembled() {
         let payload = r#"{"mode":"blacklist","domains":["g.example"]}"#;
@@ -3518,18 +4289,23 @@ mod tests {
                 None
             );
         }
+        let deadline = reassembler.deadline.unwrap();
+        let live_chunks = reassembler.chunks.clone();
+        reassembler.arm_delivery_wait();
+        let wait = reassembler.wait_deadline;
         assert_eq!(
             reassembler.feed(format!("ROUTING2:FINISH:{nonce}:5").as_bytes()),
             None
         );
-        let now = std::time::Instant::now();
+        assert_eq!(reassembler.deadline, Some(deadline));
+        assert_eq!(reassembler.wait_deadline, wait);
+        assert_eq!(reassembler.chunks, live_chunks);
         let incomplete = reassembler
-            .take_incomplete_at(
-                now + RoutingReassembler::REASSEMBLY_TIMEOUT + std::time::Duration::from_millis(1),
-            )
-            .expect("несогласованный FINISH обязан взвести дедлайн");
-        assert_eq!(incomplete.total, 5);
-        assert!(incomplete.finish_seen);
+            .take_incomplete_at(deadline)
+            .expect("несогласованный FINISH не должен продлить исходный дедлайн");
+        assert_eq!(incomplete.total, 4);
+        assert_eq!(incomplete.received, 4);
+        assert!(!incomplete.finish_seen);
     }
 
     /// Опоздавший хвост уже собранной ROUTING2 молча игнорируется.

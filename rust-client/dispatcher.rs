@@ -488,6 +488,18 @@ pub struct DomainRoutingConfig {
 }
 
 impl DomainRoutingConfig {
+    /// Семантическое равенство: периодический GETCONF присылает то же правило,
+    /// и совпадение не должно менять routing epoch и сбрасывать живые прямые
+    /// соединения (TCP-сессии и UDP-порты).
+    pub fn same_effective(&self, other: &Self) -> bool {
+        self.enabled == other.enabled
+            && self.is_whitelist == other.is_whitelist
+            && self.ip_is_whitelist == other.ip_is_whitelist
+            && self.direct_domains == other.direct_domains
+            && self.ip_rules == other.ip_rules
+            && self.template_ip_rules == other.template_ip_rules
+    }
+
     pub fn ip_routing_enabled(&self) -> bool {
         self.has_ip_rules()
     }
@@ -584,11 +596,49 @@ pub struct Dispatcher {
     uplink_state: Mutex<UplinkState>,
     pool: Arc<PacketPool>,
     reassembler: crate::wire_protocol::ShardedReassembler,
+    /// Роль доставки маршрутизации, общая для всех живых сессий туннеля.
+    /// 0 — свободна; иначе здесь incarnation_id владельца.
+    routing_owner: Arc<AtomicU64>,
     next_frag_id: std::sync::atomic::AtomicU16,
     termination: Arc<OnceLock<Termination>>,
 }
 
 impl Dispatcher {
+    #[cfg(test)]
+    pub(crate) fn routing_test_dispatcher(
+        domain_routing: Arc<ArcSwap<DomainRoutingConfig>>,
+        direct_ips: Arc<ArcSwap<HashSet<IpAddr>>>,
+        dns_domain_map: Arc<crate::sni::DnsDomainMap>,
+        relay: Arc<crate::direct_relay::DirectRelay>,
+        pool: Arc<PacketPool>,
+    ) -> Arc<Self> {
+        let profile = QueueProfile::for_worker_count(3);
+        Arc::new(Self {
+            workers: ArcSwap::from_pointee(Vec::new()),
+            inbound: ArrayQueue::new(profile.inbound_capacity),
+            outbound_capacity: profile.outbound_capacity,
+            tun_wake: Arc::new(Notify::new()),
+            tun_io_lost: Arc::new(Notify::new()),
+            cancel: CancellationToken::new(),
+            tasks: tokio::sync::Mutex::new(Vec::new()),
+            domain_routing,
+            direct_ips,
+            dns_domain_map,
+            direct_relay: Some(relay),
+            uplink_state: Mutex::new(UplinkState::new()),
+            pool,
+            reassembler: crate::wire_protocol::ShardedReassembler::new(),
+            routing_owner: Arc::new(AtomicU64::new(0)),
+            next_frag_id: std::sync::atomic::AtomicU16::new(1),
+            termination: Arc::new(OnceLock::new()),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_routing_test_packet(&self, packet: &PacketBuf) {
+        self.inspect_domain_routing(packet);
+    }
+
     #[cfg(all(test, unix))]
     pub async fn start_test_tun(
         file: File,
@@ -615,6 +665,7 @@ impl Dispatcher {
             pool: pool.clone(),
             reassembler: crate::wire_protocol::ShardedReassembler::new(),
             next_frag_id: std::sync::atomic::AtomicU16::new(1),
+            routing_owner: Arc::new(AtomicU64::new(0)),
             termination: Arc::new(OnceLock::new()),
         });
         let io_dispatcher = dispatcher.clone();
@@ -692,6 +743,7 @@ impl Dispatcher {
             pool: pool.clone(),
             reassembler: crate::wire_protocol::ShardedReassembler::new(),
             next_frag_id: std::sync::atomic::AtomicU16::new(1),
+            routing_owner: Arc::new(AtomicU64::new(0)),
             termination: Arc::new(OnceLock::new()),
         });
         crate::log_error!(
@@ -833,6 +885,10 @@ impl Dispatcher {
                 .extend([read_task, write_task]);
             Ok((dispatcher, local_port))
         }
+    }
+
+    pub(crate) fn routing_owner_slot(&self) -> Arc<AtomicU64> {
+        self.routing_owner.clone()
     }
 
     pub fn register(&self, channels: WorkerChannels) {
@@ -1309,14 +1365,26 @@ pub(crate) fn apply_domain_update(
 }
 
 impl Dispatcher {
+    fn update_routing_config(
+        &self,
+        update: impl FnOnce(&DomainRoutingConfig) -> DomainRoutingConfig,
+    ) -> DomainRoutingConfig {
+        if let Some(relay) = &self.direct_relay {
+            relay.update_routing_config(update)
+        } else {
+            let origin = self.dns_domain_map.update_routing_config(
+                &self.domain_routing,
+                &self.direct_ips,
+                update,
+                |_| {},
+            );
+            (*origin.config).clone()
+        }
+    }
+
     pub fn update_template_ip_rules(&self, sha: &str, blob: Option<&str>) -> anyhow::Result<usize> {
         let store = |set: crate::sni::IpRuleSet| {
-            let current = self.domain_routing.load();
-            let updated = current.with_template_ip_rules(set);
-            self.domain_routing.store(Arc::new(updated));
-            if let Some(relay) = &self.direct_relay {
-                relay.invalidate_route_caches();
-            }
+            self.update_routing_config(|current| current.with_template_ip_rules(set));
         };
 
         if sha.is_empty() {
@@ -1345,15 +1413,14 @@ impl Dispatcher {
     }
 
     pub fn update_domain_routing(&self, payload: &str) {
-        let current = self.domain_routing.load();
-        let new_config = apply_domain_update(&current, payload);
+        let new_config =
+            self.update_routing_config(|current| apply_domain_update(current, payload));
         let enabled = new_config.enabled;
         let domains = new_config.direct_domains.len();
         let is_whitelist = new_config.is_whitelist;
         let ip_is_whitelist = new_config.ip_is_whitelist;
         let ip_rules = new_config.ip_rules.len();
         let template_ip_rules = new_config.template_ip_rules.len();
-        self.domain_routing.store(Arc::new(new_config.clone()));
         crate::log_error!(
             "[КЛИЕНТ] Горячее обновление доменов: вкл={}, кастомных={}, ЧС/БС={}, IP вкл={}, IP ЧС/БС={}, IP правил={}, шаблонных интервалов={}",
             enabled,
@@ -1364,61 +1431,64 @@ impl Dispatcher {
             ip_rules,
             template_ip_rules
         );
-        if let Some(relay) = &self.direct_relay {
-            relay.sync_domain_routing(&new_config);
-        }
     }
 
     #[inline(always)]
     fn inspect_domain_routing(&self, packet: &PacketBuf) {
-        let config = self.domain_routing.load();
+        let origin = self.dns_domain_map.routing_origin(&self.domain_routing);
+        let config = &origin.config;
+        #[cfg(test)]
+        if let Some(relay) = &self.direct_relay {
+            relay.learned_test_hooks.pause_observation();
+        }
         if !config.enabled && !config.ip_routing_enabled() {
             return;
         }
         let slice = packet.as_slice();
         if let Some((domain, _is_resp, ips)) = crate::sni::parse_ip_packet_dns(slice) {
-            if !ips.is_empty() {
-                self.dns_domain_map.insert_multiple(&ips, &domain);
-            }
-            if config.enabled
-                && !ips.is_empty()
+            let direct = config.enabled
                 && crate::sni::is_direct_domain_mode(
                     &domain,
                     config.is_whitelist,
                     &config.direct_domains,
-                )
+                );
+            let known = self.direct_ips.load_full();
+            if self.dns_domain_map.publish_routing_learning(
+                &self.domain_routing,
+                &self.direct_ips,
+                &origin,
+                &domain,
+                &ips,
+                direct,
+            ) && direct
             {
-                self.direct_ips.rcu(|current| {
-                    let mut updated = (**current).clone();
-                    for &ip in &ips {
-                        if updated.insert(ip) {
-                            crate::log_error!("[DNS-РОУТИНГ] Прямой домен: {domain} -> {ip}");
-                        }
-                    }
-                    Arc::new(updated)
-                });
+                for ip in ips.iter().filter(|ip| !known.contains(ip)) {
+                    crate::log_error!("[DNS-РОУТИНГ] Прямой домен: {domain} -> {ip}");
+                }
             }
         }
         if let Some((sni, _port)) = crate::sni::parse_ip_packet_sni(slice)
             && let Some(dst) = crate::sni::extract_dst_addr(slice)
         {
             let ip = dst.ip();
-            self.dns_domain_map.insert(ip, sni.to_string());
-            if config.enabled
+            let direct = config.enabled
                 && crate::sni::is_direct_domain_mode(
                     sni,
                     config.is_whitelist,
                     &config.direct_domains,
-                )
-                && !self.direct_ips.load().contains(&ip)
+                );
+            let known = self.direct_ips.load().contains(&ip);
+            if self.dns_domain_map.publish_routing_learning(
+                &self.domain_routing,
+                &self.direct_ips,
+                &origin,
+                sni,
+                &[ip],
+                direct,
+            ) && direct
+                && !known
             {
-                self.direct_ips.rcu(|current| {
-                    let mut updated = (**current).clone();
-                    if updated.insert(ip) {
-                        crate::log_error!("[SNI-РОУТИНГ] Прямой домен: {sni} -> {ip}");
-                    }
-                    Arc::new(updated)
-                });
+                crate::log_error!("[SNI-РОУТИНГ] Прямой домен: {sni} -> {ip}");
             }
         }
     }
@@ -2073,6 +2143,7 @@ mod tests {
             pool: pool.clone(),
             reassembler: crate::wire_protocol::ShardedReassembler::new(),
             next_frag_id: std::sync::atomic::AtomicU16::new(1),
+            routing_owner: Arc::new(AtomicU64::new(0)),
             termination: Arc::new(OnceLock::new()),
         };
 
@@ -2250,6 +2321,7 @@ mod tests {
             pool: pool.clone(),
             reassembler: crate::wire_protocol::ShardedReassembler::new(),
             next_frag_id: std::sync::atomic::AtomicU16::new(1),
+            routing_owner: Arc::new(AtomicU64::new(0)),
             termination: Arc::new(OnceLock::new()),
         };
 
@@ -2306,6 +2378,7 @@ mod tests {
             pool: pool.clone(),
             reassembler: crate::wire_protocol::ShardedReassembler::new(),
             next_frag_id: std::sync::atomic::AtomicU16::new(1),
+            routing_owner: Arc::new(AtomicU64::new(0)),
             termination: Arc::new(OnceLock::new()),
         };
         let packet = || {
@@ -2358,6 +2431,7 @@ mod tests {
             pool: pool.clone(),
             reassembler: crate::wire_protocol::ShardedReassembler::new(),
             next_frag_id: std::sync::atomic::AtomicU16::new(1),
+            routing_owner: Arc::new(AtomicU64::new(0)),
             termination: Arc::new(OnceLock::new()),
         };
 
@@ -2427,6 +2501,7 @@ mod tests {
             pool: pool.clone(),
             reassembler: crate::wire_protocol::ShardedReassembler::new(),
             next_frag_id: std::sync::atomic::AtomicU16::new(1),
+            routing_owner: Arc::new(AtomicU64::new(0)),
             termination: Arc::new(OnceLock::new()),
         };
 

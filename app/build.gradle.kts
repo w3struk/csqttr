@@ -407,8 +407,8 @@ val serverNativeInputs = fileTree(rootProject.projectDir) {
         "rust-server/Cargo.toml",
         "rust-server/Cargo.lock",
         "rust-server/rust-toolchain.toml",
+        "rust-server/data/*.txt",
         "shared/*.rs",
-        "app/src/main/assets/domains.txt",
         "scripts/server_asset_provenance.sh",
     )
 }

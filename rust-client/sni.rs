@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use arc_swap::ArcSwap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::time::Instant;
 
 pub fn extract_tls_sni(payload: &[u8]) -> Option<&str> {
@@ -386,8 +387,31 @@ pub fn evaluate_route(
     }
 }
 
+/// Origin of learned routing facts, captured before DNS or packet inspection.
+#[derive(Clone)]
+pub(crate) struct RoutingLearningOrigin {
+    pub(crate) config: Arc<crate::dispatcher::DomainRoutingConfig>,
+    generation: u64,
+    /// `false`, когда `update_routing_config` получил семантически то же
+    /// правило: epoch не менялся, кеши и соединения не сбрасывались.
+    pub(crate) changed: bool,
+}
+
+impl RoutingLearningOrigin {
+    pub(crate) fn is_current(
+        &self,
+        generation: u64,
+        routing: &ArcSwap<crate::dispatcher::DomainRoutingConfig>,
+    ) -> bool {
+        self.generation == generation && Arc::ptr_eq(&self.config, &routing.load_full())
+    }
+}
+
 pub struct DnsDomainMap {
     entries: RwLock<HashMap<IpAddr, (String, Instant)>>,
+    /// Single publication boundary for config, this map, and learned direct IPs.
+    /// Order: epoch -> verdict cache / UDP sessions / entries. Never spans await.
+    routing_epoch: RwLock<u64>,
     max_entries: usize,
 }
 
@@ -395,10 +419,115 @@ impl DnsDomainMap {
     pub fn new(max_entries: usize) -> Self {
         Self {
             entries: RwLock::new(HashMap::with_capacity(max_entries.min(4096))),
+            routing_epoch: RwLock::new(0),
             max_entries,
         }
     }
 
+    pub(crate) fn read_routing_epoch(&self) -> RwLockReadGuard<'_, u64> {
+        match self.routing_epoch.read() {
+            Ok(epoch) => epoch,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    pub(crate) fn routing_origin(
+        &self,
+        routing: &ArcSwap<crate::dispatcher::DomainRoutingConfig>,
+    ) -> RoutingLearningOrigin {
+        let epoch = self.read_routing_epoch();
+        self.routing_origin_at(*epoch, routing)
+    }
+
+    pub(crate) fn routing_origin_at(
+        &self,
+        generation: u64,
+        routing: &ArcSwap<crate::dispatcher::DomainRoutingConfig>,
+    ) -> RoutingLearningOrigin {
+        RoutingLearningOrigin {
+            config: routing.load_full(),
+            generation,
+            changed: false,
+        }
+    }
+
+    pub(crate) fn origin_is_current(
+        &self,
+        origin: &RoutingLearningOrigin,
+        routing: &ArcSwap<crate::dispatcher::DomainRoutingConfig>,
+    ) -> bool {
+        let epoch = self.read_routing_epoch();
+        origin.is_current(*epoch, routing)
+    }
+
+    pub(crate) fn update_routing_config(
+        &self,
+        routing: &ArcSwap<crate::dispatcher::DomainRoutingConfig>,
+        direct_ips: &ArcSwap<HashSet<IpAddr>>,
+        update: impl FnOnce(
+            &crate::dispatcher::DomainRoutingConfig,
+        ) -> crate::dispatcher::DomainRoutingConfig,
+        invalidate: impl FnOnce(&crate::dispatcher::DomainRoutingConfig),
+    ) -> RoutingLearningOrigin {
+        let mut epoch = match self.routing_epoch.write() {
+            Ok(epoch) => epoch,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        // Периодический GETCONF присылает то же правило. Повторная публикация
+        // не должна менять epoch: иначе выученные факты, verdict-кеш, UDP-сессии
+        // и active_tcp сбрасываются каждые пять минут, рвут долгие прямые
+        // соединения и меняют исходный порт UDP.
+        let current = routing.load_full();
+        let updated = Arc::new(update(&current));
+        if updated.same_effective(&current) {
+            return RoutingLearningOrigin {
+                config: current,
+                generation: *epoch,
+                changed: false,
+            };
+        }
+        *epoch = epoch.wrapping_add(1);
+        // Revoke both kinds of facts before exposing the new config. In-flight
+        // publishers cannot pass their origin check until this update completes.
+        direct_ips.store(Arc::new(HashSet::new()));
+        self.clear();
+        invalidate(&updated);
+        routing.store(updated.clone());
+        RoutingLearningOrigin {
+            config: updated,
+            generation: *epoch,
+            changed: true,
+        }
+    }
+
+    pub(crate) fn publish_routing_learning(
+        &self,
+        routing: &ArcSwap<crate::dispatcher::DomainRoutingConfig>,
+        direct_ips: &ArcSwap<HashSet<IpAddr>>,
+        origin: &RoutingLearningOrigin,
+        domain: &str,
+        ips: &[IpAddr],
+        direct: bool,
+    ) -> bool {
+        let epoch = match self.routing_epoch.write() {
+            Ok(epoch) => epoch,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if !origin.is_current(*epoch, routing) {
+            return false;
+        }
+        self.insert_multiple(ips, domain);
+        if direct && !ips.is_empty() {
+            direct_ips.rcu(|current| {
+                let mut updated = (**current).clone();
+                updated.extend(ips.iter().copied());
+                Arc::new(updated)
+            });
+        }
+        true
+    }
+
+    #[cfg(test)]
     pub fn insert(&self, ip: IpAddr, domain: String) {
         if let Ok(mut map) = self.entries.write() {
             if map.len() >= self.max_entries {
@@ -412,7 +541,7 @@ impl DnsDomainMap {
         }
     }
 
-    pub fn insert_multiple(&self, ips: &[IpAddr], domain: &str) {
+    fn insert_multiple(&self, ips: &[IpAddr], domain: &str) {
         if ips.is_empty() {
             return;
         }
@@ -439,7 +568,7 @@ impl DnsDomainMap {
         }
     }
 
-    pub fn clear(&self) {
+    fn clear(&self) {
         if let Ok(mut map) = self.entries.write() {
             map.clear();
         }
@@ -705,6 +834,69 @@ mod tests {
         let dirty_input = ",,   \n\n  http://,, .ru, test.com, test.com, ";
         let parsed = parse_direct_domains(dirty_input);
         assert_eq!(parsed, vec!["test.com"]);
+    }
+
+    /// Периодический GETCONF присылает то же правило: повторная публикация не
+    /// имеет права менять epoch, чистить выученные факты и сбрасывать кеши —
+    /// иначе долгие прямые TCP-соединения и UDP-порты рвутся каждые 5 минут.
+    #[test]
+    fn identical_routing_update_keeps_epoch_facts_and_caches() {
+        let map = DnsDomainMap::new(16);
+        let routing = ArcSwap::from_pointee(crate::dispatcher::DomainRoutingConfig::default());
+        let direct_ips = ArcSwap::from_pointee(HashSet::new());
+        let learned: IpAddr = "93.184.216.34".parse().unwrap();
+        map.insert_multiple(&[learned], "example.org");
+
+        let enabled = crate::dispatcher::DomainRoutingConfig {
+            enabled: true,
+            direct_domains: vec!["example.org".to_string()].into(),
+            ..Default::default()
+        };
+        let mut invalidations = 0;
+        let first = map.update_routing_config(
+            &routing,
+            &direct_ips,
+            |_| enabled.clone(),
+            |_| invalidations += 1,
+        );
+        assert!(first.changed);
+        assert_eq!(invalidations, 1);
+        assert_eq!(map.get(&learned), None, "смена правила чистит факты");
+
+        map.insert_multiple(&[learned], "example.org");
+        let same = map.update_routing_config(
+            &routing,
+            &direct_ips,
+            |current| current.clone(),
+            |_| invalidations += 1,
+        );
+        assert!(!same.changed, "то же правило не считается обновлением");
+        assert_eq!(
+            invalidations, 1,
+            "повтор не должен сбрасывать кеши и сессии"
+        );
+        assert_eq!(same.generation, first.generation);
+        assert!(Arc::ptr_eq(&same.config, &routing.load_full()));
+        assert_eq!(
+            map.get(&learned).as_deref(),
+            Some("example.org"),
+            "выученные факты обязаны пережить повторную публикацию"
+        );
+
+        let changed = map.update_routing_config(
+            &routing,
+            &direct_ips,
+            |current| {
+                let mut updated = current.clone();
+                updated.enabled = false;
+                updated
+            },
+            |_| invalidations += 1,
+        );
+        assert!(changed.changed);
+        assert_eq!(changed.generation, first.generation.wrapping_add(1));
+        assert_eq!(invalidations, 2);
+        assert_eq!(map.get(&learned), None);
     }
 
     #[test]

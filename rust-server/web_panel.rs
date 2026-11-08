@@ -256,14 +256,15 @@ pub(crate) fn deploy_dns_profile_or_yandex(existing_dns: &str) -> String {
 }
 
 const WEB_BODY_LIMIT_BYTES: usize = 16 * 1024;
-/// Лимит тела только для создания/правки маршрутного правила.
+/// Лимит тела для создания/правки маршрутного правила и импорта базы.
 ///
 /// Правило доставляется событием ≤ 65 536 байт, но его JSON в запросе панели
 /// содержит ещё явные адреса, обвязку и экранирование; худший валидный случай
 /// (~1 024 домена по ~58 символов + 512 адресов + blob) — около 113 КБ. Общий
 /// лимит 16 КиБ отсекал такие запросы до валидатора (413 вместо 400), из-за
-/// чего ветка «правило не доставляется» была недостижима. 256 КиБ оставляют
-/// запас и не расширяют остальные endpoint'ы.
+/// чего ветка «правило не доставляется» была недостижима. Импорт получает тот
+/// же лимит: иначе сохранённое правило 16–256 КБ нельзя было бы восстановить
+/// из экспорта. 256 КиБ оставляют запас и не расширяют остальные endpoint'ы.
 const ROUTING_RULE_BODY_LIMIT_BYTES: usize = 256 * 1024;
 // D1: тело правила обязано проходить дальше общего лимита и достигать
 // валидатора, который и возвращает 400 про размер события.
@@ -5644,10 +5645,7 @@ async fn security_headers(mut request: Request<Body>, next: Next) -> Response {
     response
 }
 
-pub async fn run(
-    app: Arc<App>,
-    tls_config: axum_server::tls_rustls::RustlsConfig,
-) -> anyhow::Result<()> {
+fn panel_router(app: Arc<App>) -> Router {
     let state = WebState { app: app.clone() };
     let protected = Router::new()
         .route("/api/stats", get(stats))
@@ -5737,7 +5735,10 @@ pub async fn run(
         .route("/api/groups/{id}/clients", get(group_clients_get))
         .route("/api/diagnostics/dpi", get(api_diagnostics_dpi))
         .route("/api/export", get(api_export_get))
-        .route("/api/import", post(api_import_post))
+        .route(
+            "/api/import",
+            post(api_import_post).layer(DefaultBodyLimit::max(ROUTING_RULE_BODY_LIMIT_BYTES)),
+        )
         .route("/api/reboot", post(reboot))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -5777,7 +5778,7 @@ pub async fn run(
             .route("/favicon.ico", get(favicon));
     }
 
-    let router = router
+    router
         .route("/{uuid}/admin", get(group_admin_page))
         .route("/{uuid}/admin/", get(group_admin_page))
         .route("/{uuid}/api/data", get(group_admin_data_get))
@@ -5847,8 +5848,14 @@ pub async fn run(
         .fallback(fallback_reject)
         .layer(DefaultBodyLimit::max(WEB_BODY_LIMIT_BYTES))
         .layer(middleware::from_fn(security_headers))
-        .with_state(state);
+        .with_state(state)
+}
 
+pub async fn run(
+    app: Arc<App>,
+    tls_config: axum_server::tls_rustls::RustlsConfig,
+) -> anyhow::Result<()> {
+    let router = panel_router(app.clone());
     tokio::spawn(web_session_janitor(app.clone()));
     tokio::spawn(web_slowloris_watchdog());
     println!("[WEB] HTTP/HTTPS listening on 0.0.0.0:{}", app.web_port);
@@ -12600,11 +12607,16 @@ const PANEL_HTML_TEMPLATE: &str = r##"
                             .map(s => s.trim())
                             .filter(s => s && !s.startsWith('#'));
                     } else {
-                        templateDomainsCache = [];
+                        templateDomainsCache = null;
                     }
                 } catch(e) {
-                    templateDomainsCache = [];
+                    templateDomainsCache = null;
                 }
+            }
+            if (!templateDomainsCache) {
+                if (countEl) countEl.textContent = '—';
+                listEl.innerHTML = '<div style="color: var(--danger); text-align: center; padding: 10px;">Не удалось загрузить список. Откройте диалог ещё раз.</div>';
+                return;
             }
             if (countEl) countEl.textContent = templateDomainsCache.length;
             renderTemplateDomainsList(templateDomainsCache);
@@ -12710,11 +12722,16 @@ const PANEL_HTML_TEMPLATE: &str = r##"
                             .map(s => s.trim())
                             .filter(s => s && !s.startsWith('#'));
                     } else {
-                        templateIpsCache = [];
+                        templateIpsCache = null;
                     }
                 } catch(e) {
-                    templateIpsCache = [];
+                    templateIpsCache = null;
                 }
+            }
+            if (!templateIpsCache) {
+                if (countEl) countEl.textContent = '—';
+                listEl.innerHTML = '<div style="color: var(--danger); text-align: center; padding: 10px;">Не удалось загрузить список. Откройте диалог ещё раз.</div>';
+                return;
             }
             if (countEl) countEl.textContent = templateIpsCache.length;
             renderTemplateIpsList(templateIpsCache);
@@ -13746,6 +13763,275 @@ mod tests {
         routing_rule_validation_response, rule_affected_passwords, validate_client_name,
         validate_proxy_profile_name, validate_workers,
     };
+
+    mod api_residual {
+        use super::super::{ROUTING_RULE_BODY_LIMIT_BYTES, WEB_BODY_LIMIT_BYTES, panel_router};
+        use crate::{
+            App,
+            model::{self, Database, DatabasePersistence, RoutingRule},
+        };
+        use axum::{
+            Router,
+            body::{Body, to_bytes},
+            http::{Request, StatusCode},
+            response::Response,
+        };
+        use serde_json::{Value, json};
+        use std::sync::Arc;
+        use tower_service::Service;
+
+        /// The production router, auth and SQLite writer, without listeners or a dataplane.
+        struct Fixture {
+            app: Arc<App>,
+            router: Router,
+        }
+
+        impl Fixture {
+            async fn new(mut db: Database) -> Self {
+                // Keep snapshot reads from repairing (and rewriting) an incomplete fixture.
+                let _ = db.repair_stale_password_bindings();
+                let config_dir = std::env::temp_dir().join("opencode").join(format!(
+                    "csqtt-panel-residual-{}-{}",
+                    std::process::id(),
+                    model::random_token(16)
+                ));
+                std::fs::create_dir_all(&config_dir).unwrap();
+                let db_persistence = DatabasePersistence::new(config_dir.clone()).unwrap();
+                let revision = db_persistence.submit(db.clone());
+                db_persistence.wait(revision).await.unwrap();
+                let (auto_restart_interval_tx, _) =
+                    tokio::sync::watch::channel(db.auto_restart_interval_hours());
+                let app = Arc::new(App {
+                    dns: tokio::sync::RwLock::new(db.dns.clone()),
+                    startup_main_password: db.main_password.clone(),
+                    db: tokio::sync::RwLock::new(db),
+                    db_persistence,
+                    log_file_path: config_dir.join("csqtt.log"),
+                    config_dir,
+                    listen: "127.0.0.1:0".parse().unwrap(),
+                    web_port: 0,
+                    web_user: "test".to_owned(),
+                    web_pass: "panel-residual-test-key".to_owned(),
+                    web_secret_path: String::new(),
+                    public_ip: Default::default(),
+                    secure_cookie: false,
+                    sessions: Default::default(),
+                    password_epochs: Default::default(),
+                    web_sessions: Default::default(),
+                    login_limits: Default::default(),
+                    web_auth_admission: Default::default(),
+                    bytes_from_client: Default::default(),
+                    bytes_to_client: Default::default(),
+                    total_connections: Default::default(),
+                    cpu_percent: Default::default(),
+                    cpu_cores: Default::default(),
+                    started: model::now(),
+                    derived_keys: Default::default(),
+                    logs: Default::default(),
+                    logging_active: Default::default(),
+                    stream_debug_active: Default::default(),
+                    proxy_route: Default::default(),
+                    proxy_operation: Default::default(),
+                    proxy_trigger: Default::default(),
+                    proxy_port_listening: Default::default(),
+                    proxy_health_error: Default::default(),
+                    memory_trim_gate: Default::default(),
+                    memory_trim_count: Default::default(),
+                    memory_trim_last_unix: Default::default(),
+                    auto_restart_interval_tx,
+                    restart_pending: Default::default(),
+                    dataplane: Default::default(),
+                });
+                let router = panel_router(app.clone());
+                Self { app, router }
+            }
+
+            async fn request(&self, method: &str, uri: &str, body: Vec<u8>) -> Response {
+                self.router
+                    .clone()
+                    .call(
+                        Request::builder()
+                            .method(method)
+                            .uri(uri)
+                            .header("x-api-key", &self.app.web_pass)
+                            .header("content-type", "application/json")
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+            }
+
+            async fn export(&self) -> Vec<u8> {
+                let response = self.request("GET", "/api/export", Vec::new()).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                to_bytes(response.into_body(), ROUTING_RULE_BODY_LIMIT_BYTES)
+                    .await
+                    .unwrap()
+                    .to_vec()
+            }
+
+            async fn snapshots(&self) -> (Value, Value) {
+                (
+                    serde_json::to_value(&*self.app.db.read().await).unwrap(),
+                    serde_json::to_value(model::load_database(&self.app.config_dir).unwrap())
+                        .unwrap(),
+                )
+            }
+        }
+
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.app.config_dir);
+            }
+        }
+
+        fn large_rule() -> RoutingRule {
+            RoutingRule {
+                id: "rule_large".to_owned(),
+                name: "Large exported rule".to_owned(),
+                preset_apps: false,
+                direct_domains: (0..512)
+                    .map(|i| format!("d{i:04}.{}.example.com", "a".repeat(24)))
+                    .collect(),
+                ..Default::default()
+            }
+        }
+
+        #[tokio::test]
+        async fn import_round_trips_one_exported_rule_larger_than_16_kib() {
+            let rule = large_rule();
+            crate::protocol::validate_routing_rule(&rule).unwrap();
+            let rule_bytes = serde_json::to_vec(&rule).unwrap().len();
+            assert!(rule_bytes > WEB_BODY_LIMIT_BYTES);
+            let mut db = Database::default();
+            db.routing_rules.insert(rule.id.clone(), rule.clone());
+            let source = Fixture::new(db).await;
+            let export_body = source.export().await;
+            let export: Value = serde_json::from_slice(&export_body).unwrap();
+            assert_eq!(export["routing_rules"].as_object().unwrap().len(), 1);
+            let wrapped_body = serde_json::to_vec(&json!({
+                "import_clients": true,
+                "import_settings": false,
+                "config": export,
+            }))
+            .unwrap();
+
+            for (label, body) in [("direct", export_body), ("wrapped", wrapped_body)] {
+                assert!(body.len() > WEB_BODY_LIMIT_BYTES);
+                assert!(body.len() < ROUTING_RULE_BODY_LIMIT_BYTES);
+                let target = Fixture::new(Database::default()).await;
+                let body_len = body.len();
+                let response = target.request("POST", "/api/import", body).await;
+                assert_eq!(response.status(), StatusCode::OK, "{label} import");
+                assert_eq!(target.app.db.read().await.routing_rules.len(), 1);
+                assert_eq!(target.app.db.read().await.routing_rules[&rule.id], rule);
+                let persisted = model::load_database(&target.app.config_dir).unwrap();
+                assert_eq!(persisted.routing_rules.len(), 1);
+                assert_eq!(persisted.routing_rules[&rule.id], rule);
+                eprintln!(
+                    "P2.12: one valid rule={rule_bytes} bytes; {label} export/import body={body_len} bytes -> 200; memory and SQLite match"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn import_validates_all_rules_before_mutating_memory_or_storage() {
+            let target = Fixture::new(Database {
+                main_password: "existing-main-password".to_owned(),
+                dns: "77.88.8.8,77.88.8.1".to_owned(),
+                ..Default::default()
+            })
+            .await;
+            let before = target.snapshots().await;
+            let mut export: Value = serde_json::from_slice(&target.export().await).unwrap();
+            export["main_password"] = json!("changed-main-password");
+            export["dns"] = json!("1.1.1.1,1.0.0.1");
+            export["dns_provider"] = json!("cloudflare");
+            export["auto_restart_interval_hours"] = json!(3);
+            export["vk_access_token"] = json!("changed-token");
+            export["groups"] = json!({"new_group": {"id": "new_group", "name": "New"}});
+            export["clients"] = json!([{
+                "password": "new-client-password", "name": "New client",
+                "expires_at": 0, "down_bytes": 0, "up_bytes": 0,
+                "group_id": "new_group", "routing_rule_id": "rule_large",
+            }]);
+
+            let too_many_ips = RoutingRule {
+                ips: (0..513)
+                    .map(|i| format!("10.0.{}.{}/32", i / 256, i % 256))
+                    .collect(),
+                ..Default::default()
+            };
+            let too_many_domains = RoutingRule {
+                direct_domains: (0..1025).map(|i| format!("d{i}.example.com")).collect(),
+                ..Default::default()
+            };
+            let undeliverable = RoutingRule {
+                name: "x".repeat(65_536),
+                ..Default::default()
+            };
+            let whitelist_template = RoutingRule {
+                template_ips: true,
+                ip_is_whitelist: true,
+                ..Default::default()
+            };
+
+            for (label, mut invalid) in [
+                ("513 IPs", too_many_ips),
+                ("1025 domains", too_many_domains),
+                ("oversized routing event", undeliverable),
+                ("IP whitelist template", whitelist_template),
+            ] {
+                invalid.id = "z_invalid".to_owned();
+                export["routing_rules"] = json!({"rule_large": large_rule(), "z_invalid": invalid});
+                let body = serde_json::to_vec(&json!({"config": export})).unwrap();
+                let body_len = body.len();
+                assert!(body_len > WEB_BODY_LIMIT_BYTES);
+                assert!(body_len < ROUTING_RULE_BODY_LIMIT_BYTES);
+                let response = target.request("POST", "/api/import", body).await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{label}");
+                let error = to_bytes(response.into_body(), ROUTING_RULE_BODY_LIMIT_BYTES)
+                    .await
+                    .unwrap();
+                assert!(String::from_utf8_lossy(&error).contains("z_invalid"));
+                assert_eq!(target.snapshots().await, before, "{label}");
+                assert_eq!(*target.app.dns.read().await, "77.88.8.8,77.88.8.1");
+                assert_eq!(*target.app.auto_restart_interval_tx.borrow(), 0);
+                eprintln!(
+                    "P2.12: {label}, import body={body_len} bytes -> 400; memory, SQLite and runtime settings unchanged"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn import_limit_is_256_kib_without_expanding_other_endpoints() {
+            assert_eq!(WEB_BODY_LIMIT_BYTES, 16 * 1024);
+            assert_eq!(ROUTING_RULE_BODY_LIMIT_BYTES, 256 * 1024);
+            let target = Fixture::new(Database::default()).await;
+            let mut body = target.export().await;
+            // JSON whitespace tests the byte boundary without an invalid-rule rejection.
+            body.resize(ROUTING_RULE_BODY_LIMIT_BYTES, b' ');
+            let response = target.request("POST", "/api/import", body.clone()).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let before = target.snapshots().await;
+            body.push(b' ');
+            let response = target.request("POST", "/api/import", body).await;
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+            assert_eq!(target.snapshots().await, before);
+
+            for uri in ["/api/settings", "/api/clients", "/api/groups"] {
+                let mut body = b"{}".to_vec();
+                body.resize(WEB_BODY_LIMIT_BYTES + 1, b' ');
+                let response = target.request("POST", uri, body).await;
+                assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE, "{uri}");
+                assert_eq!(target.snapshots().await, before, "{uri}");
+            }
+            eprintln!(
+                "P2.12: import 262144 bytes -> 200, 262145 -> 413; settings/clients/groups 16385 bytes -> 413"
+            );
+        }
+    }
 
     /// База с одним правилом `rule_1`, прямым клиентом, группой и main.
     fn affected_fixture() -> crate::model::Database {

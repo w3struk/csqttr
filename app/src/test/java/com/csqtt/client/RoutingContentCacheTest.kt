@@ -1,12 +1,17 @@
 package com.csqtt.client
 
 import java.io.File
+import java.io.IOException
 import java.nio.file.Files
+import java.nio.file.Path
+import java.nio.file.StandardCopyOption
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.mockito.Mockito
 
 class RoutingContentCacheTest {
     private val dir: File = Files.createTempDirectory("routing-content-cache").toFile()
@@ -99,6 +104,52 @@ class RoutingContentCacheTest {
 
         assertEquals("f".repeat(64), cache.readSha())
         assertEquals(content(sha = "f".repeat(64)), cache.read())
+        assertTrue(dir.listFiles().orEmpty().none { it.name.endsWith(".tmp") })
+    }
+
+    @Test fun `concurrent writers never delete the published cache`() {
+        val first = RoutingContentCache(dir)
+        val second = RoutingContentCache(dir)
+        val barrier = java.util.concurrent.CyclicBarrier(2)
+        val errors = java.util.concurrent.ConcurrentLinkedQueue<Throwable>()
+        val shaA = "a".repeat(64)
+        val shaB = "b".repeat(64)
+        fun writer(cache: RoutingContentCache, sha: String) = Thread {
+            try {
+                barrier.await()
+                repeat(50) { cache.write(content(sha = sha)) }
+            } catch (error: Throwable) {
+                errors += error
+            }
+        }
+        val a = writer(first, shaA)
+        val b = writer(second, shaB)
+        a.start()
+        b.start()
+        a.join()
+        b.join()
+
+        assertTrue(errors.isEmpty())
+        val read = requireNotNull(first.read())
+        assertTrue(read.sha == shaA || read.sha == shaB)
+        assertTrue(dir.listFiles().orEmpty().none { it.name.endsWith(".tmp") })
+    }
+
+    @Test fun `failed replacement preserves the prior published content target`() {
+        val cache = RoutingContentCache(dir)
+        val previous = content()
+        cache.write(previous)
+        val target = File(dir, RoutingContentCache.FILE_NAME).toPath()
+
+        Mockito.mockStatic(Files::class.java, Mockito.CALLS_REAL_METHODS).use { files ->
+            files.`when`<Path> {
+                Files.move(Mockito.any(Path::class.java), Mockito.eq(target), Mockito.eq(StandardCopyOption.REPLACE_EXISTING))
+            }.thenThrow(IOException("forced replacement failure"))
+            assertThrows(IOException::class.java) { cache.write(content(sha = "f".repeat(64))) }
+        }
+
+        assertEquals(previous, cache.read())
+        assertEquals(previous.sha, File(dir, RoutingContentCache.SHA_NAME).readText(Charsets.UTF_8))
         assertTrue(dir.listFiles().orEmpty().none { it.name.endsWith(".tmp") })
     }
 

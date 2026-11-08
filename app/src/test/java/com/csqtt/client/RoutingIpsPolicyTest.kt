@@ -67,6 +67,14 @@ class RoutingIpsPolicyTest {
         assertEquals(RoutingIpsPolicy.Decision.FromCache(sha, text, 1), decision)
     }
 
+    @Test fun `matching cached sha cannot authorize different text`() {
+        val sha = RoutingIpsPolicy.sha256Hex("10.0.0.0/8\n".toByteArray(Charsets.UTF_8))
+        val decision = RoutingIpsPolicy.decide(rule(ipsSha = sha), sha, "192.168.0.0/16\n")
+
+        assertTrue(decision is RoutingIpsPolicy.Decision.Terminal)
+        assertEquals("routing_ips_missing", (decision as RoutingIpsPolicy.Decision.Terminal).code)
+    }
+
     @Test fun `no blob and no cache is terminal routing_ips_missing`() {
         val sha = "b".repeat(64)
         val decision = RoutingIpsPolicy.decide(rule(ipsSha = sha), null, null)

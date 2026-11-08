@@ -429,6 +429,194 @@ async fn connect(
     .unwrap()
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn routing_learned_a_to_b_update_changes_udp_verdict_and_observed_delivery() {
+    use crate::direct_relay::{DirectRelay, LearnedCheckpointStage, build_udp_packet};
+    use arc_swap::ArcSwap;
+
+    let pool = PacketPool::new(64);
+    let routing = Arc::new(ArcSwap::from_pointee(
+        crate::dispatcher::DomainRoutingConfig::default(),
+    ));
+    let direct_ips = Arc::new(ArcSwap::from_pointee(std::collections::HashSet::new()));
+    let dns = Arc::new(crate::sni::DnsDomainMap::default());
+    let (inbound_tx, _inbound_rx) = tokio::sync::mpsc::channel(64);
+    let observer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut direct = DirectRelay::new(
+        routing.clone(),
+        direct_ips.clone(),
+        dns.clone(),
+        pool.clone(),
+        inbound_tx,
+    )
+    .unwrap();
+    direct.udp_test_target = Some(observer.local_addr().unwrap());
+    let ip_a: IpAddr = "93.184.216.34".parse().unwrap();
+    let ip_b: IpAddr = "1.1.1.1".parse().unwrap();
+    direct
+        .learned_test_hooks
+        .set_resolutions(std::collections::HashMap::from([
+            ("a.routing.example".to_owned(), vec![ip_a]),
+            ("b.routing.example".to_owned(), vec![ip_b]),
+        ]));
+    let direct = Arc::new(direct);
+    let dispatcher = Dispatcher::routing_test_dispatcher(
+        routing,
+        direct_ips.clone(),
+        dns.clone(),
+        direct.clone(),
+        pool.clone(),
+    );
+
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server_address = server.local_addr().unwrap();
+    let peer: SocketAddr = "127.0.0.1:39021".parse().unwrap();
+    let (tunnel_tx, mut tunnel_rx) = tokio::sync::mpsc::channel(8);
+    let server_task = tokio::spawn(async move {
+        let client = receive_challenged_allocate(&server, "127.0.0.1:49021".parse().unwrap()).await;
+        receive_create_permission(&server, client, peer).await;
+        let (wire, _) = recv_datagram(&server).await;
+        let request = assert_authenticated_request(&wire, CHANNEL_BIND_REQUEST);
+        let channel = channel_number(&request);
+        server
+            .send_to(
+                &empty_authenticated_success(CHANNEL_BIND_SUCCESS, request.transaction()),
+                client,
+            )
+            .await
+            .unwrap();
+        loop {
+            let (wire, _) = recv_datagram(&server).await;
+            if u16::from_be_bytes([wire[0], wire[1]]) == channel {
+                let len = u16::from_be_bytes([wire[2], wire[3]]) as usize;
+                tunnel_tx.send(wire[4..4 + len].to_vec()).await.unwrap();
+                continue;
+            }
+            let request = StunMessage::decode(&wire).unwrap();
+            if request.method() == REFRESH_REQUEST && attribute_u32(&request, ATTR_LIFETIME) == 0 {
+                server
+                    .send_to(&refresh_zero_success(request.transaction()), client)
+                    .await
+                    .unwrap();
+                break;
+            }
+            answer_periodic_turn_request(&server, client, &wire).await;
+        }
+    });
+    let allocation = connect(server_address, peer, pool.clone()).await;
+    allocation.prepare_channel().await.unwrap();
+    let cipher = Arc::new(SessionCipher::Obfs(Arc::new(
+        ObfsCipher::new([0x42; 32]).unwrap(),
+    )));
+    dispatcher.register(WorkerChannels {
+        id: 0,
+        incarnation_id: 1,
+        allocation: allocation.clone(),
+        cipher: cipher.clone(),
+        config: ObfsConfig::new(ObfsMode::Audio),
+        write_state: Arc::new(ObfsState::new()),
+    });
+
+    for domain in ["a.routing.example", "b.routing.example"] {
+        let (reached, resume, done) = direct
+            .learned_test_hooks
+            .checkpoint(LearnedCheckpointStage::PreresolveBeforeCommit, domain);
+        dispatcher.update_domain_routing(&format!("enabled=1;domains={domain}"));
+        tokio::time::timeout(Duration::from_secs(2), reached.notified())
+            .await
+            .unwrap();
+        resume.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), done.notified())
+            .await
+            .unwrap();
+        if domain == "a.routing.example" {
+            assert!(
+                direct.is_direct_ip(&ip_a),
+                "A must be learned through production preregistration"
+            );
+            assert_eq!(dns.get(&ip_a).as_deref(), Some(domain));
+            let raw = build_udp_packet(
+                "10.66.67.2:5000".parse().unwrap(),
+                SocketAddr::new(ip_a, 5000),
+                b"learned-a",
+            )
+            .unwrap();
+            let mut packet = pool.try_acquire().unwrap();
+            packet.extend_tail(raw.len()).unwrap().copy_from_slice(&raw);
+            dispatcher.dispatch(packet).await;
+            let mut received = [0u8; 64];
+            let (len, _) =
+                tokio::time::timeout(Duration::from_secs(2), observer.recv_from(&mut received))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(&received[..len], b"learned-a");
+            assert!(tunnel_rx.try_recv().is_err());
+        }
+    }
+
+    let src: SocketAddr = "10.66.67.2:5000".parse().unwrap();
+    let dst = SocketAddr::new(ip_a, 5000);
+    let raw = build_udp_packet(src, dst, b"old-a-after-b").unwrap();
+    let mut packet = pool.try_acquire().unwrap();
+    packet.extend_tail(raw.len()).unwrap().copy_from_slice(&raw);
+    let handled = direct.try_handle(&packet).await;
+    let verdict = direct.routing_test_udp_verdict(src, dst);
+    let mut received = [0u8; 64];
+    let verdict_sent =
+        tokio::time::timeout(Duration::from_millis(50), observer.recv_from(&mut received))
+            .await
+            .is_ok();
+    dispatcher.dispatch(packet).await;
+    let dispatched_direct =
+        tokio::time::timeout(Duration::from_millis(50), observer.recv_from(&mut received))
+            .await
+            .is_ok();
+    let tunneled = tokio::time::timeout(Duration::from_millis(250), tunnel_rx.recv())
+        .await
+        .ok()
+        .flatten();
+    eprintln!(
+        "R1 observed: verdict={verdict:?}, handled={handled}, verdict_sent={verdict_sent}, dispatched_direct={dispatched_direct}, tunnel={}",
+        tunneled.is_some()
+    );
+    assert_eq!(
+        verdict,
+        Some(crate::sni::RouteVerdict::Tunnel),
+        "B must revoke the learned UDP Direct verdict for A"
+    );
+    assert!(
+        !handled && !verdict_sent && !dispatched_direct,
+        "A's old learned IP bypassed B via direct UDP"
+    );
+    let mut packet = pool.try_acquire().unwrap();
+    let tunneled = tunneled.expect("production dispatcher must forward old A through TURN after B");
+    packet
+        .extend_tail(tunneled.len())
+        .unwrap()
+        .copy_from_slice(&tunneled);
+    cipher.unwrap(&mut packet, ObfsMode::Audio).unwrap();
+    assert_eq!(packet.as_slice(), raw);
+    assert!(!direct_ips.load().contains(&ip_a));
+    assert_eq!(dns.get(&ip_a), None);
+
+    let raw = build_udp_packet(src, SocketAddr::new(ip_b, 5000), b"current-b").unwrap();
+    let mut packet = pool.try_acquire().unwrap();
+    packet.extend_tail(raw.len()).unwrap().copy_from_slice(&raw);
+    dispatcher.dispatch(packet).await;
+    let (len, _) = tokio::time::timeout(Duration::from_secs(2), observer.recv_from(&mut received))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&received[..len], b"current-b");
+    allocation.deallocate().await;
+    tokio::time::timeout(Duration::from_secs(3), server_task)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tcp_turn_transport_allocates_without_udp_fallback() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2136,6 +2324,321 @@ async fn getconf_timeout_recovers_without_terminating_the_tunnel() {
         .await
         .expect("the recovered relay did not stop")
         .expect("the recovered relay panicked");
+}
+
+#[cfg(unix)]
+struct RoutingOwnerTestSession {
+    cancel: CancellationToken,
+    task: Option<tokio::task::JoinHandle<anyhow::Result<bool>>>,
+}
+
+#[cfg(unix)]
+struct RoutingOwnerTestRig {
+    cancel: CancellationToken,
+    dispatcher: Arc<Dispatcher>,
+    peer: SocketAddr,
+    pool: Arc<PacketPool>,
+    stats: Arc<Stats>,
+    config_tx: tokio::sync::mpsc::Sender<String>,
+    sent: Arc<AtomicBool>,
+    in_flight: Arc<AtomicBool>,
+    requests: tokio::sync::mpsc::UnboundedReceiver<(usize, bool)>,
+    sessions: Vec<RoutingOwnerTestSession>,
+    relays: Vec<tokio::task::JoinHandle<()>>,
+    peer_task: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(unix)]
+impl Drop for RoutingOwnerTestRig {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        for session in &self.sessions {
+            if let Some(task) = &session.task {
+                task.abort();
+            }
+        }
+        for relay in &self.relays {
+            relay.abort();
+        }
+        self.peer_task.abort();
+    }
+}
+
+#[cfg(unix)]
+impl RoutingOwnerTestRig {
+    async fn start() -> Self {
+        Self::start_with_legacy_partial(false).await
+    }
+
+    async fn start_with_legacy_partial(legacy_partial: bool) -> Self {
+        let cancel = CancellationToken::new();
+        let pool = PacketPool::new(192);
+        let stats = Arc::new(Stats::default());
+        let (dispatcher, _) = Dispatcher::start(
+            "127.0.0.1:0",
+            None,
+            pool.clone(),
+            stats.clone(),
+            [0x51; 32],
+            ObfsMode::Audio,
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
+        let peer = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let peer_addr = peer.local_addr().unwrap();
+        let (requests_tx, requests) = tokio::sync::mpsc::unbounded_channel();
+        let peer_pool = pool.clone();
+        let peer_cancel = cancel.clone();
+        let peer_task = tokio::spawn(async move {
+            let keys = crate::dtls::derive_dtls_srtp_deterministic(&[0x51; 32]);
+            let inbound = ObfsCipher::new(keys.client_cipher_key).unwrap();
+            let outbound = ObfsCipher::new(keys.server_cipher_key).unwrap();
+            let obfs = ObfsConfig::new(ObfsMode::Audio);
+            let state = ObfsState::new();
+            let mut buffer = [0u8; 65_535];
+            let mut legacy_partial_sent = false;
+            loop {
+                let received = tokio::select! {
+                    _ = peer_cancel.cancelled() => break,
+                    received = peer.recv_from(&mut buffer) => received.unwrap(),
+                };
+                let (length, source) = received;
+                let mut packet = peer_pool.acquire();
+                packet
+                    .extend_tail(length)
+                    .unwrap()
+                    .copy_from_slice(&buffer[..length]);
+                if inbound.unwrap(&mut packet, ObfsMode::Audio).is_err() {
+                    continue;
+                }
+                let text = String::from_utf8_lossy(packet.as_slice()).into_owned();
+                drop(packet);
+                let mut replies: Vec<&[u8]> = Vec::new();
+                if let Some(rest) = text.strip_prefix("GETCONF:") {
+                    let parts: Vec<_> = rest.split('|').collect();
+                    let id = parts[4].parse::<usize>().unwrap();
+                    let owner = parts.get(6) == Some(&"owner");
+                    requests_tx.send((id, owner)).unwrap();
+                    if legacy_partial && id == 2 && !legacy_partial_sent {
+                        replies.push(b"ROUTING:START:1");
+                        legacy_partial_sent = true;
+                    }
+                    replies.push(
+                        b"TUNCONF:10.66.67.2:10.66.67.1:255.255.255.0:8.8.8.8,8.8.4.4:stream-v2",
+                    );
+                    if owner {
+                        replies.push(crate::protocol::ROUTING_ABSENT);
+                    }
+                } else if text.starts_with("DISCONNECT:") {
+                    replies.push(b"OK:disconnected");
+                }
+                for reply in replies {
+                    let mut packet = peer_pool.acquire();
+                    packet
+                        .extend_tail(reply.len())
+                        .unwrap()
+                        .copy_from_slice(reply);
+                    outbound.wrap(&mut packet, &obfs, &state).unwrap();
+                    peer.send_to(packet.as_slice(), source).await.unwrap();
+                }
+            }
+        });
+        let (config_tx, _config_rx) = tokio::sync::mpsc::channel(8);
+        Self {
+            cancel,
+            dispatcher,
+            peer: peer_addr,
+            pool,
+            stats,
+            config_tx,
+            sent: Arc::new(AtomicBool::new(false)),
+            in_flight: Arc::new(AtomicBool::new(true)),
+            requests,
+            sessions: Vec::new(),
+            relays: Vec::new(),
+            peer_task,
+        }
+    }
+
+    async fn add_session(&mut self, id: usize, initial_config: bool) -> usize {
+        let relay = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let endpoint = format!(
+            "turn:127.0.0.1:{}?transport=udp",
+            relay.local_addr().unwrap().port()
+        );
+        self.relays
+            .push(tokio::spawn(relay_bound_turn_channel_to_peer(
+                relay,
+                self.peer,
+                self.cancel.clone(),
+            )));
+        let cancel = self.cancel.child_token();
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let task = tokio::spawn(run_session(
+            SessionConfig {
+                id,
+                peer: self.peer,
+                turn_host: None,
+                turn_port: None,
+                turn_transport: TurnTransportMode::Udp,
+                srtp_mode: SrtpMode::Wrap,
+                local_port: Arc::from("9000"),
+                password: Arc::from("routing-owner-test"),
+                generation: 19,
+                turn_endpoint_cursor: 0,
+                salt: Arc::from("owner-generation"),
+                mode: ObfsMode::Audio,
+                wrap_key: [0x51; 32],
+                client_wrap_key: [0x51; 32],
+                get_config: initial_config,
+                server_stream_repair: Arc::new(AtomicBool::new(false)),
+                repair: RepairState::new(3),
+                configured_workers: 3,
+                routing_ips_sha: None,
+                routing_content_sha_file: None,
+            },
+            TurnCredentials {
+                username: Arc::from(USERNAME),
+                password: Arc::from(PASSWORD),
+                server_addresses: vec![Arc::from(endpoint)].into(),
+            },
+            SessionRuntime {
+                dispatcher: self.dispatcher.clone(),
+                pool: self.pool.clone(),
+                stats: self.stats.clone(),
+                events: Events::new(false),
+                config_tx: self.config_tx.clone(),
+                config_delivery: initial_config.then(|| ConfigDeliveryState {
+                    sent: self.sent.clone(),
+                    in_flight: self.in_flight.clone(),
+                }),
+                cancel: cancel.clone(),
+                shutdown: Arc::new(ShutdownCoordinator::new()),
+                ready_tx: Some(ready_tx),
+                allocation_started: None,
+                allocation_ready: None,
+                scale_notify: None,
+                target_workers: None,
+                configured_workers: 3,
+            },
+        ));
+        let index = self.sessions.len();
+        self.sessions.push(RoutingOwnerTestSession {
+            cancel,
+            task: Some(task),
+        });
+        tokio::time::timeout(Duration::from_secs(3), ready_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        index
+    }
+
+    async fn remove_session(&mut self, index: usize, abort: bool) {
+        let session = &mut self.sessions[index];
+        let task = session.task.take().unwrap();
+        if abort {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        } else {
+            session.cancel.cancel();
+            tokio::time::timeout(Duration::from_secs(3), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    fn drain_requests(&mut self) {
+        while self.requests.try_recv().is_ok() {}
+    }
+
+    async fn next_owner(&mut self, excluded: usize) -> usize {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let (id, owner) = self.requests.recv().await.unwrap();
+                if owner && id != excluded {
+                    break id;
+                }
+            }
+        })
+        .await
+        .expect("a surviving session never requested routing as the new owner")
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn routing_owner_survives_permanent_removal_and_reconnect() {
+    let mut rig = RoutingOwnerTestRig::start().await;
+    let owner = rig.add_session(1, true).await;
+    rig.add_session(2, false).await;
+    rig.add_session(3, false).await;
+    rig.drain_requests();
+    rig.remove_session(owner, false).await;
+    let successor = rig.next_owner(1).await;
+    assert!([2, 3].contains(&successor));
+    assert!(
+        rig.sent.load(Ordering::Acquire),
+        "routing ownership must not reset initial CONFIG delivery"
+    );
+    rig.add_session(1, false).await;
+    rig.drain_requests();
+    let successor_index = successor - 1;
+    rig.remove_session(successor_index, false).await;
+    assert_ne!(rig.next_owner(successor).await, successor);
+    rig.cancel.cancel();
+    rig.dispatcher.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn routing_owner_abort_releases_to_surviving_sessions() {
+    let mut rig = RoutingOwnerTestRig::start().await;
+    let owner = rig.add_session(1, true).await;
+    rig.add_session(2, false).await;
+    rig.drain_requests();
+    rig.remove_session(owner, true).await;
+    assert_eq!(rig.next_owner(1).await, 2);
+    rig.cancel.cancel();
+    rig.dispatcher.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn routing_legacy_partial_before_tunconf_retries_a_completely_lost_response() {
+    let mut rig = RoutingOwnerTestRig::start_with_legacy_partial(true).await;
+    rig.add_session(1, true).await;
+    rig.add_session(2, false).await;
+    // Отделяем две копии первичного GETCONF от последующих watchdog-ретраев.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let mut initial = 0;
+        while initial < 2 {
+            let (id, owner) = rig.requests.recv().await.unwrap();
+            if id == 2 {
+                assert!(!owner);
+                initial += 1;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(9), async {
+        let mut retries = 0;
+        while retries < 4 {
+            let (id, owner) = rig.requests.recv().await.unwrap();
+            if id == 2 {
+                assert!(!owner, "legacy retry must not steal routing ownership");
+                retries += 1;
+            }
+        }
+    })
+    .await
+    .expect("legacy nonowner forgot its delivery wait after the first lost retry");
+    rig.cancel.cancel();
+    rig.dispatcher.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

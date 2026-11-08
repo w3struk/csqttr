@@ -213,6 +213,8 @@ impl WorkerStartPacer {
 }
 
 struct ConfigFlightGuard {
+    // Только первичная доставка CONFIG. Долгоживущая роль маршрутизации
+    // принадлежит session::ConfigOwnerLease и передаётся живым reader'ам.
     in_flight: Arc<AtomicBool>,
     acquired: bool,
 }

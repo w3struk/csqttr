@@ -25,6 +25,9 @@ internal object RoutingIpsPolicy {
         data object Disabled : Decision
     }
 
+    fun decide(rule: ServerRoutingRule, cached: CachedRoutingIps?): Decision =
+        decide(rule, cached?.sha, cached?.text)
+
     fun decide(rule: ServerRoutingRule, cachedSha: String?, cachedText: String?): Decision {
         val expected = rule.ipsSha ?: return Decision.Disabled
         val blob = rule.ipsBlob
@@ -44,7 +47,9 @@ internal object RoutingIpsPolicy {
             }
             return Decision.Update(expected, text, countEntries(text))
         }
-        if (cachedSha == expected && cachedText != null) {
+        if (cachedSha == expected && cachedText != null &&
+            sha256Hex(cachedText.toByteArray(Charsets.UTF_8)) == expected
+        ) {
             return Decision.FromCache(expected, cachedText, countEntries(cachedText))
         }
         return Decision.Terminal(

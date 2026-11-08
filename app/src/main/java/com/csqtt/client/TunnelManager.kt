@@ -7,6 +7,7 @@ import android.os.SystemClock
 import android.util.Base64
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -134,6 +135,9 @@ object TunnelManager {
         val startupProgress: TunnelStartupProgress = TunnelStartupProgress(),
     ) {
         val inputLock = Any()
+        /** Сериализует применение правила процесса; не мешает остановке VPN
+         *  и проверкам identity, которые держат только `pendingRoutingReload`. */
+        val routingApplyLock = Any()
         val readyWorkers = mutableSetOf<Int>()
         val dtlsWorkers = mutableSetOf<Int>()
         val unavailableManualHashes = mutableSetOf<String>()
@@ -201,6 +205,8 @@ object TunnelManager {
      */
     @Volatile
     private var routingTerminal: Boolean = false
+
+    private val pendingRoutingReload = RoutingDeferredReload()
 
     @Volatile
     var isLoggingEnabled = true
@@ -312,34 +318,113 @@ object TunnelManager {
     }
 
     fun onVpnInterfaceReady(dns: String? = null) {
-        vpnReady.value = true
-        lastTunnelDiagnostic.value = ""
-        activeScope.launch { activeSettingsStore?.clearTunnelDiagnostic() }
-        if (!dns.isNullOrBlank() && dns != lastAppliedDns) {
-            lastAppliedDns = dns
-            updateLog(
-                key = "vpn_dns_active_${dnsProfileName(dns)}",
-                message = "[SERVER] DNS применён: ${dnsProfileName(dns)} ✓",
-                priority = 32,
-                level = LogLevel.OK,
-            )
+        synchronized(pendingRoutingReload) {
+            pendingRoutingReload.currentStart()?.let { onVpnInterfaceReady(it, dns) }
+        }
+    }
+
+    internal fun onVpnInterfaceReady(start: RoutingDeferredReload.VpnStart, dns: String? = null, routesRebuilt: Boolean = true) {
+        synchronized(pendingRoutingReload) {
+            if (!isVpnStartCurrent(start)) return
+            val ready = pendingRoutingReload.markReady(start, routesRebuilt) ?: return
+            vpnReady.value = true
+            ready.reloadReason?.let { flushDeferredRoutingReload(start.connection, it) }
+            lastTunnelDiagnostic.value = ""
+            activeScope.launch { activeSettingsStore?.clearTunnelDiagnostic() }
+            if (!dns.isNullOrBlank() && dns != lastAppliedDns) {
+                lastAppliedDns = dns
+                updateLog(
+                    key = "vpn_dns_active_${dnsProfileName(dns)}",
+                    message = "[SERVER] DNS применён: ${dnsProfileName(dns)} ✓",
+                    priority = 32,
+                    level = LogLevel.OK,
+                )
+            }
         }
     }
 
     fun onRoutingUpdated() {
-        vpnReady.value = true
-        lastTunnelDiagnostic.value = ""
-        activeScope.launch { activeSettingsStore?.clearTunnelDiagnostic() }
-        updateLog(
-            key = "vpn_routing_updated",
-            message = "[СЕТЬ] Маршрутизация приложений обновлена ✓",
-            priority = 25,
-            level = LogLevel.NET,
-        )
+        synchronized(pendingRoutingReload) {
+            pendingRoutingReload.currentStart()?.let { onRoutingUpdated(it) }
+        }
+    }
+
+    internal fun onRoutingUpdated(start: RoutingDeferredReload.VpnStart, routesRebuilt: Boolean = true) {
+        synchronized(pendingRoutingReload) {
+            if (!isVpnStartCurrent(start)) return
+            val ready = pendingRoutingReload.markReady(start, routesRebuilt) ?: return
+            vpnReady.value = true
+            ready.reloadReason?.let { flushDeferredRoutingReload(start.connection, it) }
+            lastTunnelDiagnostic.value = ""
+            activeScope.launch { activeSettingsStore?.clearTunnelDiagnostic() }
+            updateLog(
+                key = "vpn_routing_updated",
+                message = "[СЕТЬ] Маршрутизация приложений обновлена ✓",
+                priority = 25,
+                level = LogLevel.NET,
+            )
+        }
     }
 
     fun onVpnInterfaceStopped() {
-        vpnReady.value = false
+        synchronized(pendingRoutingReload) {
+            pendingRoutingReload.currentStart()?.let { onVpnInterfaceStopped(it) }
+        }
+    }
+
+    internal fun onVpnInterfaceStopped(start: RoutingDeferredReload.VpnStart) {
+        synchronized(pendingRoutingReload) {
+            if (!isVpnStartCurrent(start) || !pendingRoutingReload.markStopped(start)) return
+            vpnReady.value = false
+        }
+    }
+
+    internal fun routingConnectionFor(generation: Long? = null): RoutingDeferredReload.Connection? =
+        synchronized(pendingRoutingReload) {
+            val identity = processIdentity ?: return@synchronized null
+            if (!isCurrent(identity)) return@synchronized null
+            pendingRoutingReload.currentConnection(generation)?.takeIf { it.generation == identity.generation }
+        }
+
+    internal fun isRoutingConnectionCurrent(connection: RoutingDeferredReload.Connection): Boolean =
+        synchronized(pendingRoutingReload) {
+            pendingRoutingReload.isCurrent(connection) && routingConnectionFor() === connection
+        }
+
+    internal fun isVpnStartCurrent(start: RoutingDeferredReload.VpnStart): Boolean =
+        synchronized(pendingRoutingReload) {
+            pendingRoutingReload.isCurrent(start) && isRoutingConnectionCurrent(start.connection)
+        }
+
+    /**
+     * Короткая публикация состояния FD атомарно с epoch. Сервис уже держит
+     * interfaceLock: порядок только interfaceLock -> identity, не наоборот.
+     * commit не делает I/O, не вызывает Builder/PM и не захватывает новые замки.
+     */
+    internal fun commitVpnStartIfCurrent(start: RoutingDeferredReload.VpnStart, commit: () -> Unit): Boolean =
+        synchronized(pendingRoutingReload) {
+            if (!isVpnStartCurrent(start) || routingTerminal) return@synchronized false
+            commit()
+            true
+        }
+
+    internal data class VpnRoutingSnapshot(val start: RoutingDeferredReload.VpnStart, val rule: ServerRoutingRule?)
+
+    internal fun routingRuleSnapshot(
+        connection: RoutingDeferredReload.Connection,
+        expectedStart: RoutingDeferredReload.VpnStart? = null,
+    ): VpnRoutingSnapshot? =
+        synchronized(pendingRoutingReload) {
+            if (!isRoutingConnectionCurrent(connection) || routingTerminal) return@synchronized null
+            if (expectedStart != null && !isVpnStartCurrent(expectedStart)) return@synchronized null
+            val start = pendingRoutingReload.markStarting(connection) ?: return@synchronized null
+            vpnReady.value = false
+            VpnRoutingSnapshot(start, activeServerRoutingRule.value)
+        }
+
+    private fun flushDeferredRoutingReload(connection: RoutingDeferredReload.Connection, reason: String) {
+        val (clientIp, dns) = RoutingConfigPolicy.tunnelEndpoints(config.value)
+        reloadRouting(connection, clientIp, dns, reason)
     }
 
     private fun recordTunnelDiagnostic(code: String, message: String) {
@@ -355,10 +440,25 @@ object TunnelManager {
     }
 
     internal fun onVpnRecoverableFailure(message: String, kind: VpnFailureKind) {
+        synchronized(pendingRoutingReload) {
+            val start = pendingRoutingReload.currentStart() ?: return
+            onVpnRecoverableFailure(start, message, kind)
+        }
+    }
+
+    internal fun onVpnRecoverableFailure(start: RoutingDeferredReload.VpnStart, message: String, kind: VpnFailureKind) {
+        synchronized(pendingRoutingReload) {
+            if (!isVpnStartCurrent(start)) return
+            onVpnRecoverableFailureCurrent(start, message, kind)
+        }
+    }
+
+    private fun onVpnRecoverableFailureCurrent(start: RoutingDeferredReload.VpnStart, message: String, kind: VpnFailureKind) {
         if (!VpnRecoveryPolicy.keepsTunnelRequested(kind)) {
-            onVpnTerminalFailure(message, kind)
+            onVpnTerminalFailure(start, message, kind)
             return
         }
+        pendingRoutingReload.markStopped(start)
         vpnReady.value = false
         val diagnostic = VpnRecoveryPolicy.message(kind, message)
         recordTunnelDiagnostic(kind.code, diagnostic)
@@ -376,13 +476,30 @@ object TunnelManager {
         message: String,
         kind: VpnFailureKind = VpnFailureKind.TunEstablishFailed,
     ) {
+        synchronized(pendingRoutingReload) {
+            val connection = routingConnectionFor() ?: return
+            onVpnTerminalFailureCurrent(connection, message, kind)
+        }
+    }
+
+    internal fun onVpnTerminalFailure(start: RoutingDeferredReload.VpnStart, message: String, kind: VpnFailureKind) {
+        synchronized(pendingRoutingReload) {
+            if (!isVpnStartCurrent(start)) return
+            onVpnTerminalFailureCurrent(start.connection, message, kind)
+        }
+    }
+
+    private fun onVpnTerminalFailureCurrent(connection: RoutingDeferredReload.Connection, message: String, kind: VpnFailureKind) {
+        if (!isRoutingConnectionCurrent(connection)) return
+        val identity = processIdentity ?: return
+        pendingRoutingReload.clear()
         vpnReady.value = false
         val diagnostic = VpnRecoveryPolicy.message(kind, message)
         recordTunnelDiagnostic(kind.code, diagnostic)
         updateLog("${kind.code}_terminal", "✗ VPN TUN: $diagnostic", 99, true)
         scope.launch {
             startStopMutex.withLock {
-                stopLocked(processIdentity)
+                if (isCurrent(identity)) stopLocked(identity)
             }
         }
     }
@@ -413,40 +530,56 @@ object TunnelManager {
         if (!isCurrent(identity)) return true
         when (event) {
             is TunnelEventParser.Event.Process -> {
-                nativeProcessPid = event.pid
+                val pid = event.pid
+                synchronized(pendingRoutingReload) {
+                    if (!isCurrent(identity)) return true
+                    nativeProcessPid = pid
+                }
             }
             is TunnelEventParser.Event.Stats -> {
-                activeWorkers.value = event.active
-                if (workerRecoveryPolicy.observe(event.active)) {
-                    workerRecoveryJob?.cancel()
-                    workerRecoveryJob = null
-                }
-                if (event.active > 0) {
-                    wrapAuthTimeoutCount = 0
-                    val currentConfig = config.value
-                    if (!vpnReady.value && currentConfig != null && currentConfig.startsWith("TUNCONF:") &&
-                        SystemClock.elapsedRealtime() - lastVpnStartAttemptMs >= VPN_START_RETRY_MS
-                    ) {
-                        ensureVpnStarted(currentConfig, identity, reason = "stats_no_vpn")
-                    }
-                }
+                val active = event.active
+                val droppedProtocol = event.droppedProtocol
                 val totalMB = (event.bytesUp + event.bytesDown) / (1024.0 * 1024.0)
-                val msg = "Активных: ${event.active} | Трафик: %.2f МБ".format(totalMB)
-                stats.value = msg
+                val msg = "Активных: $active | Трафик: %.2f МБ".format(totalMB)
+                val (retryConfig, recoveryJob, reportDropped) = synchronized(pendingRoutingReload) {
+                    if (!isCurrent(identity)) return true
+                    activeWorkers.value = active
+                    stats.value = msg
+                    val recoveryJob = if (workerRecoveryPolicy.observe(active)) {
+                        workerRecoveryJob.also { workerRecoveryJob = null }
+                    } else {
+                        null
+                    }
+                    if (active > 0) wrapAuthTimeoutCount = 0
+                    val retryConfig = config.value?.takeIf {
+                        active > 0 && !vpnReady.value && it.startsWith("TUNCONF:")
+                    }
+                    val reportDropped = droppedProtocol > lastReportedDroppedProtocol
+                    if (reportDropped) lastReportedDroppedProtocol = droppedProtocol
+                    Triple(retryConfig, recoveryJob, reportDropped)
+                }
+                // Внешние вызовы не держат монитор identity. После валидации
+                // кеша ensureVpnStarted проверит его снова перед запуском VPN.
+                recoveryJob?.cancel()
+                if (retryConfig != null && SystemClock.elapsedRealtime() - lastVpnStartAttemptMs >= VPN_START_RETRY_MS) {
+                    ensureVpnStarted(retryConfig, identity, reason = "stats_no_vpn")
+                }
                 updateProcessLog(identity, "stats", "[СЕТЬ] $msg", 25, false, LogLevel.NET)
-                if (event.droppedProtocol > lastReportedDroppedProtocol) {
-                    lastReportedDroppedProtocol = event.droppedProtocol
+                if (reportDropped) {
                     updateProcessLog(
                         identity,
                         "protocol_lines_dropped",
-                        "[СЕТЬ] Потеряно строк протокола: ${event.droppedProtocol} — события сервера могли пропасть",
+                        "[СЕТЬ] Потеряно строк протокола: $droppedProtocol — события сервера могли пропасть",
                         98,
                         true
                     )
                 }
             }
             is TunnelEventParser.Event.ActiveZero -> {
-                activeWorkers.value = 0
+                synchronized(pendingRoutingReload) {
+                    if (!isCurrent(identity)) return true
+                    activeWorkers.value = 0
+                }
                 scheduleWorkerZeroRecovery(identity)
             }
             is TunnelEventParser.Event.CallUnavailable -> handleUnavailableVkCall(event, identity)
@@ -481,7 +614,10 @@ object TunnelManager {
             is TunnelEventParser.Event.Config -> {
                 val configStr = event.config.trim()
                 if (configStr.isNotEmpty()) {
-                    config.value = configStr
+                    synchronized(pendingRoutingReload) {
+                        if (!isCurrent(identity)) return true
+                        config.value = configStr
+                    }
                     activeScope.launch(Dispatchers.Main) {
                         if (!isCurrent(identity)) return@launch
                         if (configStr.startsWith("TUNCONF:")) {
@@ -540,30 +676,32 @@ object TunnelManager {
                 }
             }
             is TunnelEventParser.Event.TunLost -> {
-                if (isCurrent(identity)) {
-                    val now = SystemClock.elapsedRealtime()
+                val now = SystemClock.elapsedRealtime()
+                val (escalate, conf) = synchronized(pendingRoutingReload) {
+                    if (!isCurrent(identity)) return true
                     val escalate = now - lastTunLossMs < TUN_LOSS_REBUILD_WINDOW_MS
                     lastTunLossMs = now
-                    updateProcessLog(
+                    escalate to config.value
+                }
+                updateProcessLog(
+                    identity,
+                    if (escalate) "tun_lost_rebuild" else "tun_lost_reuse",
+                    if (escalate) {
+                        "[TUN] Запрос переподключения FD (пересборка интерфейса)"
+                    } else {
+                        "[TUN] Повторная выдача действующего TUN FD без пересборки"
+                    },
+                    20,
+                    false,
+                    LogLevel.OK,
+                )
+                conf?.let {
+                    ensureVpnStarted(
+                        it,
                         identity,
-                        if (escalate) "tun_lost_rebuild" else "tun_lost_reuse",
-                        if (escalate) {
-                            "[TUN] Запрос переподключения FD (пересборка интерфейса)"
-                        } else {
-                            "[TUN] Повторная выдача действующего TUN FD без пересборки"
-                        },
-                        20,
-                        false,
-                        LogLevel.OK,
+                        forceRebuild = escalate,
+                        reason = if (escalate) "tun_lost_rebuild" else "tun_lost_reuse",
                     )
-                    config.value?.let { conf ->
-                        ensureVpnStarted(
-                            conf,
-                            identity,
-                            forceRebuild = escalate,
-                            reason = if (escalate) "tun_lost_rebuild" else "tun_lost_reuse",
-                        )
-                    }
                 }
             }
             else -> return false
@@ -572,8 +710,11 @@ object TunnelManager {
     }
 
     private fun handleServerAssignedWorkers(assignedWorkers: Int, identity: ProcessIdentity) {
-        if (!isCurrent(identity)) return
-        serverAssignedWorkers.value = if (assignedWorkers in TunnelEventParser.MIN_SERVER_WORKERS..CsqttConstants.Tunnel.MAX_WORKERS) assignedWorkers else null
+        val workers = assignedWorkers.takeIf { it in TunnelEventParser.MIN_SERVER_WORKERS..CsqttConstants.Tunnel.MAX_WORKERS }
+        synchronized(pendingRoutingReload) {
+            if (!isCurrent(identity)) return
+            serverAssignedWorkers.value = workers
+        }
     }
 
     private fun verifyVkReachability(identity: ProcessIdentity) {
@@ -672,6 +813,8 @@ object TunnelManager {
         reason: String,
     ) {
         if (!configStr.startsWith("TUNCONF:")) return
+        // Кадр от прежнего процесса не имеет права трогать состояние нового.
+        if (!isCurrent(identity)) return
         // Terminals решение важнее любого повторного кадра: Stats/TunLost зовут
         // этот метод напрямую и не должны поднять VPN со старым правилом.
         if (routingTerminal) return
@@ -701,7 +844,10 @@ object TunnelManager {
         // В TUNCONF правила обычно нет (оно приходит отдельным событием ROUTING),
         // поэтому null здесь означает «в конфиге правила нет», а не «правило снято».
         // Иначе уже полученное правило затиралось бы при каждом подключении.
-        val ruleToApply = RoutingConfigPolicy.ruleToApply(newServerRule, activeServerRoutingRule.value)
+        val ruleToApply = synchronized(pendingRoutingReload) {
+            if (!isCurrent(identity) || routingTerminal) return
+            RoutingConfigPolicy.ruleToApply(newServerRule, activeServerRoutingRule.value)
+        }
         if (ruleToApply != null) {
             applyServerRoutingRule(ruleToApply, clientIp, dns, identity)
         }
@@ -709,20 +855,24 @@ object TunnelManager {
         // handleCriticalError асинхронна, а этот кадр мог прийти раньше неё.
         if (routingTerminal) return
 
-        activeContext()?.let { ctx ->
-            lastVpnStartAttemptMs = SystemClock.elapsedRealtime()
-            val vpnIntent = Intent(ctx, TunVpnService::class.java).apply {
-                action = "START"
-                putExtra("client_ip", clientIp)
-                putExtra("dns", dns)
-                putExtra("force_rebuild", forceRebuild)
-                putExtra("reason", reason)
-                putExtra("mtu", CsqttConstants.Vpn.DEFAULT_MTU)
-            }
-            try {
-                startTunVpnService(ctx, vpnIntent)
-            } catch (e: Exception) {
-                updateProcessLog(identity, "vpn_start_error", "Ошибка запуска VPN: ${e.readableMessage()}", 99, true)
+        synchronized(pendingRoutingReload) {
+            if (!isCurrent(identity) || routingTerminal) return
+            activeContext()?.let { ctx ->
+                lastVpnStartAttemptMs = SystemClock.elapsedRealtime()
+                val vpnIntent = Intent(ctx, TunVpnService::class.java).apply {
+                    action = "START"
+                    putExtra("client_ip", clientIp)
+                    putExtra("dns", dns)
+                    putExtra("force_rebuild", forceRebuild)
+                    putExtra("reason", reason)
+                    putExtra("mtu", CsqttConstants.Vpn.DEFAULT_MTU)
+                    putExtra(ROUTING_CONNECTION_GENERATION, identity.generation)
+                }
+                try {
+                    startTunVpnService(ctx, vpnIntent)
+                } catch (e: Exception) {
+                    updateProcessLog(identity, "vpn_start_error", "Ошибка запуска VPN: ${e.readableMessage()}", 99, true)
+                }
             }
         }
     }
@@ -732,25 +882,35 @@ object TunnelManager {
     }
 
     private fun scheduleWorkerZeroRecovery(identity: ProcessIdentity) {
-        val target = workerRecoveryPolicy.armAtZero() ?: return
-        if (workerRecoveryJob?.isActive == true) return
-        workerRecoveryJob = activeScope.launch {
-            try {
-                delay(WORKER_ZERO_CONFIRMATION_MS)
-                if (!isCurrent(identity) || !running.value) return@launch
-                if (!workerRecoveryPolicy.shouldRecover(activeWorkers.value, target)) return@launch
-                val context = activeContext() ?: return@launch
-                requestTransportRestart(
-                    context.applicationContext,
-                    "workers_zero_refresh",
-                    "[NET] Потоки: 0 · обновление TURN",
-                )
-            } finally {
-                if (workerRecoveryJob === coroutineContext[Job]) {
-                    workerRecoveryJob = null
+        val recoveryJob = synchronized(pendingRoutingReload) {
+            if (!isCurrent(identity)) return
+            val target = workerRecoveryPolicy.armAtZero() ?: return
+            if (workerRecoveryJob?.isCompleted == false) return
+            // Публикуем Job до запуска, но не исполняем callback под монитором.
+            activeScope.launch(start = CoroutineStart.LAZY) {
+                try {
+                    delay(WORKER_ZERO_CONFIRMATION_MS)
+                    val context = synchronized(pendingRoutingReload) {
+                        if (!isCurrent(identity) || !running.value) return@launch
+                        if (!workerRecoveryPolicy.shouldRecover(activeWorkers.value, target)) return@launch
+                        activeContext()
+                    } ?: return@launch
+                    requestTransportRestart(
+                        context.applicationContext,
+                        "workers_zero_refresh",
+                        "[NET] Потоки: 0 · обновление TURN",
+                        identity,
+                    )
+                } finally {
+                    synchronized(pendingRoutingReload) {
+                        if (workerRecoveryJob === coroutineContext[Job]) {
+                            workerRecoveryJob = null
+                        }
+                    }
                 }
-            }
+            }.also { workerRecoveryJob = it }
         }
+        recoveryJob.start()
     }
 
     private fun schedulePanelServerRestart(identity: ProcessIdentity) {
@@ -779,21 +939,23 @@ object TunnelManager {
         context: Context,
         logKey: String,
         message: String,
+        identity: ProcessIdentity? = null,
     ) {
+        if (identity != null && !isCurrent(identity)) return
         if (logKey == "workers_zero_refresh") {
+            val intent = Intent(context, TunnelService::class.java).apply {
+                action = CsqttConstants.General.ACTION_RESTART_WHEN_VK_REACHABLE
+            }
+            if (identity != null && !isCurrent(identity)) return
             runCatching {
-                context.startService(
-                    Intent(context, TunnelService::class.java).apply {
-                        action = CsqttConstants.General.ACTION_RESTART_WHEN_VK_REACHABLE
-                    },
-                )
+                context.startService(intent)
             }.onFailure {
-                updateLog(
-                    "vk_recovery_service_error",
-                    "Не удалось запустить проверку VK: ${it.readableMessage()}",
-                    99,
-                    true,
-                )
+                val error = "Не удалось запустить проверку VK: ${it.readableMessage()}"
+                if (identity != null) {
+                    updateProcessLog(identity, "vk_recovery_service_error", error, 99, true)
+                } else {
+                    updateLog("vk_recovery_service_error", error, 99, true)
+                }
             }
             return
         }
@@ -824,10 +986,14 @@ object TunnelManager {
                     ) {
                         return@withLock
                     }
-                    val epoch = lifecycleState.requestRestart() ?: return@withLock
+                    val epoch = synchronized(pendingRoutingReload) {
+                        lifecycleState.requestRestart()?.also {
+                            pendingRoutingReload.clear()
+                            vpnReady.value = false
+                        }
+                    } ?: return@withLock
                     restartJob?.cancel()
                     restartJob = null
-                    vpnReady.value = false
                     updateLog(logKey, message, 2, false)
                     terminateProcessLocked(processIdentity)
                     currentParams = newParams
@@ -1066,10 +1232,34 @@ object TunnelManager {
     }
 
     private fun isCurrent(identity: ProcessIdentity): Boolean =
-        processIdentity === identity &&
-            process === identity.process &&
-            processGeneration == identity.generation &&
-            lifecycleState.accepts(identity.ticket)
+        synchronized(pendingRoutingReload) {
+            processIdentity === identity &&
+                process === identity.process &&
+                processGeneration == identity.generation &&
+                lifecycleState.accepts(identity.ticket)
+        }
+
+    private fun attachProcessIdentity(startedProcess: Process, ticket: TunnelLifecycleTicket): ProcessIdentity =
+        synchronized(pendingRoutingReload) {
+            processGeneration = if (processGeneration == Long.MAX_VALUE) 1L else processGeneration + 1L
+            val identity = ProcessIdentity(startedProcess, processGeneration, ticket, 3_500L)
+            process = startedProcess
+            processIdentity = identity
+            pendingRoutingReload.begin(identity.generation)
+            routingTerminal = false
+            vpnReady.value = false
+            identity
+        }
+
+    private fun detachProcessIdentity() {
+        synchronized(pendingRoutingReload) {
+            process = null
+            processIdentity = null
+            nativeProcessPid = null
+            pendingRoutingReload.clear()
+            vpnReady.value = false
+        }
+    }
 
     private fun appendLogEntry(entry: LogEntry) {
         val stamped = entry.copy(id = nextLogEntryId.getAndIncrement())
@@ -1112,7 +1302,12 @@ object TunnelManager {
                 }
                 val appContext = context.applicationContext
                 val epoch = if (isSwitching) {
-                    lifecycleState.requestRestart() ?: return@withLock
+                    synchronized(pendingRoutingReload) {
+                        lifecycleState.requestRestart()?.also {
+                            pendingRoutingReload.clear()
+                            vpnReady.value = false
+                        }
+                    } ?: return@withLock
                 } else {
                     config.value = null
                     stats.value = "Ожидание данных..."
@@ -1126,7 +1321,11 @@ object TunnelManager {
                     lastTunnelDiagnostic.value = ""
                     activeScope.launch { activeSettingsStore?.clearTunnelDiagnostic() }
                     currentCaptchaSolveMethod = params.captchaSolveMethod
-                    lifecycleState.requestStart()
+                    synchronized(pendingRoutingReload) {
+                        pendingRoutingReload.clear()
+                        vpnReady.value = false
+                        lifecycleState.requestStart()
+                    }
                 }
                 restartJob?.cancel()
                 restartJob = null
@@ -1143,7 +1342,11 @@ object TunnelManager {
 
     private fun failStartLocked(key: String, message: String) {
         updateLog(key, message, 99, true)
-        lifecycleState.requestStop()
+        synchronized(pendingRoutingReload) {
+            lifecycleState.requestStop()
+            pendingRoutingReload.clear()
+            vpnReady.value = false
+        }
         stopUptimeTimer()
         running.value = false
         stopping.value = false
@@ -1161,9 +1364,7 @@ object TunnelManager {
             if (existingProcess.isAlive) {
                 terminateExactProcess(existingProcess, 1_000L, false)
             }
-            process = null
-            processIdentity = null
-            nativeProcessPid = null
+            detachProcessIdentity()
         }
         val hashList = params.vkHashes
             .split(Regex("[,\\s\\n]+"))
@@ -1198,7 +1399,6 @@ object TunnelManager {
             hashList,
             params.allowHashRedistribution || jsHashMode,
         )
-        routingTerminal = false
         val cmd = mutableListOf(
             binaryPath,
             "-peer", params.peer,
@@ -1292,17 +1492,9 @@ object TunnelManager {
                 return
             }
         }
-        processGeneration = if (processGeneration == Long.MAX_VALUE) 1L else processGeneration + 1L
-        val identity = ProcessIdentity(
-            startedProcess,
-            processGeneration,
-            ticket,
-            3_500L,
-        )
-        process = startedProcess
+        val identity = attachProcessIdentity(startedProcess, ticket)
         callRecoveryPending.set(false)
         nativeProcessPid = processIdOf(startedProcess)
-        processIdentity = identity
         running.value = true
         startUptimeTimer()
         wrapAuthTimeoutCount = 0
@@ -1382,10 +1574,9 @@ object TunnelManager {
                 var restartScheduled = false
                 startStopMutex.withLock {
                     if (processIdentity === identity && process === targetProcess) {
-                        val lifecycleWantsRestart = lifecycleState.processEnded(identity.ticket)
-                        process = null
-                        processIdentity = null
-                        nativeProcessPid = null
+                        val lifecycleWantsRestart = synchronized(pendingRoutingReload) {
+                            lifecycleState.processEnded(identity.ticket).also { detachProcessIdentity() }
+                        }
                         activeWorkers.value = 0
                         resetWorkerRecoveryState()
                         if (readerJob === coroutineContext[Job]) readerJob = null
@@ -1833,6 +2024,13 @@ object TunnelManager {
     }
 
     private fun handleCriticalError(message: String, identity: ProcessIdentity) {
+        synchronized(pendingRoutingReload) {
+            if (!isCurrent(identity)) return
+            handleCurrentCriticalError(message, identity)
+        }
+    }
+
+    private fun handleCurrentCriticalError(message: String, identity: ProcessIdentity) {
         // Любая критическая ошибка терминальна для текущего процесса: следующий
         // кадр Config не должен успеть поднять VPN до асинхронного stopLocked.
         routingTerminal = true
@@ -1867,9 +2065,7 @@ object TunnelManager {
     ) {
         val targetProcess = identity?.process ?: process
         if (targetProcess == null) {
-            process = null
-            processIdentity = null
-            nativeProcessPid = null
+            detachProcessIdentity()
             activeWorkers.value = 0
             return
         }
@@ -1877,10 +2073,7 @@ object TunnelManager {
         val logReader = if (attached || process === targetProcess) readerJob else null
         val pidToKill = nativeProcessPid ?: processIdOf(targetProcess)
         if (attached || process === targetProcess) {
-            process = null
-            processIdentity = null
-            nativeProcessPid = null
-            vpnReady.value = false
+            detachProcessIdentity()
             stopUptimeTimer()
             resetWorkerRecoveryState()
         }
@@ -1970,13 +2163,16 @@ object TunnelManager {
         notifyController: Boolean = true,
     ) {
         stopping.value = true
-        lifecycleState.requestStop()
+        synchronized(pendingRoutingReload) {
+            lifecycleState.requestStop()
+            pendingRoutingReload.clear()
+            vpnReady.value = false
+            serverRoutingActive.value = false
+            activeServerRoutingRule.value = null
+            serverAssignedWorkers.value = null
+        }
         if (!preserveWifiAutoPause) autoPausedForWifi.value = false
         pausedForNoNetwork.reset()
-        vpnReady.value = false
-        serverRoutingActive.value = false
-        activeServerRoutingRule.value = null
-        serverAssignedWorkers.value = null
         restartJob?.cancel()
         restartJob = null
         panelRestartJob?.cancel()
@@ -2026,23 +2222,30 @@ object TunnelManager {
     }
 
     fun reloadVpn() {
-        if (routingTerminal) return
-        val configStr = config.value?.trim() ?: return
+        val (identity, configStr) = synchronized(pendingRoutingReload) {
+            if (routingTerminal) return
+            val identity = processIdentity?.takeIf(::isCurrent) ?: return
+            identity to (config.value?.trim() ?: return)
+        }
         if (running.value && configStr.startsWith("TUNCONF:")) {
             activeScope.launch(Dispatchers.Main) {
-                val parts = configStr.removePrefix("TUNCONF:").split(":", limit = 3)
-                val clientIp = parts.getOrNull(0)?.trim()?.takeIf { it.isNotEmpty() } ?: return@launch
-                val dns = parts.getOrNull(1)?.trim()?.takeIf { it.isNotEmpty() } ?: return@launch
-                activeContext()?.let { ctx ->
-                    val vpnIntent = Intent(ctx, TunVpnService::class.java).apply {
-                        action = "RELOAD_ROUTING"
-                        putExtra("client_ip", clientIp)
-                        putExtra("dns", dns)
-                        putExtra("force_rebuild", true)
-                        putExtra("is_routing_reload", true)
-                        putExtra("reason", "reload_vpn")
+                synchronized(pendingRoutingReload) {
+                    if (!isCurrent(identity) || routingTerminal) return@launch
+                    val parts = configStr.removePrefix("TUNCONF:").split(":", limit = 3)
+                    val clientIp = parts.getOrNull(0)?.trim()?.takeIf { it.isNotEmpty() } ?: return@launch
+                    val dns = parts.getOrNull(1)?.trim()?.takeIf { it.isNotEmpty() } ?: return@launch
+                    activeContext()?.let { ctx ->
+                        val vpnIntent = Intent(ctx, TunVpnService::class.java).apply {
+                            action = "RELOAD_ROUTING"
+                            putExtra("client_ip", clientIp)
+                            putExtra("dns", dns)
+                            putExtra("force_rebuild", true)
+                            putExtra("is_routing_reload", true)
+                            putExtra("reason", "reload_vpn")
+                            putExtra(ROUTING_CONNECTION_GENERATION, identity.generation)
+                        }
+                        try { startTunVpnService(ctx, vpnIntent) } catch (_: Exception) {}
                     }
-                    try { startTunVpnService(ctx, vpnIntent) } catch (_: Exception) {}
                 }
             }
         }
@@ -2149,57 +2352,104 @@ object TunnelManager {
         dns: String,
         identity: ProcessIdentity,
     ): RoutingApplyResult {
-        // Терминальное решение липкое до переподключения: повторный кадр с тем
-        // же (или старым) правилом не имеет права сбросить его и поднять VPN.
-        // Исключение — явный ROUTING_ABSENT: он очищает правило и режим.
-        if (routingTerminal && newServerRule != null) {
-            return RoutingApplyResult.Terminal(
-                "routing_terminal",
-                "предыдущее правило завершилось терминальной ошибкой",
+        if (!isCurrent(identity)) return RoutingApplyResult.Applied
+        // Чтение диска может задержаться. Оно не держит монитор подключения;
+        // перед любой мутацией повторно проверяем identity под этим монитором.
+        val context = if (newServerRule != null) activeContext() else null
+        val contentCache = context?.let(::routingContentCache)
+        val cachedContent = contentCache?.read()
+        val cache = context?.let(::routingCache)
+        val cachedIps = cache?.readSnapshot()
+        // Блокирующий I/O (файловый кеш и stdin Rust) сериализуем на процесс:
+        // общий монитор pendingRoutingReload держим только для проверки identity
+        // и публикации состояния. Иначе забитый stdin не даёт stopLocked снять
+        // VPN, а обработка логов на main thread ждёт монитор (ANR).
+        return synchronized(identity.routingApplyLock) {
+            applyServerRoutingRuleSerialized(
+                newServerRule, clientIp, dns, identity,
+                context, contentCache, cachedContent, cache, cachedIps,
             )
         }
-        val previousRule = activeServerRoutingRule.value
+    }
+
+    private fun applyServerRoutingRuleSerialized(
+        newServerRule: ServerRoutingRule?,
+        clientIp: String,
+        dns: String,
+        identity: ProcessIdentity,
+        context: Context?,
+        contentCache: RoutingContentCache?,
+        cachedContent: CachedRoutingContent?,
+        cache: RoutingIpsCache?,
+        cachedIps: CachedRoutingIps?,
+    ): RoutingApplyResult {
         if (newServerRule == null) {
-            activeServerRoutingRule.value = null
-            serverRoutingActive.value = false
+            val previousRule = synchronized(pendingRoutingReload) {
+                // Сначала identity: фоновый STATS/TUN_LOST прежнего процесса не
+                // должен выставить routingTerminal или очистить правило нового.
+                if (!isCurrent(identity)) return RoutingApplyResult.Applied
+                val previous = activeServerRoutingRule.value
+                activeServerRoutingRule.value = null
+                serverRoutingActive.value = false
+                previous
+            }
             if (!clearTemplateIps(identity)) {
                 return routingWriteFailure(identity, "не удалось очистить список адресов сервера")
             }
             // Aдреса и домены очищаются раздельно: шаблон живёт в UPDATE_IPS,
             // явный список — в UPDATE_DOMAINS.
             updateDomainRouting(
+                identity,
                 enabled = false,
                 directDomains = "",
                 ipIsWhitelist = false,
                 directIps = "",
             )
-            if (previousRule != null && vpnReady.value) {
-                reloadRouting(clientIp, dns, "routing_cleared")
+            if (previousRule != null) {
+                requestRoutingReload(identity, clientIp, dns, "routing_cleared")
             }
-            routingTerminal = false
+            synchronized(pendingRoutingReload) {
+                if (isCurrent(identity)) routingTerminal = false
+            }
             return RoutingApplyResult.Applied
         }
 
-        val context = activeContext()
-        val contentCache = context?.let(::routingContentCache)
+        // Терминальное решение липкое до переподключения: повторный кадр с тем
+        // же (или старым) правилом не имеет права сбросить его и поднять VPN.
+        // Исключение — явный ROUTING_ABSENT: он очищает правило и режим.
+        synchronized(pendingRoutingReload) {
+            if (!isCurrent(identity)) return RoutingApplyResult.Applied
+            if (routingTerminal) {
+                return RoutingApplyResult.Terminal(
+                    "routing_terminal",
+                    "предыдущее правило завершилось терминальной ошибкой",
+                )
+            }
+        }
+
         // Решение по доменам/приложениям — до мутации состояния и до любых
         // команд клиенту: терминальный исход не должен оставить полуприменённое
         // правило (см. RoutingContentPolicy).
         val rule = when (val contentDecision =
-            RoutingContentPolicy.decide(newServerRule, contentCache?.read())) {
+            RoutingContentPolicy.decide(newServerRule, cachedContent)) {
             is RoutingContentDecision.Terminal -> {
-                routingTerminal = true
-                // Старое правило больше не активно: иначе следующий TUNCONF без
-                // правила подхватил бы его из activeServerRoutingRule и поднял
-                // VPN вопреки терминальному решению.
-                activeServerRoutingRule.value = null
-                serverRoutingActive.value = false
+                synchronized(pendingRoutingReload) {
+                    if (!isCurrent(identity)) return RoutingApplyResult.Applied
+                    routingTerminal = true
+                    // Старое правило больше не активно: иначе следующий TUNCONF без
+                    // правила подхватил бы его из activeServerRoutingRule и поднял
+                    // VPN вопреки терминальному решению.
+                    activeServerRoutingRule.value = null
+                    serverRoutingActive.value = false
+                }
                 updateProcessLog(identity, contentDecision.code, contentDecision.message, 99, true)
                 handleCriticalError(contentDecision.message, identity)
                 // Ни одной команды не отправлено: туннель не должен подняться.
                 return RoutingApplyResult.Terminal(contentDecision.code, contentDecision.message)
             }
             is RoutingContentDecision.Updated -> {
+                // Кеш пишется вне общего монитора: диск может тормозить, а монитор
+                // нужен остановке VPN и обработке логов.
                 contentCache?.let { cache ->
                     runCatching { cache.write(contentDecision.content) }
                         .onFailure { error ->
@@ -2228,14 +2478,14 @@ object TunnelManager {
             }
             is RoutingContentDecision.Uncached -> contentDecision.rule
         }
-        activeServerRoutingRule.value = rule
-        serverRoutingActive.value = true
-        val cache = context?.let(::routingCache)
-        val decision = RoutingIpsPolicy.decide(
-            rule,
-            cache?.readSha(),
-            cache?.readText(),
-        )
+        val previousRule = synchronized(pendingRoutingReload) {
+            if (!isCurrent(identity)) return RoutingApplyResult.Applied
+            val previous = activeServerRoutingRule.value
+            activeServerRoutingRule.value = rule
+            serverRoutingActive.value = true
+            previous
+        }
+        val decision = RoutingIpsPolicy.decide(rule, cachedIps)
         when (decision) {
             is RoutingIpsPolicy.Decision.Update -> {
                 cache?.let {
@@ -2269,10 +2519,13 @@ object TunnelManager {
                 )
             }
             is RoutingIpsPolicy.Decision.Terminal -> {
-                routingTerminal = true
-                // Старое правило не должно переехать в следующий кадр/перезагрузку.
-                activeServerRoutingRule.value = null
-                serverRoutingActive.value = false
+                synchronized(pendingRoutingReload) {
+                    if (!isCurrent(identity)) return RoutingApplyResult.Applied
+                    routingTerminal = true
+                    // Старое правило не должно переехать в следующий кадр/перезагрузку.
+                    activeServerRoutingRule.value = null
+                    serverRoutingActive.value = false
+                }
                 updateProcessLog(identity, decision.code, decision.message, 99, true)
                 handleCriticalError(decision.message, identity)
                 // Ни одной команды не отправлено: туннель не должен подняться.
@@ -2300,6 +2553,7 @@ object TunnelManager {
         // Порядок важен: сначала UPDATE_IPS (шаблон), затем UPDATE_DOMAINS (явный
         // список и домены). Обе команды независимы и не затирают друг друга.
         updateDomainRouting(
+            identity,
             enabled = rule.domains.isNotEmpty(),
             directDomains = rule.domains.joinToString(","),
             isWhitelist = rule.domainsIsWhite,
@@ -2309,8 +2563,8 @@ object TunnelManager {
         // excludeRoutes VPN собираются из ips/ipIsWhite тоже: смена там (маршрутизация приложений
         // от панели) оставляла старые маршруты до переподключения
         val vpnInputsChanged = IpRoutingPolicy.needsVpnRebuild(previousRule, rule)
-        if (context != null && vpnReady.value && vpnInputsChanged) {
-            reloadRouting(clientIp, dns, "routing_changed")
+        if (context != null && vpnInputsChanged) {
+            requestRoutingReload(identity, clientIp, dns, "routing_changed")
         }
         return RoutingApplyResult.Applied
     }
@@ -2319,24 +2573,37 @@ object TunnelManager {
         "$prefix: доменов ${rule.domains.size}, приложений " +
             (rule.packages.size + rule.presetRed.size + rule.presetOrange.size)
 
-    private fun routingWriteFailure(identity: ProcessIdentity, message: String): RoutingApplyResult {
-        routingTerminal = true
-        activeServerRoutingRule.value = null
-        serverRoutingActive.value = false
-        handleCriticalError(message, identity)
-        return RoutingApplyResult.Terminal(IPS_WRITE_ERROR, message)
+    private fun routingWriteFailure(identity: ProcessIdentity, message: String): RoutingApplyResult =
+        synchronized(pendingRoutingReload) {
+            if (!isCurrent(identity)) return RoutingApplyResult.Applied
+            routingTerminal = true
+            activeServerRoutingRule.value = null
+            serverRoutingActive.value = false
+            handleCriticalError(message, identity)
+            RoutingApplyResult.Terminal(IPS_WRITE_ERROR, message)
+        }
+
+    private fun requestRoutingReload(identity: ProcessIdentity, clientIp: String, dns: String, reason: String) {
+        synchronized(pendingRoutingReload) {
+            if (!isCurrent(identity) || routingTerminal) return
+            val connection = routingConnectionFor(identity.generation) ?: return
+            pendingRoutingReload.request(connection, reason)?.let { reloadRouting(connection, clientIp, dns, it) }
+        }
     }
 
-    private fun reloadRouting(clientIp: String, dns: String, reason: String) {
-        if (routingTerminal) return
-        val ctx = activeContext() ?: return
-        val reloadIntent = Intent(ctx, TunVpnService::class.java).apply {
-            action = "RELOAD_ROUTING"
-            putExtra("client_ip", clientIp)
-            putExtra("dns", dns)
-            putExtra("reason", reason)
+    private fun reloadRouting(connection: RoutingDeferredReload.Connection, clientIp: String, dns: String, reason: String) {
+        synchronized(pendingRoutingReload) {
+            if (!isRoutingConnectionCurrent(connection) || routingTerminal) return
+            val ctx = activeContext() ?: return
+            val reloadIntent = Intent(ctx, TunVpnService::class.java).apply {
+                action = "RELOAD_ROUTING"
+                putExtra("client_ip", clientIp)
+                putExtra("dns", dns)
+                putExtra("reason", reason)
+                putExtra(ROUTING_CONNECTION_GENERATION, connection.generation)
+            }
+            startTunVpnService(ctx, reloadIntent)
         }
-        startTunVpnService(ctx, reloadIntent)
     }
 
     private fun updateTemplateIps(identity: ProcessIdentity, sha: String, text: String): Boolean {
@@ -2360,6 +2627,17 @@ object TunnelManager {
         directIps: String = "",
     ) {
         val identity = processIdentity ?: return
+        updateDomainRouting(identity, enabled, directDomains, isWhitelist, ipIsWhitelist, directIps)
+    }
+
+    private fun updateDomainRouting(
+        identity: ProcessIdentity,
+        enabled: Boolean,
+        directDomains: String,
+        isWhitelist: Boolean = false,
+        ipIsWhitelist: Boolean = false,
+        directIps: String = "",
+    ) {
         val command = RoutingCommandPolicy.domainRoutingCommand(
             enabled = enabled,
             directDomains = directDomains,

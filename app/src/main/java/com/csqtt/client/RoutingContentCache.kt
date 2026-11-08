@@ -2,6 +2,8 @@ package com.csqtt.client
 
 import java.io.File
 import java.io.IOException
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -25,10 +27,12 @@ internal class RoutingContentCache(private val dir: File) {
     private val file = File(dir, FILE_NAME)
     private val shaFile = File(dir, SHA_NAME)
 
-    fun read(): CachedRoutingContent? = try {
-        parseCachedRoutingContent(file.readText(Charsets.UTF_8))
-    } catch (_: Exception) {
-        null
+    fun read(): CachedRoutingContent? = synchronized(routingCacheWriteLock) {
+        try {
+            parseCachedRoutingContent(file.readText(Charsets.UTF_8))
+        } catch (_: Exception) {
+            null
+        }
     }
 
     /** Sha для политики: только при полностью валидном кеше. */
@@ -40,13 +44,13 @@ internal class RoutingContentCache(private val dir: File) {
      * поэтому sha остаётся актуальным и после перезаписи кеша в середине сессии.
      * Невалидный кеш удаляет `.sha`, чтобы клиент не сослался на него.
      */
-    fun reconcileForSpawn(): String? {
+    fun reconcileForSpawn(): String? = synchronized(routingCacheWriteLock) {
         val content = read()
         if (content == null) {
             shaFile.delete()
-            return null
+            return@synchronized null
         }
-        return try {
+        try {
             writeAtomically(shaFile, content.sha)
             content.sha
         } catch (_: IOException) {
@@ -55,7 +59,7 @@ internal class RoutingContentCache(private val dir: File) {
         }
     }
 
-    fun write(content: CachedRoutingContent) {
+    fun write(content: CachedRoutingContent) = synchronized(routingCacheWriteLock) {
         val json = JSONObject().apply {
             put("version", VERSION)
             put("sha", content.sha)
@@ -71,14 +75,17 @@ internal class RoutingContentCache(private val dir: File) {
     }
 
     private fun writeAtomically(target: File, content: String) {
-        val tmp = File(dir, "${target.name}.tmp")
-        tmp.writeText(content, Charsets.UTF_8)
-        if (!tmp.renameTo(target)) {
-            target.delete()
-            if (!tmp.renameTo(target)) {
-                tmp.delete()
-                throw IOException("cannot replace ${target.name}")
-            }
+        val tmp = File(dir, "${target.name}.${System.nanoTime()}.tmp")
+        try {
+            tmp.writeText(content, Charsets.UTF_8)
+            Files.move(
+                tmp.toPath(),
+                target.toPath(),
+                StandardCopyOption.REPLACE_EXISTING,
+            )
+        } catch (error: IOException) {
+            tmp.delete()
+            throw error
         }
     }
 
