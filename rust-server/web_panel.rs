@@ -566,18 +566,14 @@ fn authorized(app: &App, headers: &HeaderMap) -> bool {
         return true;
     }
 
+    // main_password is the owner's tunnel secret; it must not authorize the panel.
     if let Some(key) = headers
         .get("x-api-key")
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
         && !key.is_empty()
     {
-        if secret_eq(key, &app.web_pass) || secret_eq(key, &app.startup_main_password) {
-            return true;
-        }
-        if let Ok(db) = app.db.try_read()
-            && secret_eq(key, &db.main_password)
-        {
+        if secret_eq(key, &app.web_pass) {
             return true;
         }
         if app
@@ -599,12 +595,7 @@ fn authorized(app: &App, headers: &HeaderMap) -> bool {
     {
         let token = token.trim();
         if !token.is_empty() {
-            if secret_eq(token, &app.web_pass) || secret_eq(token, &app.startup_main_password) {
-                return true;
-            }
-            if let Ok(db) = app.db.try_read()
-                && secret_eq(token, &db.main_password)
-            {
+            if secret_eq(token, &app.web_pass) {
                 return true;
             }
             if app
@@ -14346,6 +14337,27 @@ mod tests {
                     .unwrap()
             }
 
+            async fn request_with_header(
+                &self,
+                method: &str,
+                uri: &str,
+                header: &'static str,
+                value: &str,
+            ) -> Response {
+                self.router
+                    .clone()
+                    .call(
+                        Request::builder()
+                            .method(method)
+                            .uri(uri)
+                            .header(header, value)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+            }
+
             async fn export(&self) -> Vec<u8> {
                 let response = self.request("GET", "/api/export", Vec::new()).await;
                 assert_eq!(response.status(), StatusCode::OK);
@@ -14368,6 +14380,44 @@ mod tests {
             fn drop(&mut self) {
                 let _ = std::fs::remove_dir_all(&self.app.config_dir);
             }
+        }
+
+        #[tokio::test]
+        async fn main_password_never_authorizes_panel_api() {
+            let target = Fixture::new(Database {
+                main_password: "owner-main-password".to_owned(),
+                ..Default::default()
+            })
+            .await;
+            target.app.db.write().await.main_password = "rotated-main-password".to_owned();
+
+            for password in ["owner-main-password", "rotated-main-password"] {
+                for uri in ["/api/settings", "/api/clients", "/api/export"] {
+                    let response = target
+                        .request_with_header("GET", uri, "x-api-key", password)
+                        .await;
+                    assert_eq!(
+                        response.status(),
+                        StatusCode::UNAUTHORIZED,
+                        "x-api-key {uri}"
+                    );
+
+                    let bearer = format!("Bearer {password}");
+                    let response = target
+                        .request_with_header("GET", uri, "authorization", &bearer)
+                        .await;
+                    assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "Bearer {uri}");
+                }
+            }
+
+            let response = target
+                .request_with_header("GET", "/api/settings", "x-api-key", &target.app.web_pass)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+
+            eprintln!(
+                "main password rejected as x-api-key/Bearer; panel password still authorizes"
+            );
         }
 
         fn large_rule() -> RoutingRule {
