@@ -82,6 +82,8 @@ pub struct PasswordEntry {
     pub expires_at: i64,
     pub down_bytes: i64,
     pub up_bytes: i64,
+    #[serde(default, skip_serializing)]
+    pub last_online: i64,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub vk_hash: String,
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -243,6 +245,8 @@ pub struct Database {
     pub auto_restart_interval_hours: Option<u8>,
     pub main_up_bytes: i64,
     pub main_down_bytes: i64,
+    #[serde(default, skip_serializing)]
+    pub main_last_online: i64,
     pub admin_id: String,
     pub bot_token: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -275,6 +279,7 @@ pub struct Database {
 pub struct TrafficCounters {
     pub up_bytes: i64,
     pub down_bytes: i64,
+    pub last_online: i64,
 }
 
 #[derive(Debug, Default)]
@@ -517,6 +522,16 @@ impl DatabasePersistence {
         };
         self.inner.queue_ready.notify_one();
         revision
+    }
+
+    #[cfg(test)]
+    pub fn next_revision_for_test(&self) -> u64 {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .queue
+            .next_revision
     }
 
     pub async fn wait(&self, revision: u64) -> Result<()> {
@@ -801,7 +816,8 @@ CREATE TABLE IF NOT EXISTS meta (
 CREATE TABLE IF NOT EXISTS counters (
     id              INTEGER PRIMARY KEY CHECK (id = 1),
     main_up_bytes   INTEGER NOT NULL DEFAULT 0,
-    main_down_bytes INTEGER NOT NULL DEFAULT 0
+    main_down_bytes INTEGER NOT NULL DEFAULT 0,
+    main_last_online INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS passwords (
     password       TEXT PRIMARY KEY,
@@ -809,6 +825,7 @@ CREATE TABLE IF NOT EXISTS passwords (
     expires_at     INTEGER NOT NULL DEFAULT 0,
     down_bytes     INTEGER NOT NULL DEFAULT 0,
     up_bytes       INTEGER NOT NULL DEFAULT 0,
+    last_online    INTEGER NOT NULL DEFAULT 0,
     vk_hash        TEXT    NOT NULL DEFAULT '',
     ports          TEXT    NOT NULL DEFAULT '',
     is_deactivated INTEGER NOT NULL DEFAULT 0,
@@ -879,9 +896,30 @@ fn open_database_connection(config_dir: &Path) -> Result<Connection> {
         .execute_batch(DATABASE_SCHEMA)
         .with_context(|| format!("schema {}", path.display()))?;
     ensure_password_columns(&connection)?;
+    ensure_counter_columns(&connection)?;
     ensure_routing_rule_columns(&connection)?;
     ensure_client_group_columns(&connection)?;
     Ok(connection)
+}
+
+fn ensure_counter_columns(connection: &Connection) -> Result<()> {
+    let mut statement = connection
+        .prepare("PRAGMA table_info(counters)")
+        .context("prepare counters schema check")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .context("read counters schema")?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("collect counters schema")?;
+    if !columns.iter().any(|column| column == "main_last_online") {
+        connection
+            .execute(
+                "ALTER TABLE counters ADD COLUMN main_last_online INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .context("add main_last_online column")?;
+    }
+    Ok(())
 }
 
 fn ensure_client_group_columns(connection: &Connection) -> Result<()> {
@@ -1036,6 +1074,14 @@ fn ensure_password_columns(connection: &Connection) -> Result<()> {
             .execute("ALTER TABLE passwords ADD COLUMN workers INTEGER", [])
             .context("add workers column")?;
     }
+    if !columns.iter().any(|column| column == "last_online") {
+        connection
+            .execute(
+                "ALTER TABLE passwords ADD COLUMN last_online INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .context("add last_online column")?;
+    }
     Ok(())
 }
 
@@ -1111,11 +1157,13 @@ fn write_database_snapshot(connection: &mut Connection, db: &Database) -> Result
     }
     transaction
         .execute(
-            "INSERT INTO counters (id, main_up_bytes, main_down_bytes) VALUES (1, ?1, ?2)
+            "INSERT INTO counters (id, main_up_bytes, main_down_bytes, main_last_online)
+             VALUES (1, ?1, ?2, ?3)
              ON CONFLICT(id) DO UPDATE SET
                 main_up_bytes = excluded.main_up_bytes,
-                main_down_bytes = excluded.main_down_bytes",
-            rusqlite::params![db.main_up_bytes, db.main_down_bytes],
+                main_down_bytes = excluded.main_down_bytes,
+                main_last_online = MAX(counters.main_last_online, excluded.main_last_online)",
+            rusqlite::params![db.main_up_bytes, db.main_down_bytes, db.main_last_online],
         )
         .context("write counters")?;
     for password in existing_row_keys(&transaction, "SELECT password FROM passwords")? {
@@ -1226,13 +1274,15 @@ fn write_database_snapshot(connection: &mut Connection, db: &Database) -> Result
                 "INSERT INTO passwords (
                     password, ip, expires_at, down_bytes, up_bytes,
                     vk_hash, ports, is_deactivated, name, vk_hashes, vk_token_enabled,
-                    dtls_port, wg_port, local_port, group_id, routing_rule_id, sub_uuid, workers
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+                    dtls_port, wg_port, local_port, group_id, routing_rule_id, sub_uuid, workers,
+                    last_online
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
                 ON CONFLICT(password) DO UPDATE SET
                     ip = excluded.ip,
                     expires_at = excluded.expires_at,
                     down_bytes = excluded.down_bytes,
                     up_bytes = excluded.up_bytes,
+                    last_online = MAX(passwords.last_online, excluded.last_online),
                     vk_hash = excluded.vk_hash,
                     ports = excluded.ports,
                     is_deactivated = excluded.is_deactivated,
@@ -1269,6 +1319,7 @@ fn write_database_snapshot(connection: &mut Connection, db: &Database) -> Result
                     entry.routing_rule_id,
                     entry.sub_uuid,
                     entry.workers.map(|w| w as i64),
+                    entry.last_online,
                 ])
                 .with_context(|| format!("write password {}", secret_tag(password)))?;
         }
@@ -1366,20 +1417,28 @@ fn read_database_snapshot(config_dir: &Path) -> Result<Database> {
             }
         }
     }
-    if let Ok((up_bytes, down_bytes)) = connection.query_row(
-        "SELECT main_up_bytes, main_down_bytes FROM counters WHERE id = 1",
+    if let Ok((up_bytes, down_bytes, last_online)) = connection.query_row(
+        "SELECT main_up_bytes, main_down_bytes, main_last_online FROM counters WHERE id = 1",
         [],
-        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2).unwrap_or(0),
+            ))
+        },
     ) {
         db.main_up_bytes = up_bytes;
         db.main_down_bytes = down_bytes;
+        db.main_last_online = last_online;
     }
     {
         let mut select = connection
             .prepare(
                 "SELECT password, ip, expires_at, down_bytes, up_bytes,
                         vk_hash, ports, is_deactivated, name, vk_hashes, vk_token_enabled,
-                        dtls_port, wg_port, local_port, group_id, routing_rule_id, sub_uuid, workers
+                        dtls_port, wg_port, local_port, group_id, routing_rule_id, sub_uuid, workers,
+                        last_online
                  FROM passwords",
             )
             .context("prepare passwords select")?;
@@ -1398,6 +1457,7 @@ fn read_database_snapshot(config_dir: &Path) -> Result<Database> {
                 expires_at: row.get(2).context("read password expires_at")?,
                 down_bytes: row.get(3).context("read password down_bytes")?,
                 up_bytes: row.get(4).context("read password up_bytes")?,
+                last_online: row.get::<_, i64>(18).unwrap_or(0),
                 vk_hash: row.get(5).context("read password vk_hash")?,
                 ports: row.get(6).context("read password ports")?,
                 is_deactivated: row
@@ -1676,11 +1736,17 @@ fn import_legacy_database_rows(connection: &mut Connection, legacy: &Database) -
     }
     transaction
         .execute(
-            "INSERT INTO counters (id, main_up_bytes, main_down_bytes) VALUES (1, ?1, ?2)
+            "INSERT INTO counters (id, main_up_bytes, main_down_bytes, main_last_online)
+             VALUES (1, ?1, ?2, ?3)
              ON CONFLICT(id) DO UPDATE SET
                 main_up_bytes = MAX(counters.main_up_bytes, excluded.main_up_bytes),
-                main_down_bytes = MAX(counters.main_down_bytes, excluded.main_down_bytes)",
-            rusqlite::params![legacy.main_up_bytes, legacy.main_down_bytes],
+                main_down_bytes = MAX(counters.main_down_bytes, excluded.main_down_bytes),
+                main_last_online = MAX(counters.main_last_online, excluded.main_last_online)",
+            rusqlite::params![
+                legacy.main_up_bytes,
+                legacy.main_down_bytes,
+                legacy.main_last_online.clamp(0, now()),
+            ],
         )
         .context("merge legacy main traffic counters")?;
 
@@ -1690,8 +1756,8 @@ fn import_legacy_database_rows(connection: &mut Connection, legacy: &Database) -
                 "INSERT INTO passwords (
                     password, ip, expires_at, down_bytes, up_bytes,
                     vk_hash, ports, is_deactivated, name, vk_hashes, vk_token_enabled,
-                    dtls_port, wg_port, local_port
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                    dtls_port, wg_port, local_port, last_online
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
                 ON CONFLICT(password) DO NOTHING",
             )
             .context("prepare legacy passwords import")?;
@@ -1712,6 +1778,7 @@ fn import_legacy_database_rows(connection: &mut Connection, legacy: &Database) -
                     entry.dtls_port,
                     entry.wg_port,
                     entry.local_port,
+                    entry.last_online.clamp(0, now()),
                 ])
                 .with_context(|| format!("merge legacy password {}", secret_tag(password)))?;
         }
@@ -1832,19 +1899,29 @@ fn write_traffic(connection: &mut Connection, traffic: &TrafficSnapshot) -> Resu
     if let Some(main) = traffic.main {
         transaction
             .execute(
-                "INSERT INTO counters (id, main_up_bytes, main_down_bytes) VALUES (1, ?1, ?2)
+                "INSERT INTO counters (id, main_up_bytes, main_down_bytes, main_last_online)
+                 VALUES (1, ?1, ?2, ?3)
                  ON CONFLICT(id) DO UPDATE SET
                     main_up_bytes = excluded.main_up_bytes,
-                    main_down_bytes = excluded.main_down_bytes",
-                rusqlite::params![main.up_bytes, main.down_bytes],
+                    main_down_bytes = excluded.main_down_bytes,
+                    main_last_online = MAX(counters.main_last_online, excluded.main_last_online)",
+                rusqlite::params![main.up_bytes, main.down_bytes, main.last_online],
             )
             .context("write main traffic counters")?;
     }
     for (password, counters) in &traffic.passwords {
         transaction
             .execute(
-                "UPDATE passwords SET up_bytes = ?2, down_bytes = ?3 WHERE password = ?1",
-                rusqlite::params![password, counters.up_bytes, counters.down_bytes],
+                "UPDATE passwords
+                 SET up_bytes = ?2, down_bytes = ?3,
+                     last_online = MAX(last_online, ?4)
+                 WHERE password = ?1",
+                rusqlite::params![
+                    password,
+                    counters.up_bytes,
+                    counters.down_bytes,
+                    counters.last_online
+                ],
             )
             .with_context(|| format!("write traffic for password {}", secret_tag(password)))?;
     }
@@ -2368,6 +2445,7 @@ mod tests {
             TrafficCounters {
                 up_bytes: 1,
                 down_bytes: 2,
+                last_online: 0,
             },
         );
         let (first_revision, start_first) = queue.submit_traffic(first);
@@ -2378,6 +2456,7 @@ mod tests {
             TrafficCounters {
                 up_bytes: 3,
                 down_bytes: 4,
+                last_online: 0,
             },
         );
         let (second_revision, start_second) = queue.submit_traffic(second);
@@ -2462,6 +2541,7 @@ mod tests {
             main: Some(TrafficCounters {
                 up_bytes: 101,
                 down_bytes: 102,
+                last_online: 0,
             }),
             ..TrafficSnapshot::default()
         };
@@ -2470,6 +2550,7 @@ mod tests {
             TrafficCounters {
                 up_bytes: 103,
                 down_bytes: 104,
+                last_online: 0,
             },
         );
         let revision = persistence.submit_traffic(traffic);
@@ -2737,6 +2818,250 @@ mod tests {
             .get("client1234567890")
             .expect("participant slot exists");
         assert_eq!(participant.ip, "10.66.67.3");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    fn temp_dir(prefix: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("{prefix}-{unique}"));
+        std::fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    fn columns_of(connection: &rusqlite::Connection, table: &str) -> Vec<String> {
+        let mut statement = connection
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn old_sqlite_schema_gains_presence_columns_with_zero_defaults() {
+        let directory = temp_dir("csqtt-presence-migration");
+        let connection = rusqlite::Connection::open(directory.join(super::DATABASE_FILE)).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE counters (
+                     id INTEGER PRIMARY KEY CHECK (id = 1),
+                     main_up_bytes INTEGER NOT NULL DEFAULT 0,
+                     main_down_bytes INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE passwords (
+                     password TEXT PRIMARY KEY,
+                     ip TEXT NOT NULL DEFAULT '',
+                     expires_at INTEGER NOT NULL DEFAULT 0,
+                     down_bytes INTEGER NOT NULL DEFAULT 0,
+                     up_bytes INTEGER NOT NULL DEFAULT 0,
+                     vk_hash TEXT NOT NULL DEFAULT '',
+                     ports TEXT NOT NULL DEFAULT '',
+                     is_deactivated INTEGER NOT NULL DEFAULT 0,
+                     name TEXT NOT NULL DEFAULT '',
+                     vk_hashes TEXT NOT NULL DEFAULT '',
+                     vk_token_enabled INTEGER NOT NULL DEFAULT 0,
+                     dtls_port INTEGER NOT NULL DEFAULT 0,
+                     wg_port INTEGER NOT NULL DEFAULT 0,
+                     local_port INTEGER NOT NULL DEFAULT 0,
+                     group_id TEXT NOT NULL DEFAULT '',
+                     routing_rule_id TEXT NOT NULL DEFAULT '',
+                     sub_uuid TEXT NOT NULL DEFAULT '',
+                     workers INTEGER
+                 );
+                 INSERT INTO counters (id, main_up_bytes, main_down_bytes) VALUES (1, 10, 20);
+                 INSERT INTO passwords (password, ip, name) VALUES ('oldclientpass001', '10.66.67.3', 'Old');",
+            )
+            .unwrap();
+        drop(connection);
+
+        let db = super::load_database(&directory).unwrap();
+        assert_eq!(db.main_last_online, 0);
+        assert_eq!(db.passwords["oldclientpass001"].last_online, 0);
+
+        let connection = rusqlite::Connection::open(directory.join(super::DATABASE_FILE)).unwrap();
+        assert!(
+            columns_of(&connection, "passwords")
+                .iter()
+                .any(|column| column == "last_online")
+        );
+        assert!(
+            columns_of(&connection, "counters")
+                .iter()
+                .any(|column| column == "main_last_online")
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn counters_presence_migration_is_independent_of_passwords() {
+        let directory = temp_dir("csqtt-presence-counter-migration");
+        let connection = rusqlite::Connection::open(directory.join(super::DATABASE_FILE)).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE counters (
+                     id INTEGER PRIMARY KEY CHECK (id = 1),
+                     main_up_bytes INTEGER NOT NULL DEFAULT 0,
+                     main_down_bytes INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE passwords (
+                     password TEXT PRIMARY KEY,
+                     ip TEXT NOT NULL DEFAULT '',
+                     expires_at INTEGER NOT NULL DEFAULT 0,
+                     down_bytes INTEGER NOT NULL DEFAULT 0,
+                     up_bytes INTEGER NOT NULL DEFAULT 0,
+                     last_online INTEGER NOT NULL DEFAULT 0,
+                     vk_hash TEXT NOT NULL DEFAULT '',
+                     ports TEXT NOT NULL DEFAULT '',
+                     is_deactivated INTEGER NOT NULL DEFAULT 0,
+                     name TEXT NOT NULL DEFAULT '',
+                     vk_hashes TEXT NOT NULL DEFAULT '',
+                     vk_token_enabled INTEGER NOT NULL DEFAULT 0,
+                     dtls_port INTEGER NOT NULL DEFAULT 0,
+                     wg_port INTEGER NOT NULL DEFAULT 0,
+                     local_port INTEGER NOT NULL DEFAULT 0,
+                     group_id TEXT NOT NULL DEFAULT '',
+                     routing_rule_id TEXT NOT NULL DEFAULT '',
+                     sub_uuid TEXT NOT NULL DEFAULT '',
+                     workers INTEGER
+                 );
+                 INSERT INTO counters (id, main_up_bytes, main_down_bytes) VALUES (1, 0, 0);
+                 INSERT INTO passwords (password, ip, name, last_online) VALUES ('oldclientpass002', '10.66.67.4', 'Old', 123);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let db = super::load_database(&directory).unwrap();
+        assert_eq!(db.main_last_online, 0);
+        assert_eq!(db.passwords["oldclientpass002"].last_online, 123);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn traffic_persistence_never_lowers_last_online() {
+        let directory = temp_dir("csqtt-presence-monotonic");
+        let persistence = super::DatabasePersistence::new(directory.clone()).unwrap();
+        let mut db = super::Database {
+            main_password: "owner12345678901".to_owned(),
+            ..super::Database::default()
+        };
+        db.passwords.insert(
+            "client1234567890".to_owned(),
+            super::PasswordEntry {
+                ip: "10.66.67.3".to_owned(),
+                name: "Client".to_owned(),
+                ..super::PasswordEntry::default()
+            },
+        );
+        let revision = persistence.submit(db);
+        persistence.wait(revision).await.unwrap();
+
+        let mut fresh = super::TrafficSnapshot {
+            main: Some(super::TrafficCounters {
+                up_bytes: 0,
+                down_bytes: 0,
+                last_online: 300,
+            }),
+            ..super::TrafficSnapshot::default()
+        };
+        fresh.passwords.insert(
+            "client1234567890".to_owned(),
+            super::TrafficCounters {
+                up_bytes: 0,
+                down_bytes: 0,
+                last_online: 300,
+            },
+        );
+        let revision = persistence.submit_traffic(fresh);
+        persistence.wait(revision).await.unwrap();
+
+        let mut stale = super::TrafficSnapshot {
+            main: Some(super::TrafficCounters {
+                up_bytes: 0,
+                down_bytes: 0,
+                last_online: 100,
+            }),
+            ..super::TrafficSnapshot::default()
+        };
+        stale.passwords.insert(
+            "client1234567890".to_owned(),
+            super::TrafficCounters {
+                up_bytes: 0,
+                down_bytes: 0,
+                last_online: 100,
+            },
+        );
+        let revision = persistence.submit_traffic(stale);
+        persistence.wait(revision).await.unwrap();
+
+        let restored = super::load_database(&directory).unwrap();
+        assert_eq!(restored.main_last_online, 300);
+        assert_eq!(restored.passwords["client1234567890"].last_online, 300);
+
+        let mut stale_snapshot = restored.clone();
+        stale_snapshot.main_last_online = 50;
+        stale_snapshot
+            .passwords
+            .get_mut("client1234567890")
+            .unwrap()
+            .last_online = 50;
+        super::save_database(&directory, &stale_snapshot).unwrap();
+        let reloaded = super::load_database(&directory).unwrap();
+        assert_eq!(reloaded.main_last_online, 300);
+        assert_eq!(reloaded.passwords["client1234567890"].last_online, 300);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn presence_timestamps_are_not_serialized() {
+        let entry = super::PasswordEntry {
+            last_online: 123,
+            ..super::PasswordEntry::default()
+        };
+        let value = serde_json::to_value(&entry).unwrap();
+        assert!(value.get("last_online").is_none());
+
+        let db = super::Database {
+            main_last_online: 123,
+            ..super::Database::default()
+        };
+        let value = serde_json::to_value(&db).unwrap();
+        assert!(value.get("main_last_online").is_none());
+    }
+
+    #[test]
+    fn legacy_import_clamps_future_presence_timestamps() {
+        let directory = temp_dir("csqtt-presence-import-clamp");
+        let future = super::now().saturating_add(100_000);
+        let mut legacy = super::Database {
+            main_last_online: future,
+            ..super::Database::default()
+        };
+        legacy.passwords.insert(
+            "client1234567890".to_owned(),
+            super::PasswordEntry {
+                ip: "10.66.67.3".to_owned(),
+                name: "Legacy".to_owned(),
+                last_online: future,
+                ..super::PasswordEntry::default()
+            },
+        );
+        let mut connection = super::open_database_connection(&directory).unwrap();
+        super::import_legacy_database_rows(&mut connection, &legacy).unwrap();
+        drop(connection);
+
+        let db = super::load_database(&directory).unwrap();
+        assert!(db.main_last_online > 0);
+        assert!(db.main_last_online <= super::now());
+        let entry = &db.passwords["client1234567890"];
+        assert!(entry.last_online > 0);
+        assert!(entry.last_online <= super::now());
         let _ = std::fs::remove_dir_all(directory);
     }
 }

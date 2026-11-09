@@ -322,6 +322,9 @@ struct ClientInfo {
     expires: i64,
     active: bool,
     active_sessions: usize,
+    last_online: i64,
+    presence_window_secs: i64,
+    server_now: i64,
     vk_hash: String,
     ports: String,
     ip: String,
@@ -1550,20 +1553,38 @@ struct ClientListQuery {
     search: Option<String>,
 }
 
+fn live_presence(
+    sessions: &dashmap::DashMap<u64, Arc<crate::protocol::Session>>,
+    password: &str,
+) -> (usize, u64) {
+    if password.is_empty() {
+        return (0, 0);
+    }
+    let mut count = 0;
+    let mut last_inbound = 0;
+    for entry in sessions.iter() {
+        let session = entry.value();
+        if session.password == password {
+            count += 1;
+            last_inbound = last_inbound.max(session.last_inbound.load(Ordering::Relaxed));
+        }
+    }
+    (count, last_inbound)
+}
+
 fn count_active_sessions(
     sessions: &dashmap::DashMap<u64, Arc<crate::protocol::Session>>,
     password: &str,
 ) -> usize {
-    if password.is_empty() {
-        return 0;
-    }
-    let mut count = 0;
-    for entry in sessions.iter() {
-        if entry.value().password == password {
-            count += 1;
-        }
-    }
-    count
+    live_presence(sessions, password).0
+}
+
+fn submit_snapshot_locked(
+    app: &Arc<App>,
+    _guard: &tokio::sync::RwLockWriteGuard<'_, model::Database>,
+    snapshot: model::Database,
+) -> u64 {
+    app.db_persistence.submit(snapshot)
 }
 
 async fn clients_get(
@@ -1573,6 +1594,7 @@ async fn clients_get(
 ) -> impl IntoResponse {
     let db = state.app.db.read().await;
     let host = resolve_client_host(&headers, &state).await;
+    let current = now();
 
     let mut list: Vec<ClientInfo> = db
         .passwords
@@ -1583,13 +1605,18 @@ async fn clients_get(
             } else {
                 entry.dtls_port
             };
+            let (active_sessions, live) = live_presence(&state.app.sessions, password);
+            let (last_online, _) = protocol::presence_view(entry.last_online, live, current);
             ClientInfo {
                 password: password.clone(),
                 down: entry.down_bytes,
                 up: entry.up_bytes,
                 expires: entry.expires_at,
                 active: !entry.is_deactivated && !is_expired(entry),
-                active_sessions: count_active_sessions(&state.app.sessions, password),
+                active_sessions,
+                last_online,
+                presence_window_secs: protocol::PRESENCE_WINDOW_SECS,
+                server_now: current,
                 vk_hash: entry.vk_hash.clone(),
                 ports: entry.ports.clone(),
                 ip: if entry.ip.is_empty() {
@@ -1619,13 +1646,18 @@ async fn clients_get(
     if !db.main_password.is_empty() {
         let mut session_up = 0;
         let mut session_down = 0;
+        let mut active_sessions = 0;
+        let mut live = 0;
         for s in state.app.sessions.iter() {
             let sess = s.value();
             if secret_eq(&sess.password, &db.main_password) {
+                active_sessions += 1;
                 session_up += sess.up_bytes.load(Ordering::Relaxed) as i64;
                 session_down += sess.down_bytes.load(Ordering::Relaxed) as i64;
+                live = live.max(sess.last_inbound.load(Ordering::Relaxed));
             }
         }
+        let (last_online, _) = protocol::presence_view(db.main_last_online, live, current);
 
         let main_peer_port = state.app.listen.port();
         list.push(ClientInfo {
@@ -1634,7 +1666,10 @@ async fn clients_get(
             up: db.main_up_bytes + session_up,
             expires: 0,
             active: true,
-            active_sessions: count_active_sessions(&state.app.sessions, &db.main_password),
+            active_sessions,
+            last_online,
+            presence_window_secs: protocol::PRESENCE_WINDOW_SECS,
+            server_now: current,
             vk_hash: String::new(),
             ports: String::new(),
             ip: "10.66.67.2".to_string(),
@@ -1692,6 +1727,7 @@ async fn group_clients_get(
             .into_response();
     }
     let host = resolve_client_host(&headers, &state).await;
+    let current = now();
     let effective_vk_token = db
         .groups
         .get(&id)
@@ -1707,13 +1743,18 @@ async fn group_clients_get(
             } else {
                 entry.dtls_port
             };
+            let (active_sessions, live) = live_presence(&state.app.sessions, password);
+            let (last_online, _) = protocol::presence_view(entry.last_online, live, current);
             ClientInfo {
                 password: password.clone(),
                 down: entry.down_bytes,
                 up: entry.up_bytes,
                 expires: entry.expires_at,
                 active: !entry.is_deactivated && !is_expired(entry),
-                active_sessions: count_active_sessions(&state.app.sessions, password),
+                active_sessions,
+                last_online,
+                presence_window_secs: protocol::PRESENCE_WINDOW_SECS,
+                server_now: current,
                 vk_hash: entry.vk_hash.clone(),
                 ports: entry.ports.clone(),
                 ip: if entry.ip.is_empty() {
@@ -1860,6 +1901,7 @@ async fn clients_create(
                 expires_at: expires,
                 down_bytes: 0,
                 up_bytes: 0,
+                last_online: 0,
                 vk_hash: vk_hashes.clone(),
                 ports,
                 is_deactivated: false,
@@ -2031,7 +2073,7 @@ async fn client_toggle(State(state): State<WebState>, Path(password): Path<Strin
         return response;
     }
 
-    crate::protocol::drop_password_sessions(&state.app, &password);
+    crate::protocol::drop_password_sessions(&state.app, &password).await;
     if let Err(message) = refresh_credentials_report(&state).await {
         let warning = format!("saved but reload failed: {message}");
         return (StatusCode::OK, [("x-csqtt-reload-error", warning)], "saved").into_response();
@@ -2045,7 +2087,7 @@ async fn client_unbind(State(state): State<WebState>, Path(password): Path<Strin
     // привязка правила этим handler'ом не меняется, а `drop_password_sessions`
     // уничтожает ровно те сессии, которым notice был бы адресован. Клиент
     // переподключится и получит актуальное решение обычным `GETCONF`.
-    crate::protocol::drop_password_sessions(&state.app, &password);
+    crate::protocol::drop_password_sessions(&state.app, &password).await;
     crate::protocol::forget_idle_password_epoch(&state.app, &password);
     StatusCode::OK.into_response()
 }
@@ -2063,7 +2105,7 @@ async fn client_delete(State(state): State<WebState>, Path(password): Path<Strin
         return response;
     }
 
-    crate::protocol::drop_password_sessions(&state.app, &password);
+    crate::protocol::drop_password_sessions(&state.app, &password).await;
     if let Err(message) = refresh_credentials_report(&state).await {
         let warning = format!("saved but reload failed: {message}");
         return (StatusCode::OK, [("x-csqtt-reload-error", warning)], "saved").into_response();
@@ -2079,19 +2121,23 @@ async fn client_get(
 ) -> Response {
     let db = state.app.db.read().await;
     let host = resolve_client_host(&headers, &state).await;
+    let current = now();
 
     if secret_eq(&password, &db.main_password) {
         let mut session_up = 0;
         let mut session_down = 0;
         let mut active_sessions = 0;
+        let mut live = 0;
         for entry in state.app.sessions.iter() {
             let sess = entry.value();
             if secret_eq(&sess.password, &db.main_password) {
                 active_sessions += 1;
                 session_up += sess.up_bytes.load(Ordering::Relaxed) as i64;
                 session_down += sess.down_bytes.load(Ordering::Relaxed) as i64;
+                live = live.max(sess.last_inbound.load(Ordering::Relaxed));
             }
         }
+        let (last_online, _) = protocol::presence_view(db.main_last_online, live, current);
 
         let main_peer_port = state.app.listen.port();
         let info = ClientInfo {
@@ -2101,6 +2147,9 @@ async fn client_get(
             expires: 0,
             active: true,
             active_sessions,
+            last_online,
+            presence_window_secs: protocol::PRESENCE_WINDOW_SECS,
+            server_now: current,
             vk_hash: String::new(),
             ports: String::new(),
             ip: "10.66.67.2".to_string(),
@@ -2123,7 +2172,8 @@ async fn client_get(
     }
 
     if let Some(entry) = db.passwords.get(&password) {
-        let active_sessions = count_active_sessions(&state.app.sessions, &password);
+        let (active_sessions, live) = live_presence(&state.app.sessions, &password);
+        let (last_online, _) = protocol::presence_view(entry.last_online, live, current);
         let client_peer_port = if entry.dtls_port == 0 {
             state.app.listen.port()
         } else {
@@ -2136,6 +2186,9 @@ async fn client_get(
             expires: entry.expires_at,
             active: !entry.is_deactivated && !is_expired(entry),
             active_sessions,
+            last_online,
+            presence_window_secs: protocol::PRESENCE_WINDOW_SECS,
+            server_now: current,
             vk_hash: entry.vk_hash.clone(),
             ports: entry.ports.clone(),
             ip: if entry.ip.is_empty() {
@@ -2705,6 +2758,7 @@ async fn api_import_post(
                             expires_at: c.expires_at,
                             down_bytes: c.down_bytes,
                             up_bytes: c.up_bytes,
+                            last_online: 0,
                             vk_hash: c.vk_hash,
                             ports: c.ports,
                             is_deactivated: c.is_deactivated,
@@ -2954,7 +3008,7 @@ async fn groups_delete(State(state): State<WebState>, Path(id): Path<String>) ->
     // переподключении не пройдут аутентификацию; остальные получат актуальное
     // решение обычным `GETCONF`. Тот же случай, что `client_unbind`/`client_delete`.
     for pwd in &deleted_passwords {
-        crate::protocol::drop_password_sessions(&state.app, pwd);
+        crate::protocol::drop_password_sessions(&state.app, pwd).await;
     }
     if let Err(message) = refresh_credentials_report(&state).await {
         let warning = format!("saved but reload failed: {message}");
@@ -2973,8 +3027,8 @@ async fn group_admin_link_post(State(state): State<WebState>, Path(id): Path<Str
     }
     let admin_uuid = group.admin_uuid.clone();
     let snapshot = db.clone();
+    submit_snapshot_locked(&state.app, &db, snapshot);
     drop(db);
-    state.app.db_persistence.submit(snapshot);
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -2996,8 +3050,8 @@ async fn group_admin_link_regenerate(
     group.admin_uuid = model::random_uuid_v4();
     let admin_uuid = group.admin_uuid.clone();
     let snapshot = db.clone();
+    submit_snapshot_locked(&state.app, &db, snapshot);
     drop(db);
-    state.app.db_persistence.submit(snapshot);
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -3018,8 +3072,8 @@ async fn group_admin_link_delete(
     };
     group.admin_uuid.clear();
     let snapshot = db.clone();
+    submit_snapshot_locked(&state.app, &db, snapshot);
     drop(db);
-    state.app.db_persistence.submit(snapshot);
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -3470,7 +3524,7 @@ async fn api_clients_batch_toggle(
         let _ = wait_for_persistence(&state, rev).await;
     }
     for pwd in &passwords_to_disconnect {
-        crate::protocol::drop_password_sessions(&state.app, pwd);
+        crate::protocol::drop_password_sessions(&state.app, pwd).await;
     }
     if updated > 0 {
         let _ = refresh_credentials_report(&state).await;
@@ -3597,7 +3651,7 @@ async fn api_clients_batch_delete(
         let _ = wait_for_persistence(&state, rev).await;
     }
     for pwd in &req.passwords {
-        crate::protocol::drop_password_sessions(&state.app, pwd);
+        crate::protocol::drop_password_sessions(&state.app, pwd).await;
     }
     if deleted > 0 {
         let _ = refresh_credentials_report(&state).await;
@@ -3673,6 +3727,38 @@ async fn api_diagnostics_dpi(Query(query): Query<DpiDiagnosticsQuery>) -> impl I
     }))
 }
 
+fn group_admin_client_row(
+    password: &str,
+    entry: &PasswordEntry,
+    link: String,
+    active_sessions: usize,
+    last_online: i64,
+    server_now: i64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "password": password,
+        "name": entry.name,
+        "expires": entry.expires_at,
+        "up": entry.up_bytes,
+        "down": entry.down_bytes,
+        "active": !entry.is_deactivated && !is_expired(entry),
+        "is_deactivated": entry.is_deactivated,
+        "active_sessions": active_sessions,
+        "last_online": last_online,
+        "presence_window_secs": protocol::PRESENCE_WINDOW_SECS,
+        "server_now": server_now,
+        "ip": if entry.ip.is_empty() { "10.66.67.3" } else { &entry.ip },
+        "device_ip": if entry.ip.is_empty() { "10.66.67.3" } else { &entry.ip },
+        "group_id": entry.group_id,
+        "peer_port": entry.wg_port,
+        "vk_hashes": entry.vk_hashes,
+        "vk_token": entry.vk_token_enabled,
+        "sub_uuid": entry.sub_uuid,
+        "workers": entry.workers.unwrap_or(0),
+        "link": link,
+    })
+}
+
 async fn group_admin_data_get(
     State(state): State<WebState>,
     Path(admin_uuid): Path<String>,
@@ -3694,29 +3780,21 @@ async fn group_admin_data_get(
     let peer_port = state.app.listen.port();
     let effective_vk_token = group.vk_token.as_deref().unwrap_or(&db.vk_access_token);
     let effective_vk_hashes = group.vk_hashes.as_deref().unwrap_or(&db.vk_hashes);
+    let current = now();
     let mut clients = Vec::new();
-    for (_pass, p_entry) in &db.passwords {
+    for (pass, p_entry) in &db.passwords {
         if p_entry.group_id == group.id {
-            let link = make_entry_link(&host, peer_port, _pass, p_entry, effective_vk_token);
-            clients.push(serde_json::json!({
-                "password": _pass,
-                "name": p_entry.name,
-                "expires": p_entry.expires_at,
-                "up": p_entry.up_bytes,
-                "down": p_entry.down_bytes,
-                "active": !p_entry.is_deactivated && !model::is_expired(p_entry),
-                "is_deactivated": p_entry.is_deactivated,
-                "active_sessions": count_active_sessions(&state.app.sessions, _pass),
-                "ip": if p_entry.ip.is_empty() { "10.66.67.3" } else { &p_entry.ip },
-                "device_ip": if p_entry.ip.is_empty() { "10.66.67.3" } else { &p_entry.ip },
-                "group_id": p_entry.group_id,
-                "peer_port": p_entry.wg_port,
-                "vk_hashes": p_entry.vk_hashes,
-                "vk_token": p_entry.vk_token_enabled,
-                "sub_uuid": p_entry.sub_uuid,
-                "workers": p_entry.workers.unwrap_or(0),
-                "link": link,
-            }));
+            let link = make_entry_link(&host, peer_port, pass, p_entry, effective_vk_token);
+            let (active_sessions, live) = live_presence(&state.app.sessions, pass);
+            let (last_online, _) = protocol::presence_view(p_entry.last_online, live, current);
+            clients.push(group_admin_client_row(
+                pass,
+                p_entry,
+                link,
+                active_sessions,
+                last_online,
+                current,
+            ));
         }
     }
     (
@@ -3732,7 +3810,9 @@ async fn group_admin_data_get(
             },
             "clients": clients,
             "server_ip": server_ip,
-            "peer_port": peer_port
+            "peer_port": peer_port,
+            "server_now": current,
+            "presence_window_secs": protocol::PRESENCE_WINDOW_SECS
         })),
     )
         .into_response()
@@ -3782,8 +3862,8 @@ async fn group_admin_settings_post(
         }
     }
     let snapshot = db.clone();
+    submit_snapshot_locked(&state.app, &db, snapshot);
     drop(db);
-    state.app.db_persistence.submit(snapshot);
     let _ = refresh_credentials_report(&state).await;
     (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
 }
@@ -3854,6 +3934,7 @@ async fn group_admin_client_create(
         expires_at,
         down_bytes: 0,
         up_bytes: 0,
+        last_online: 0,
         vk_hash: String::new(),
         ports: String::new(),
         is_deactivated: false,
@@ -3870,8 +3951,8 @@ async fn group_admin_client_create(
     };
     db.passwords.insert(pass.clone(), entry);
     let snapshot = db.clone();
+    submit_snapshot_locked(&state.app, &db, snapshot);
     drop(db);
-    state.app.db_persistence.submit(snapshot);
     if let Err(message) = refresh_credentials_report(&state).await {
         let warning = format!("saved but reload failed: {message}");
         return (
@@ -3918,10 +3999,10 @@ async fn group_admin_client_toggle(
     entry.is_deactivated = !entry.is_deactivated;
     let is_deactivated = entry.is_deactivated;
     let snapshot = db.clone();
+    submit_snapshot_locked(&state.app, &db, snapshot);
     drop(db);
-    state.app.db_persistence.submit(snapshot);
     if is_deactivated {
-        crate::protocol::drop_password_sessions(&state.app, &password);
+        crate::protocol::drop_password_sessions(&state.app, &password).await;
     }
     let _ = refresh_credentials_report(&state).await;
     (
@@ -3962,8 +4043,8 @@ async fn group_admin_client_reset_traffic(
         }
     }
     let snapshot = db.clone();
+    submit_snapshot_locked(&state.app, &db, snapshot);
     drop(db);
-    state.app.db_persistence.submit(snapshot);
     (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
 }
 
@@ -3995,8 +4076,8 @@ async fn group_admin_client_extend(
     entry.expires_at = base.saturating_add(30 * 86400);
     let expires = entry.expires_at;
     let snapshot = db.clone();
+    submit_snapshot_locked(&state.app, &db, snapshot);
     drop(db);
-    state.app.db_persistence.submit(snapshot);
     let _ = refresh_credentials_report(&state).await;
     (
         StatusCode::OK,
@@ -4025,7 +4106,7 @@ async fn group_admin_client_unbind(
         return (StatusCode::FORBIDDEN, "forbidden").into_response();
     }
     drop(db);
-    crate::protocol::drop_password_sessions(&state.app, &password);
+    crate::protocol::drop_password_sessions(&state.app, &password).await;
     crate::protocol::forget_idle_password_epoch(&state.app, &password);
     let _ = refresh_credentials_report(&state).await;
     (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
@@ -4122,8 +4203,8 @@ async fn group_admin_client_update(
         }
     }
     let snapshot = db.clone();
+    submit_snapshot_locked(&state.app, &db, snapshot);
     drop(db);
-    state.app.db_persistence.submit(snapshot);
     let _ = refresh_credentials_report(&state).await;
     (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
 }
@@ -4149,9 +4230,9 @@ async fn group_admin_client_delete(
     }
     db.passwords.remove(&password);
     let snapshot = db.clone();
+    submit_snapshot_locked(&state.app, &db, snapshot);
     drop(db);
-    state.app.db_persistence.submit(snapshot);
-    crate::protocol::drop_password_sessions(&state.app, &password);
+    crate::protocol::drop_password_sessions(&state.app, &password).await;
     let _ = refresh_credentials_report(&state).await;
     (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
 }
@@ -6847,9 +6928,11 @@ const GROUP_ADMIN_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
             display: inline-flex;
             align-items: center;
             gap: 4px;
+            white-space: nowrap;
         }
         .badge.active { background: color-mix(in srgb, var(--success) 12%, transparent); color: var(--success); border: 1px solid color-mix(in srgb, var(--success) 25%, transparent); }
         .badge.inactive { background: color-mix(in srgb, var(--danger) 12%, transparent); color: var(--danger); border: 1px solid color-mix(in srgb, var(--danger) 25%, transparent); }
+        .badge.presence-badge { background: color-mix(in srgb, var(--success) 12%, transparent); color: var(--success); border: 1px solid color-mix(in srgb, var(--success) 25%, transparent); }
         .badge.admin { background: var(--icon-bg); color: var(--primary); border: 1px solid color-mix(in srgb, var(--primary) 25%, transparent); }
         .group-dlg-actions {
             display: flex;
@@ -6913,8 +6996,10 @@ const GROUP_ADMIN_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
             grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
             gap: 14px;
             margin-top: 4px;
+            min-width: 0;
         }
         .client-card {
+            min-width: 0;
             background: var(--surface);
             border: 1px solid var(--border);
             border-radius: 16px;
@@ -6935,21 +7020,74 @@ const GROUP_ADMIN_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
             display: flex;
             justify-content: space-between;
             align-items: center;
+            gap: 8px;
             border-bottom: 1px solid var(--border);
             padding-bottom: 10px;
-            min-height: 32px;
+            min-height: 34px;
+            box-sizing: border-box;
         }
         .client-card-title {
             display: flex;
             align-items: center;
-            gap: 8px;
-            font-weight: 700;
+            gap: 6px;
+            font-weight: 600;
             font-size: 14px;
             color: var(--text-main);
+            min-width: 0;
+            flex: 1;
+        }
+        .client-card-title > span {
             min-width: 0;
             overflow: hidden;
             text-overflow: ellipsis;
             white-space: nowrap;
+        }
+        .client-card-badges {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            flex-shrink: 0;
+            white-space: nowrap;
+        }
+        .client-card-badges .badge {
+            font-size: 11px;
+            font-weight: 500;
+            line-height: 1.2;
+            padding: 2px 7px;
+            border-radius: 20px;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            white-space: nowrap;
+            letter-spacing: 0.01em;
+        }
+        .client-card-badges .badge:not(.presence-badge)::before {
+            display: none;
+        }
+        .client-card-badges .badge.active {
+            background: var(--icon-bg);
+            color: var(--primary);
+            border: 1px solid color-mix(in srgb, var(--primary) 25%, transparent);
+        }
+        .client-card-badges .badge.inactive {
+            background: var(--surface-hover);
+            color: var(--text-muted);
+            border: 1px solid var(--border);
+        }
+        .client-card-badges .badge.presence-badge {
+            background: color-mix(in srgb, var(--success) 12%, transparent);
+            color: var(--success);
+            border: 1px solid color-mix(in srgb, var(--success) 28%, transparent);
+        }
+        .client-card-badges .badge.presence-badge::before {
+            content: '';
+            display: block;
+            width: 5px;
+            height: 5px;
+            border-radius: 50%;
+            background: var(--success);
+            box-shadow: 0 0 4px color-mix(in srgb, var(--success) 60%, transparent);
+            flex-shrink: 0;
         }
         .client-card-body {
             display: flex;
@@ -7205,7 +7343,7 @@ const GROUP_ADMIN_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
             .group-dlg-actions { flex-direction: column; align-items: stretch; gap: 8px; }
             .group-act-btn { width: 100%; justify-content: center; }
             .group-search-wrapper { width: 100%; min-width: 0; }
-            .client-cards-grid { grid-template-columns: 1fr; }
+            .client-cards-grid { grid-template-columns: minmax(0, 1fr); }
             .show-mobile { display: inline-block !important; }
             .hide-mobile { display: none !important; }
             .hub-field-row {
@@ -7451,6 +7589,47 @@ const GROUP_ADMIN_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
 
         const adminUuid = window.location.pathname.split('/').filter(Boolean)[0];
         let currentData = null;
+        let presenceClock = null;
+
+        function updatePresenceClock(serverNow, windowSecs) {
+            serverNow = Number(serverNow) || 0;
+            windowSecs = Number(windowSecs) || 0;
+            if (serverNow > 0 && windowSecs > 0) {
+                presenceClock = { serverNow, windowSecs, receivedAt: Date.now() };
+            }
+        }
+
+        function presenceServerNow() {
+            if (!presenceClock) return null;
+            return presenceClock.serverNow + Math.floor((Date.now() - presenceClock.receivedAt) / 1000);
+        }
+
+        function presenceIsOnline(lastOnline, now) {
+            if (!presenceClock) return false;
+            const t = Number(lastOnline) || 0;
+            return t > 0 && now >= t && (now - t) <= presenceClock.windowSecs;
+        }
+
+        function formatPresenceTime(lastOnline) {
+            const t = Number(lastOnline) || 0;
+            if (t <= 0) return 'нет данных';
+            return new Date(t * 1000).toLocaleString(undefined, { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+        }
+
+        function refreshPresenceBadges() {
+            if (document.hidden) return;
+            const now = presenceServerNow();
+            if (now === null) return;
+            document.querySelectorAll('[data-presence="badge"]').forEach(el => {
+                const last = Number(el.getAttribute('data-last-online')) || 0;
+                el.style.display = presenceIsOnline(last, now) ? '' : 'none';
+            });
+        }
+
+        setInterval(refreshPresenceBadges, 20000);
+        document.addEventListener('visibilitychange', () => {
+            if (!document.hidden) refreshPresenceBadges();
+        });
         let activeClient = null;
 
         function esc(s) {
@@ -7530,6 +7709,7 @@ const GROUP_ADMIN_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
                     return;
                 }
                 currentData = await r.json();
+                updatePresenceClock(currentData.server_now, currentData.presence_window_secs);
                 renderView();
             } catch (e) {
                 document.getElementById('statsSummary').textContent = 'Ошибка сети';
@@ -7565,9 +7745,12 @@ const GROUP_ADMIN_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
                     <div class="client-card-header">
                         <div class="client-card-title">
                             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: var(--primary); flex-shrink: 0;"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>
-                            <span>${esc(c.name || 'Клиент')}</span>
+                            <span title="${esc(c.name || 'Клиент')}">${esc(c.name || 'Клиент')}</span>
                         </div>
-                        <span class="badge ${c.active ? 'active' : 'inactive'}">${c.active ? 'Участник' : 'Неактивно'}</span>
+                        <div class="client-card-badges">
+                            <span class="badge ${c.active ? 'active' : 'inactive'}">${c.active ? 'Участник' : 'Неактивно'}</span>
+                            <span class="badge presence-badge" data-presence="badge" data-last-online="${Number(c.last_online) || 0}" style="display: none;">в сети</span>
+                        </div>
                     </div>
                     <div class="client-card-body">
                         <div class="client-card-row">
@@ -7577,6 +7760,10 @@ const GROUP_ADMIN_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
                         <div class="client-card-row">
                             <span class="client-card-label">Срок действия:</span>
                             <span class="client-card-value">${expiryStr}</span>
+                        </div>
+                        <div class="client-card-row">
+                            <span class="client-card-label">Онлайн:</span>
+                            <span class="client-card-value">${formatPresenceTime(c.last_online)}</span>
                         </div>
                         <div class="client-card-row">
                             <span class="client-card-label">Трафик:</span>
@@ -7595,6 +7782,7 @@ const GROUP_ADMIN_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
                     </div>
                 </div>`;
             }).join('');
+            refreshPresenceBadges();
         }
 
         function handleSearch(val) {
@@ -8545,11 +8733,13 @@ const PANEL_HTML_TEMPLATE: &str = r##"
         .traffic-flex { display: flex; flex-direction: column; gap: 4px; font-family: ui-monospace, SFMono-Regular, 'Cascadia Code', Consolas, monospace; font-size: 13px; }
         .t-up { color: var(--primary); } .t-down { color: var(--primary); }
 
-        .badge { display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px; border-radius: 20px; font-size: 12px; font-weight: 600; }
+        .badge { display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px; border-radius: 20px; font-size: 12px; font-weight: 600; white-space: nowrap; }
         .badge::before { content: ''; display: block; width: 6px; height: 6px; border-radius: 50%; background: var(--primary); }
         .badge.active { background: var(--icon-bg); color: var(--primary); border: 1px solid var(--primary); }
         .badge.inactive { background: var(--surface-hover); color: var(--text-muted); border: 1px solid var(--border); }
         .badge.inactive::before { background: var(--text-muted); }
+        .badge.presence-badge { background: color-mix(in srgb, var(--success) 12%, transparent); color: var(--success); border: 1px solid color-mix(in srgb, var(--success) 25%, transparent); }
+        .badge.presence-badge::before { background: var(--success); }
 
         .actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
         .empty-state { text-align: center; padding: 64px 20px; color: var(--text-muted); }
@@ -8668,8 +8858,10 @@ const PANEL_HTML_TEMPLATE: &str = r##"
             grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
             gap: 16px;
             margin-top: 16px;
+            min-width: 0;
         }
         .client-card {
+            min-width: 0;
             background: var(--surface);
             border: 1px solid var(--border);
             border-radius: 16px;
@@ -8935,22 +9127,75 @@ const PANEL_HTML_TEMPLATE: &str = r##"
             display: flex;
             justify-content: space-between;
             align-items: center;
+            gap: 8px;
             border-bottom: 1px solid var(--border);
             padding-bottom: 10px;
             margin-bottom: 2px;
-            min-height: 40px;
+            min-height: 34px;
+            box-sizing: border-box;
         }
         .client-card-title {
-            font-size: 15px;
-            font-weight: 700;
+            font-size: 14px;
+            font-weight: 600;
             color: var(--text-main);
             display: flex;
             align-items: center;
-            gap: 8px;
+            gap: 6px;
+            min-width: 0;
+            flex: 1;
+        }
+        .client-card-title > span {
             min-width: 0;
             overflow: hidden;
             text-overflow: ellipsis;
             white-space: nowrap;
+        }
+        .client-card-badges {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            flex-shrink: 0;
+            white-space: nowrap;
+        }
+        .client-card-badges .badge {
+            font-size: 11px;
+            font-weight: 500;
+            line-height: 1.2;
+            padding: 2px 7px;
+            border-radius: 20px;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            white-space: nowrap;
+            letter-spacing: 0.01em;
+        }
+        .client-card-badges .badge:not(.presence-badge)::before {
+            display: none;
+        }
+        .client-card-badges .badge.active {
+            background: var(--icon-bg);
+            color: var(--primary);
+            border: 1px solid color-mix(in srgb, var(--primary) 25%, transparent);
+        }
+        .client-card-badges .badge.inactive {
+            background: var(--surface-hover);
+            color: var(--text-muted);
+            border: 1px solid var(--border);
+        }
+        .client-card-badges .badge.presence-badge {
+            background: color-mix(in srgb, var(--success) 12%, transparent);
+            color: var(--success);
+            border: 1px solid color-mix(in srgb, var(--success) 28%, transparent);
+        }
+        .client-card-badges .badge.presence-badge::before {
+            content: '';
+            display: block;
+            width: 5px;
+            height: 5px;
+            border-radius: 50%;
+            background: var(--success);
+            box-shadow: 0 0 4px color-mix(in srgb, var(--success) 60%, transparent);
+            flex-shrink: 0;
         }
         .rule-targets-container {
             max-height: 200px;
@@ -11509,6 +11754,53 @@ const PANEL_HTML_TEMPLATE: &str = r##"
             });
         }
 
+        let presenceClock = null;
+
+        function updatePresenceClock(rows) {
+            let serverNow = 0, windowSecs = 0;
+            for (const row of (rows || [])) {
+                const candidate = Number(row && row.server_now) || 0;
+                if (candidate > serverNow) serverNow = candidate;
+                const win = Number(row && row.presence_window_secs) || 0;
+                if (win > 0) windowSecs = win;
+            }
+            if (serverNow > 0 && windowSecs > 0) {
+                presenceClock = { serverNow, windowSecs, receivedAt: Date.now() };
+            }
+        }
+
+        function presenceServerNow() {
+            if (!presenceClock) return null;
+            return presenceClock.serverNow + Math.floor((Date.now() - presenceClock.receivedAt) / 1000);
+        }
+
+        function presenceIsOnline(lastOnline, now) {
+            if (!presenceClock) return false;
+            const t = Number(lastOnline) || 0;
+            return t > 0 && now >= t && (now - t) <= presenceClock.windowSecs;
+        }
+
+        function formatPresenceTime(lastOnline) {
+            const t = Number(lastOnline) || 0;
+            if (t <= 0) return 'нет данных';
+            return new Date(t * 1000).toLocaleString(undefined, { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+        }
+
+        function refreshPresenceBadges() {
+            if (document.hidden) return;
+            const now = presenceServerNow();
+            if (now === null) return;
+            document.querySelectorAll('[data-presence="badge"]').forEach(el => {
+                const last = Number(el.getAttribute('data-last-online')) || 0;
+                el.style.display = presenceIsOnline(last, now) ? '' : 'none';
+            });
+        }
+
+        setInterval(refreshPresenceBadges, 20000);
+        document.addEventListener('visibilitychange', () => {
+            if (!document.hidden) refreshPresenceBadges();
+        });
+
         window.clientsData = [];
         window.groupsData = [];
         window.routingRulesData = [];
@@ -11533,9 +11825,12 @@ const PANEL_HTML_TEMPLATE: &str = r##"
                 <div class="client-card-header">
                     <div class="client-card-title">
                         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: var(--primary); flex-shrink: 0;"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>
-                        <span>${esc(x.name || 'Клиент')}</span>
+                        <span title="${esc(x.name || 'Клиент')}">${esc(x.name || 'Клиент')}</span>
                     </div>
-                    <span class="badge ${x.active ? "active" : "inactive"}">${x.active ? "Участник" : "Неактивно"}</span>
+                    <div class="client-card-badges">
+                        <span class="badge ${x.active ? "active" : "inactive"}">${x.active ? "Участник" : "Неактивно"}</span>
+                        <span class="badge presence-badge" data-presence="badge" data-last-online="${Number(x.last_online) || 0}" style="display: none;">в сети</span>
+                    </div>
                 </div>
                 <div class="client-card-body">
                     <div class="client-card-row">
@@ -11545,6 +11840,10 @@ const PANEL_HTML_TEMPLATE: &str = r##"
                     <div class="client-card-row">
                         <span class="client-card-label">Срок действия:</span>
                         <span class="client-card-value">${expiryStr}</span>
+                    </div>
+                    <div class="client-card-row">
+                        <span class="client-card-label">Онлайн:</span>
+                        <span class="client-card-value">${formatPresenceTime(x.last_online)}</span>
                     </div>
                     <div class="client-card-row">
                         <span class="client-card-label">Трафик:</span>
@@ -11572,9 +11871,11 @@ const PANEL_HTML_TEMPLATE: &str = r##"
                 <div class="client-card-header">
                     <div class="client-card-title">
                         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: var(--primary); flex-shrink: 0;"><circle cx="12" cy="7" r="3.5"></circle><path d="M6 21v-2a4 4 0 0 1 8 0v2"></path><path d="M5.5 10a3 3 0 0 1 0-6"></path><path d="M2 21v-1.5a3.5 3.5 0 0 1 3-3.4"></path><path d="M18.5 4a3 3 0 0 1 0 6"></path><path d="M19 16.1a3.5 3.5 0 0 1 3 3.4V21"></path></svg>
-                        <span>${esc(g.name || 'Без названия')}</span>
+                        <span title="${esc(g.name || 'Без названия')}">${esc(g.name || 'Без названия')}</span>
                     </div>
-                    <span class="badge active">Группа</span>
+                    <div class="client-card-badges">
+                        <span class="badge active">Группа</span>
+                    </div>
                 </div>
                 <div class="client-card-body">
                     <div class="client-card-row">
@@ -11668,6 +11969,7 @@ const PANEL_HTML_TEMPLATE: &str = r##"
                 if (!groupsHtml && !standaloneHtml) {
                     container.innerHTML = `<div class="empty-state" style="grid-column: 1/-1;">Нет созданных доступов.</div>`;
                 }
+                refreshPresenceBadges();
                 return;
             }
 
@@ -11707,6 +12009,7 @@ const PANEL_HTML_TEMPLATE: &str = r##"
 
             results.sort((a, b) => b.score - a.score);
             container.innerHTML = results.map(r => r.html).join('');
+            refreshPresenceBadges();
         }
 
         let clientsInFlight = false;
@@ -11718,6 +12021,7 @@ const PANEL_HTML_TEMPLATE: &str = r##"
                 if (!rC.ok) return;
                 const a = await rC.json() || [];
                 window.clientsData = a;
+                updatePresenceClock(a);
                 if (a.length > 0 && a[0].peer_port) {
                     window.serverDefaultPeerPort = a[0].peer_port;
                 }
@@ -11730,6 +12034,7 @@ const PANEL_HTML_TEMPLATE: &str = r##"
                 if (window.currentViewingGroupId) {
                     refreshCurrentGroupDlgView();
                 }
+                refreshPresenceBadges();
             } catch (e) {
             } finally {
                 clientsInFlight = false;
@@ -11893,6 +12198,7 @@ const PANEL_HTML_TEMPLATE: &str = r##"
             const query = (document.getElementById('groupSearchInput')?.value || '').trim();
             if (!query) {
                 container.innerHTML = groupClients.map(c => renderClientCard(c)).join('');
+                refreshPresenceBadges();
                 return;
             }
 
@@ -11911,6 +12217,7 @@ const PANEL_HTML_TEMPLATE: &str = r##"
 
             matched.sort((a, b) => b.score - a.score);
             container.innerHTML = matched.map(m => m.html).join('');
+            refreshPresenceBadges();
         }
 
         function openGroupDlg(groupId) {
@@ -13753,16 +14060,193 @@ static PANEL_HTML: LazyLock<String> = LazyLock::new(|| expand_theme_tokens(PANEL
 #[cfg(test)]
 mod tests {
     use super::{
-        CLIENT_SUB_HTML, CreateRoutingRuleRequest, DNS_PROVIDERS, GROUP_ADMIN_HTML, GROUP_SUB_HTML,
-        LOGIN_HTML, MAX_CLIENT_NAME_BYTES, PANEL_HTML, PWA_ICON_192_PNG, PWA_ICON_512_PNG,
-        PWA_MANIFEST, PWA_SERVICE_WORKER, THEME_TOKENS, batch_group_affected_passwords,
-        count_active_sessions, decrypt_csqtt_link, deploy_dns_profile_or_yandex,
-        dns_provider_by_id, dns_provider_id, encrypt_csqtt_link, group_affected_passwords,
-        make_client_link, manual_dns, merge_affected_passwords, normalize_client_vk_hashes,
-        normalize_vk_access_token, process_memory, process_memory_rollup, provider_dns,
-        routing_rule_validation_response, rule_affected_passwords, validate_client_name,
-        validate_proxy_profile_name, validate_workers,
+        CLIENT_SUB_HTML, ClientInfo, CreateRoutingRuleRequest, DNS_PROVIDERS, GROUP_ADMIN_HTML,
+        GROUP_SUB_HTML, LOGIN_HTML, MAX_CLIENT_NAME_BYTES, PANEL_HTML, PWA_ICON_192_PNG,
+        PWA_ICON_512_PNG, PWA_MANIFEST, PWA_SERVICE_WORKER, THEME_TOKENS,
+        batch_group_affected_passwords, count_active_sessions, decrypt_csqtt_link,
+        deploy_dns_profile_or_yandex, dns_provider_by_id, dns_provider_id, encrypt_csqtt_link,
+        group_admin_client_row, group_affected_passwords, make_client_link, manual_dns,
+        merge_affected_passwords, normalize_client_vk_hashes, normalize_vk_access_token,
+        process_memory, process_memory_rollup, provider_dns, routing_rule_validation_response,
+        rule_affected_passwords, validate_client_name, validate_proxy_profile_name,
+        validate_workers,
     };
+
+    #[test]
+    fn client_info_serializes_presence_keys_in_snake_case() {
+        let info = ClientInfo {
+            password: "client1234567890".to_owned(),
+            down: 0,
+            up: 0,
+            expires: 0,
+            active: true,
+            active_sessions: 1,
+            last_online: 1_700_000_000,
+            presence_window_secs: crate::protocol::PRESENCE_WINDOW_SECS,
+            server_now: 1_700_000_010,
+            vk_hash: String::new(),
+            ports: String::new(),
+            ip: String::new(),
+            name: String::new(),
+            vk_hashes: String::new(),
+            vk_token: false,
+            peer_port: 0,
+            local_port: 0,
+            group_id: String::new(),
+            routing_rule_id: String::new(),
+            link: String::new(),
+            sub_uuid: String::new(),
+            workers: None,
+        };
+        let value = serde_json::to_value(info).unwrap();
+        assert_eq!(value["last_online"], 1_700_000_000);
+        assert_eq!(
+            value["presence_window_secs"],
+            crate::protocol::PRESENCE_WINDOW_SECS
+        );
+        assert_eq!(value["server_now"], 1_700_000_010);
+        for camel in ["lastOnline", "presenceWindowSecs", "serverNow"] {
+            assert!(
+                value.get(camel).is_none(),
+                "unexpected camelCase key {camel}"
+            );
+        }
+        assert!(
+            value.get("online").is_none(),
+            "presence flag must not be duplicated in the payload"
+        );
+    }
+
+    #[test]
+    fn group_admin_client_row_carries_presence_contract() {
+        let entry = crate::model::PasswordEntry {
+            ip: "10.66.67.3".to_owned(),
+            name: "Client".to_owned(),
+            ..crate::model::PasswordEntry::default()
+        };
+        let row = group_admin_client_row(
+            "client1234567890",
+            &entry,
+            String::new(),
+            2,
+            1_700_000_000,
+            1_700_000_010,
+        );
+        assert_eq!(row["active_sessions"], 2);
+        assert_eq!(row["last_online"], 1_700_000_000);
+        assert_eq!(
+            row["presence_window_secs"],
+            crate::protocol::PRESENCE_WINDOW_SECS
+        );
+        assert_eq!(row["server_now"], 1_700_000_010);
+        assert!(row.get("online").is_none());
+    }
+
+    #[test]
+    fn panel_snapshots_are_submitted_before_the_db_guard_is_released() {
+        let source = include_str!("web_panel.rs");
+        let production = &source[..source
+            .find("\n#[cfg(test)]\nmod tests")
+            .expect("test module")];
+        let needle = "drop(db);";
+        let mut cursor = 0;
+        while let Some(index) = production[cursor..].find(needle) {
+            let absolute = cursor + index;
+            let after = &production[absolute + needle.len()..];
+            assert!(
+                !after
+                    .trim_start()
+                    .starts_with("state.app.db_persistence.submit"),
+                "snapshot submitted after releasing the database guard"
+            );
+            cursor = absolute + needle.len();
+        }
+        assert!(
+            production
+                .matches("submit_snapshot_locked(&state.app, &db, snapshot)")
+                .count()
+                >= 10,
+            "every full snapshot must be submitted through the guarded helper"
+        );
+    }
+
+    #[test]
+    fn main_client_render_refreshes_presence_badges_on_every_branch() {
+        let template = PANEL_HTML.as_str();
+        let start = template
+            .find("function renderMainClientsCards()")
+            .expect("main client render function");
+        let rest = &template[start..];
+        let end = rest
+            .find("\n        let clientsInFlight")
+            .expect("end of main client render function");
+        let body = &rest[..end];
+        assert!(
+            body.matches("refreshPresenceBadges();").count() >= 2,
+            "both render branches must restore presence badges after rebuilding cards"
+        );
+    }
+
+    #[test]
+    fn presence_templates_use_last_online_and_payload_window() {
+        for (name, template) in [
+            ("panel", PANEL_HTML.as_str()),
+            ("group admin", GROUP_ADMIN_HTML.as_str()),
+        ] {
+            assert!(template.contains("last_online"), "{name}: last_online");
+            assert!(
+                template.contains("presence_window_secs"),
+                "{name}: presence_window_secs"
+            );
+            assert!(template.contains("server_now"), "{name}: server_now");
+            assert!(template.contains("data-last-online"), "{name}: data bridge");
+            assert!(
+                template.contains("[data-presence=\"badge\"]"),
+                "{name}: badge patch target"
+            );
+            assert!(
+                !template.contains(".online"),
+                "{name}: templates must not read a boolean online field"
+            );
+        }
+    }
+
+    #[test]
+    fn client_card_badges_are_compact_and_non_wrapping_in_both_templates() {
+        for (name, template) in [
+            ("panel", PANEL_HTML.as_str()),
+            ("group admin", GROUP_ADMIN_HTML.as_str()),
+        ] {
+            assert!(
+                template.contains(".client-card-badges"),
+                "{name}: dedicated badges wrapper class"
+            );
+            assert!(
+                template.contains(".client-card-badges .badge"),
+                "{name}: compact scoped card badge styling"
+            );
+            assert!(
+                template.contains("white-space: nowrap"),
+                "{name}: badge text must not break onto multiple lines"
+            );
+            assert!(
+                template.contains("min-height: 34px"),
+                "{name}: card header minimum height must be unified"
+            );
+            assert!(
+                template.contains(".client-card-title > span"),
+                "{name}: card title span must truncate with ellipsis"
+            );
+            assert!(
+                template.contains("min-width: 0"),
+                "{name}: client cards must allow flex/grid shrinking without overflow"
+            );
+        }
+        assert!(
+            GROUP_ADMIN_HTML.contains("grid-template-columns: minmax(0, 1fr)"),
+            "group admin mobile grid column must use minmax(0, 1fr) to prevent track expansion"
+        );
+    }
 
     mod api_residual {
         use super::super::{ROUTING_RULE_BODY_LIMIT_BYTES, WEB_BODY_LIMIT_BYTES, panel_router};

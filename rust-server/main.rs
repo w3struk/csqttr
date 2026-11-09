@@ -1352,6 +1352,7 @@ async fn async_main() -> Result<()> {
         eprintln!("[PROXY] shutdown cleanup timed out");
     }
 
+    protocol::drop_all_sessions(&app).await;
     protocol::flush_traffic(&app).await;
     let final_revision = {
         let db = app.db.read().await;
@@ -1368,7 +1369,6 @@ async fn async_main() -> Result<()> {
         Ok(Ok(())) => {}
     }
 
-    protocol::drop_all_sessions(&app);
     match terminal_error {
         Some(error) => Err(error),
         None => Ok(()),

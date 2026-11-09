@@ -3,8 +3,8 @@ use crate::{
     dataplane::{self, DataplaneConfig, DataplaneLogic},
     lock_unpoison, log_event,
     model::{
-        Database, TrafficCounters, TrafficSnapshot, cached_now, derive_wrap_key, get_next_ip,
-        is_expired, now, resolve_session_ip, secret_eq, secret_tag,
+        Database, PasswordEntry, TrafficCounters, TrafficSnapshot, cached_now, derive_wrap_key,
+        get_next_ip, is_expired, now, resolve_session_ip, secret_eq, secret_tag,
     },
     packet::{PACKET_CAPACITY, PacketBuf, PacketBuffer},
     tokio_io::{IoCounters, PacketOutput},
@@ -38,6 +38,8 @@ const CONTROL_EVENT_CAPACITY: usize = 1024;
 const CONTROL_TASK_CAPACITY: usize = 128;
 const DB_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const TRAFFIC_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
+pub const PRESENCE_WINDOW_SECS: i64 = 60;
+const _: () = assert!(TRAFFIC_FLUSH_INTERVAL.as_secs() <= PRESENCE_WINDOW_SECS as u64);
 const SESSION_SETUP_IDLE_MS: u64 = 15_000;
 const SESSION_AUTH_IDLE_MS: u64 = 10 * 60 * 60 * 1_000;
 const PUBLIC_SETUP_GHOST_IDLE_SECS: u64 = 30;
@@ -908,6 +910,7 @@ pub struct Session {
     pub desired_stream_count: AtomicU64,
     pub tunnel_ip: std::sync::Mutex<Option<[u8; 4]>>,
     pub last_seen: AtomicU64,
+    pub last_inbound: AtomicU64,
     pub up_bytes: AtomicU64,
     pub down_bytes: AtomicU64,
     pub created_at: u64,
@@ -940,6 +943,7 @@ impl Session {
             desired_stream_count: AtomicU64::new(0),
             tunnel_ip: std::sync::Mutex::new(None),
             last_seen: AtomicU64::new(wall_now),
+            last_inbound: AtomicU64::new(wall_now),
             up_bytes: AtomicU64::new(0),
             down_bytes: AtomicU64::new(0),
             created_at: wall_now,
@@ -1218,6 +1222,7 @@ pub(crate) struct HotSession {
     worker_id: u16,
     desired_stream_count: u16,
     last_inbound_ms: u64,
+    reported_last_inbound_ms: u64,
     up_total: u64,
     down_total: u64,
     reported_up: u64,
@@ -1279,6 +1284,7 @@ impl HotSession {
             worker_id: 0,
             desired_stream_count: 0,
             last_inbound_ms: monotonic_ms,
+            reported_last_inbound_ms: 0,
             up_total: 0,
             down_total: 0,
             reported_up: 0,
@@ -1357,6 +1363,13 @@ impl HotSession {
             .public
             .last_seen
             .store(wall_now, Ordering::Relaxed);
+        if self.last_inbound_ms != self.reported_last_inbound_ms {
+            self.cold
+                .public
+                .last_inbound
+                .store(wall_now, Ordering::Relaxed);
+            self.reported_last_inbound_ms = self.last_inbound_ms;
+        }
         #[cfg(feature = "diagnostics")]
         {
             let generation = self.cold.public.stream_debug.generation();
@@ -1629,6 +1642,7 @@ enum ControlEvent {
 pub struct ProtocolRuntime {
     dataplane: Option<dataplane::DataplaneRuntime<ProtocolCommand>>,
     control_task: tokio::task::JoinHandle<()>,
+    teardown_task: tokio::task::JoinHandle<()>,
     status: tokio::sync::watch::Receiver<Option<String>>,
 }
 
@@ -1640,6 +1654,15 @@ impl ProtocolRuntime {
     pub async fn shutdown(mut self) -> Result<()> {
         self.control_task.abort();
         let _ = tokio::time::timeout(Duration::from_millis(500), &mut self.control_task).await;
+        // The aborted control loop drops the teardown sender, so the worker
+        // drains every queued session before this returns.
+        if tokio::time::timeout(Duration::from_secs(6), &mut self.teardown_task)
+            .await
+            .is_err()
+        {
+            self.teardown_task.abort();
+            eprintln!("[DB] session teardown fold timed out during shutdown");
+        }
         if let Some(runtime) = self.dataplane.take() {
             runtime.shutdown()?;
         }
@@ -1711,13 +1734,16 @@ pub async fn start(app: Arc<App>) -> Result<ProtocolRuntime> {
     app.dataplane
         .set(runtime.handle())
         .map_err(|_| anyhow!("dataplane handle already initialized"))?;
+    let (teardown_tx, teardown_rx) = mpsc::unbounded_channel();
+    let teardown_task = tokio::spawn(session_teardown_worker(app.clone(), teardown_rx));
     let control_app = app.clone();
     let control_task = tokio::spawn(async move {
-        control_loop(control_app, control_rx).await;
+        control_loop(control_app, control_rx, teardown_tx).await;
     });
     Ok(ProtocolRuntime {
         dataplane: Some(runtime),
         control_task,
+        teardown_task,
         status,
     })
 }
@@ -1789,7 +1815,7 @@ pub fn forget_idle_password_epoch(app: &Arc<App>, password: &str) {
     });
 }
 
-pub fn drop_password_sessions(app: &Arc<App>, password: &str) {
+pub async fn drop_password_sessions(app: &Arc<App>, password: &str) -> u64 {
     let _ = command(
         app,
         ProtocolCommand::DropPassword {
@@ -1802,17 +1828,20 @@ pub fn drop_password_sessions(app: &Arc<App>, password: &str) {
         .filter(|entry| entry.value().password == password)
         .map(|entry| *entry.key())
         .collect::<Vec<_>>();
+    let mut removed = Vec::new();
     for session_id in candidates {
         if let Some((_, session)) = app
             .sessions
             .remove_if(&session_id, |_, current| current.id == session_id)
         {
             session.cancel_token.cancel();
+            removed.push(session);
         }
     }
+    fold_sessions_activity(app, &removed).await
 }
 
-pub fn drop_all_sessions(app: &Arc<App>) {
+pub async fn drop_all_sessions(app: &Arc<App>) -> u64 {
     let ids = app
         .sessions
         .iter()
@@ -1821,10 +1850,16 @@ pub fn drop_all_sessions(app: &Arc<App>) {
     for session_id in ids {
         let _ = command(app, ProtocolCommand::DropSession { session_id });
     }
-    for entry in app.sessions.iter() {
-        entry.value().cancel_token.cancel();
+    let sessions = app
+        .sessions
+        .iter()
+        .map(|entry| entry.value().clone())
+        .collect::<Vec<_>>();
+    for session in &sessions {
+        session.cancel_token.cancel();
     }
     app.sessions.clear();
+    fold_sessions_activity(app, &sessions).await
 }
 
 pub fn notify_panel_restart(app: &Arc<App>) -> Result<()> {
@@ -4268,13 +4303,31 @@ fn getconf_reconnect_action_hot(
     }
 }
 
-async fn control_loop(app: Arc<App>, mut receiver: mpsc::Receiver<ControlEvent>) {
+async fn session_teardown_worker(
+    app: Arc<App>,
+    mut receiver: mpsc::UnboundedReceiver<Arc<Session>>,
+) {
+    let mut batch = Vec::new();
+    while let Some(session) = receiver.recv().await {
+        batch.push(session);
+        while let Ok(session) = receiver.try_recv() {
+            batch.push(session);
+        }
+        fold_sessions_activity(&app, &batch).await;
+        batch.clear();
+    }
+}
+
+async fn control_loop(
+    app: Arc<App>,
+    mut receiver: mpsc::Receiver<ControlEvent>,
+    teardown_tx: mpsc::UnboundedSender<Arc<Session>>,
+) {
     let mut last_io = IoCounters::default();
     let jobs = Arc::new(Semaphore::new(CONTROL_TASK_CAPACITY));
     while let Some(event) = receiver.recv().await {
         match event {
             ControlEvent::SessionCreated(session) => {
-                prune_public_sessions(&app, now().max(0) as u64);
                 if let Some((_, old)) = app.sessions.remove(&session.id) {
                     old.cancel_token.cancel();
                 }
@@ -4309,6 +4362,7 @@ async fn control_loop(app: Arc<App>, mut receiver: mpsc::Receiver<ControlEvent>)
                         "SESSION",
                         &format!("Closed session for {address}: {reason}"),
                     );
+                    let _ = teardown_tx.send(session);
                 }
             }
             ControlEvent::Payload {
@@ -5876,52 +5930,157 @@ pub async fn handle_disconnect(
     )
     .map_err(|_| "DENIED:server_busy")?;
     let mut removed = 0usize;
+    let mut detached = Vec::new();
     for session_id in candidates {
         if let Some((_, session)) = app.sessions.remove_if(&session_id, |_, current| {
             current.id == session_id
                 && (current.id == requester.id || secret_eq(&current.password, effective_password))
         }) {
             session.cancel_token.cancel();
+            detached.push(session);
             removed += 1;
         }
     }
+    fold_sessions_activity(app, &detached).await;
     Ok(removed)
 }
 
-#[inline(always)]
-pub async fn flush_traffic(app: &Arc<App>) {
-    let Ok(mut db) = db_write(app).await else {
-        return;
+pub fn presence_time(last_inbound: u64, now: i64) -> i64 {
+    if last_inbound == 0 {
+        return 0;
+    }
+    let Ok(last_inbound) = i64::try_from(last_inbound) else {
+        return 0;
     };
-    let mut traffic = TrafficSnapshot::default();
-    for entry in app.sessions.iter() {
-        let session = entry.value();
-        let up = session.up_bytes.swap(0, Ordering::Relaxed);
-        let down = session.down_bytes.swap(0, Ordering::Relaxed);
-        if up == 0 && down == 0 {
-            continue;
-        }
-        if let Some(password) = db.passwords.get_mut(&session.password) {
-            password.up_bytes = password.up_bytes.saturating_add(up as i64);
-            password.down_bytes = password.down_bytes.saturating_add(down as i64);
+    let current = now.max(0);
+    if last_inbound > current {
+        return if last_inbound.saturating_sub(current) > PRESENCE_WINDOW_SECS {
+            0
+        } else {
+            current
+        };
+    }
+    last_inbound
+}
+
+pub fn client_is_online(last_online: i64, now: i64) -> bool {
+    last_online > 0 && now >= last_online && now.saturating_sub(last_online) <= PRESENCE_WINDOW_SECS
+}
+
+pub fn presence_view(persisted: i64, live: u64, now: i64) -> (i64, bool) {
+    let current = now.max(0);
+    let persisted = presence_time(persisted.max(0) as u64, current);
+    let live = presence_time(live, current);
+    let last_online = persisted.max(live);
+    (last_online, client_is_online(last_online, current))
+}
+
+pub fn apply_session_activity(
+    entry: &mut PasswordEntry,
+    up: i64,
+    down: i64,
+    last_online: i64,
+) -> bool {
+    let mut changed = false;
+    if up != 0 {
+        entry.up_bytes = entry.up_bytes.saturating_add(up);
+        changed = true;
+    }
+    if down != 0 {
+        entry.down_bytes = entry.down_bytes.saturating_add(down);
+        changed = true;
+    }
+    if last_online > entry.last_online {
+        entry.last_online = last_online;
+        changed = true;
+    }
+    changed
+}
+
+fn fold_session_activity(
+    db: &mut Database,
+    session: &Session,
+    current: i64,
+    traffic: &mut TrafficSnapshot,
+) {
+    let up = session.up_bytes.swap(0, Ordering::Relaxed) as i64;
+    let down = session.down_bytes.swap(0, Ordering::Relaxed) as i64;
+    let last_online = presence_time(session.last_inbound.load(Ordering::Relaxed), current);
+    let is_main = secret_eq(&session.password, &db.main_password);
+
+    if let Some(entry) = db.passwords.get_mut(&session.password) {
+        if apply_session_activity(entry, up, down, last_online) {
             traffic.passwords.insert(
                 session.password.clone(),
                 TrafficCounters {
-                    up_bytes: password.up_bytes,
-                    down_bytes: password.down_bytes,
+                    up_bytes: entry.up_bytes,
+                    down_bytes: entry.down_bytes,
+                    last_online: entry.last_online,
                 },
             );
-        } else if session.password == db.main_password {
-            db.main_up_bytes = db.main_up_bytes.saturating_add(up as i64);
-            db.main_down_bytes = db.main_down_bytes.saturating_add(down as i64);
-            traffic.main = Some(TrafficCounters {
-                up_bytes: db.main_up_bytes,
-                down_bytes: db.main_down_bytes,
-            });
         }
+    } else if is_main && (up != 0 || down != 0) {
+        db.main_up_bytes = db.main_up_bytes.saturating_add(up);
+        db.main_down_bytes = db.main_down_bytes.saturating_add(down);
+        traffic.main = Some(TrafficCounters {
+            up_bytes: db.main_up_bytes,
+            down_bytes: db.main_down_bytes,
+            last_online: db.main_last_online,
+        });
     }
+
+    if is_main && last_online > db.main_last_online {
+        db.main_last_online = last_online;
+        traffic.main = Some(TrafficCounters {
+            up_bytes: db.main_up_bytes,
+            down_bytes: db.main_down_bytes,
+            last_online: db.main_last_online,
+        });
+    }
+}
+
+fn submit_traffic_locked(
+    app: &Arc<App>,
+    _guard: &RwLockWriteGuard<'_, Database>,
+    traffic: TrafficSnapshot,
+) -> u64 {
+    app.db_persistence.submit_traffic(traffic)
+}
+
+async fn fold_sessions_activity(app: &Arc<App>, sessions: &[Arc<Session>]) -> u64 {
+    if sessions.is_empty() {
+        return 0;
+    }
+    let Ok(mut db) = db_write(app).await else {
+        eprintln!("[DB] WARN session cleanup skipped: database write lock unavailable");
+        return 0;
+    };
+    let current = now();
+    let mut traffic = TrafficSnapshot::default();
+    for session in sessions {
+        fold_session_activity(&mut db, session, current, &mut traffic);
+    }
+    // The guard keeps a concurrent reset from queueing its snapshot first.
+    let revision = submit_traffic_locked(app, &db, traffic);
     drop(db);
-    app.db_persistence.submit_traffic(traffic);
+    revision
+}
+
+#[inline(always)]
+pub async fn flush_traffic(app: &Arc<App>) -> u64 {
+    let Ok(mut db) = db_write(app).await else {
+        eprintln!("[DB] WARN traffic flush skipped: database write lock unavailable");
+        return 0;
+    };
+    let current = now();
+    let mut traffic = TrafficSnapshot::default();
+    for entry in app.sessions.iter() {
+        fold_session_activity(&mut db, entry.value(), current, &mut traffic);
+    }
+    // Same ordering rule as fold_sessions_activity.
+    let revision = submit_traffic_locked(app, &db, traffic);
+    drop(db);
+    revision
 }
 
 pub(crate) fn refresh_monotonic_millis() -> u64 {
@@ -5966,14 +6125,15 @@ pub async fn session_janitor(app: Arc<App>) {
             last_traffic_flush = Instant::now();
         }
         let current_wall = wall_clock();
-        prune_public_sessions(&app, current_wall);
+        prune_public_sessions(&app, current_wall).await;
         if app.sessions.len().saturating_mul(4) < app.sessions.capacity() {
             app.sessions.shrink_to_fit();
         }
     }
 }
 
-fn prune_public_sessions(app: &Arc<App>, current_wall: u64) {
+async fn prune_public_sessions(app: &Arc<App>, current_wall: u64) {
+    let mut detached = Vec::new();
     let stale_public = app
         .sessions
         .iter()
@@ -5994,32 +6154,34 @@ fn prune_public_sessions(app: &Arc<App>, current_wall: u64) {
             .remove_if(&session_id, |_, session| session.id == session_id)
         {
             removed.cancel_token.cancel();
+            detached.push(removed);
         }
     }
     let overflow = app.sessions.len().saturating_sub(PUBLIC_SESSION_LIMIT);
-    if overflow == 0 {
-        return;
-    }
-    let mut inactive = app
-        .sessions
-        .iter()
-        .filter(|entry| !entry.value().has_tunnel.load(Ordering::Acquire))
-        .map(|entry| {
-            (
-                entry.value().last_seen.load(Ordering::Acquire),
-                entry.value().id,
-            )
-        })
-        .collect::<Vec<_>>();
-    inactive.sort_unstable();
-    for (_, session_id) in inactive.into_iter().take(overflow) {
-        if let Some((_, removed)) = app
+    if overflow > 0 {
+        let mut inactive = app
             .sessions
-            .remove_if(&session_id, |_, session| session.id == session_id)
-        {
-            removed.cancel_token.cancel();
+            .iter()
+            .filter(|entry| !entry.value().has_tunnel.load(Ordering::Acquire))
+            .map(|entry| {
+                (
+                    entry.value().last_seen.load(Ordering::Acquire),
+                    entry.value().id,
+                )
+            })
+            .collect::<Vec<_>>();
+        inactive.sort_unstable();
+        for (_, session_id) in inactive.into_iter().take(overflow) {
+            if let Some((_, removed)) = app
+                .sessions
+                .remove_if(&session_id, |_, session| session.id == session_id)
+            {
+                removed.cancel_token.cancel();
+                detached.push(removed);
+            }
         }
     }
+    fold_sessions_activity(app, &detached).await;
 }
 
 async fn run_password_janitor_cycle(app: &Arc<App>) {
@@ -6046,7 +6208,7 @@ async fn run_password_janitor_cycle(app: &Arc<App>) {
             app.db_persistence.submit(db.clone());
         }
         app.derived_keys.remove(&password);
-        drop_password_sessions(app, &password);
+        drop_password_sessions(app, &password).await;
         credentials_changed = true;
     }
     if credentials_changed {
@@ -6155,6 +6317,555 @@ mod tests {
 
     fn fixture_wire() -> Vec<u8> {
         hex::decode(crate::wire_protocol::CLIENT_GETCONF_AUDIO_FIXTURE).unwrap()
+    }
+
+    struct NullSink;
+
+    impl PacketOutput for NullSink {
+        fn client_data_headroom(&self, _: usize, _: usize, _: usize) -> usize {
+            0
+        }
+
+        fn send_udp_prioritized<F>(
+            &mut self,
+            _: SocketAddr,
+            _: Option<IpAddr>,
+            _: bool,
+            _: bool,
+            _: F,
+        ) -> bool
+        where
+            F: FnOnce(&mut PacketBuf) -> bool,
+        {
+            false
+        }
+
+        fn send_udp_client_with_headroom<F>(
+            &mut self,
+            _: usize,
+            _: SocketAddr,
+            _: Option<IpAddr>,
+            _: bool,
+            _: bool,
+            _: usize,
+            _: F,
+        ) -> bool
+        where
+            F: FnOnce(&mut PacketBuf) -> bool,
+        {
+            false
+        }
+
+        fn request_udp_flush(&mut self) {}
+
+        fn write_tun(&mut self, _: &[u8]) -> bool {
+            false
+        }
+    }
+
+    fn encode_client_packet(password: &str, seq: u16, plain: &[u8]) -> Vec<u8> {
+        let key = derive_wrap_key(password).unwrap();
+        let aes = make_aes_key(&key);
+        let hmac = make_hmac_key(&key);
+        let ssrc = 0x4353_5154u32;
+        let timestamp = 0u32;
+        let mut wire = vec![0u8; 12];
+        wire[0] = 0x80;
+        wire[1] = 111;
+        wire[2..4].copy_from_slice(&seq.to_be_bytes());
+        wire[4..8].copy_from_slice(&timestamp.to_be_bytes());
+        wire[8..12].copy_from_slice(&ssrc.to_be_bytes());
+        wire.extend_from_slice(plain);
+        let iv = build_srtp_iv(ssrc, seq, timestamp);
+        let mut cipher = aes_ctr(&aes, &iv);
+        cipher.apply_keystream(&mut wire[12..]);
+        let mut mac = hmac.clone();
+        mac.update(&wire);
+        wire.extend_from_slice(&mac.finalize().into_bytes()[..10]);
+        wire
+    }
+
+    fn force_tick(engine: &mut ProtocolEngine) {
+        engine.last_session_maintenance_ms = 0;
+        engine.on_tick(&mut NullSink);
+    }
+
+    fn wall_seconds() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    async fn presence_test_app(mut db: Database) -> Arc<App> {
+        let _ = db.repair_stale_password_bindings();
+        let config_dir = std::env::temp_dir()
+            .join("csqtt-presence-tests")
+            .join(format!(
+                "{}-{}",
+                std::process::id(),
+                crate::model::random_token(12)
+            ));
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let db_persistence = crate::model::DatabasePersistence::new(config_dir.clone()).unwrap();
+        let revision = db_persistence.submit(db.clone());
+        db_persistence.wait(revision).await.unwrap();
+        let (auto_restart_interval_tx, _) =
+            tokio::sync::watch::channel(db.auto_restart_interval_hours());
+        Arc::new(App {
+            dns: tokio::sync::RwLock::new(db.dns.clone()),
+            startup_main_password: db.main_password.clone(),
+            db: tokio::sync::RwLock::new(db),
+            db_persistence,
+            log_file_path: config_dir.join("csqtt.log"),
+            config_dir,
+            listen: "127.0.0.1:0".parse().unwrap(),
+            web_port: 0,
+            web_user: "test".to_owned(),
+            web_pass: "presence-test-key".to_owned(),
+            web_secret_path: String::new(),
+            public_ip: Default::default(),
+            secure_cookie: false,
+            sessions: Default::default(),
+            password_epochs: Default::default(),
+            web_sessions: Default::default(),
+            login_limits: Default::default(),
+            web_auth_admission: Default::default(),
+            bytes_from_client: Default::default(),
+            bytes_to_client: Default::default(),
+            total_connections: Default::default(),
+            cpu_percent: Default::default(),
+            cpu_cores: Default::default(),
+            started: now(),
+            derived_keys: Default::default(),
+            logs: Default::default(),
+            logging_active: Default::default(),
+            stream_debug_active: Default::default(),
+            proxy_route: Default::default(),
+            proxy_operation: Default::default(),
+            proxy_trigger: Default::default(),
+            proxy_port_listening: Default::default(),
+            proxy_health_error: Default::default(),
+            memory_trim_gate: Default::default(),
+            memory_trim_count: Default::default(),
+            memory_trim_last_unix: Default::default(),
+            auto_restart_interval_tx,
+            restart_pending: Default::default(),
+            dataplane: Default::default(),
+        })
+    }
+
+    #[test]
+    fn keepalive_through_engine_advances_published_presence() {
+        let (mut engine, _events) = fixture_engine("wire-password");
+        engine.begin_batch(Instant::now());
+        let peer = SocketAddr::from(([198, 51, 100, 40], 46000));
+        let wire = fixture_wire();
+        let seq = u16::from_be_bytes([wire[2], wire[3]]);
+        let mut initial = wire.clone();
+        engine.on_udp(peer, None, &mut initial, &mut NullSink);
+        assert_eq!(engine.sessions.len(), 1);
+        let public = engine.sessions.iter().next().unwrap().1.cold.public.clone();
+        engine.started = Instant::now() - Duration::from_secs(2);
+        force_tick(&mut engine);
+        let first = public.last_inbound.load(Ordering::Relaxed);
+        assert!(first > 0, "creation must publish a presence timestamp");
+
+        std::thread::sleep(Duration::from_millis(1100));
+        engine.begin_batch(Instant::now());
+        let mut keepalive =
+            encode_client_packet("wire-password", seq.wrapping_add(1), b"keepalive");
+        engine.on_udp(peer, None, &mut keepalive, &mut NullSink);
+        let before = wall_seconds();
+        force_tick(&mut engine);
+        let after = wall_seconds();
+        let second = public.last_inbound.load(Ordering::Relaxed);
+        assert!(
+            second > first,
+            "keepalive must advance presence: first={first} second={second}"
+        );
+        assert!(
+            (before..=after).contains(&second),
+            "presence must equal server wall seconds: before={before} second={second} after={after}"
+        );
+    }
+
+    #[test]
+    fn silent_session_does_not_advance_presence() {
+        let (mut engine, _events) = fixture_engine("wire-password");
+        engine.begin_batch(Instant::now());
+        let peer = SocketAddr::from(([198, 51, 100, 41], 46000));
+        let mut wire = fixture_wire();
+        engine.on_udp(peer, None, &mut wire, &mut NullSink);
+        let public = engine.sessions.iter().next().unwrap().1.cold.public.clone();
+        engine.started = Instant::now() - Duration::from_secs(2);
+        force_tick(&mut engine);
+        let ghost = 1u64;
+        public.last_inbound.store(ghost, Ordering::Relaxed);
+        force_tick(&mut engine);
+        force_tick(&mut engine);
+        assert_eq!(
+            public.last_inbound.load(Ordering::Relaxed),
+            ghost,
+            "ticks without inbound packets must not refresh presence"
+        );
+        assert!(!client_is_online(ghost as i64, now()));
+    }
+
+    #[tokio::test]
+    async fn flush_persists_presence_without_byte_delta() {
+        let mut db = Database {
+            main_password: "owner12345678901".to_owned(),
+            ..Database::default()
+        };
+        db.passwords.insert(
+            "client1234567890".to_owned(),
+            PasswordEntry {
+                ip: "10.66.67.3".to_owned(),
+                name: "Client".to_owned(),
+                ..PasswordEntry::default()
+            },
+        );
+        let app = presence_test_app(db).await;
+        let current = now().max(0) as u64;
+        let debug = Arc::new(AtomicBool::new(false));
+        let client = Session::new(
+            1,
+            SocketAddr::from(([198, 51, 100, 42], 46000)),
+            "client1234567890",
+            1,
+            "salt-client",
+            false,
+            debug.clone(),
+            current,
+        );
+        client.last_inbound.store(current, Ordering::Relaxed);
+        app.sessions.insert(1, client);
+        let owner = Session::new(
+            2,
+            SocketAddr::from(([198, 51, 100, 43], 46000)),
+            "owner12345678901",
+            1,
+            "salt-owner",
+            false,
+            debug,
+            current,
+        );
+        owner.last_inbound.store(current, Ordering::Relaxed);
+        app.sessions.insert(2, owner);
+
+        let revision = flush_traffic(&app).await;
+        assert!(revision > 0, "presence-only flush must reach persistence");
+        app.db_persistence.wait(revision).await.unwrap();
+        let restored = crate::model::load_database(&app.config_dir).unwrap();
+        assert_eq!(
+            restored.passwords["client1234567890"].last_online,
+            current as i64
+        );
+        assert_eq!(restored.main_last_online, current as i64);
+        let _ = std::fs::remove_dir_all(&app.config_dir);
+    }
+
+    #[test]
+    fn presence_view_keeps_time_and_flag_consistent() {
+        let now = 1_000_000i64;
+        let samples = [
+            -5,
+            0,
+            now - 61,
+            now - 60,
+            now,
+            now + 30,
+            now + 60,
+            now + 61,
+            i64::MAX,
+        ];
+        for persisted in samples {
+            for live in [0u64, (now - 1).max(0) as u64] {
+                let (time, online) = presence_view(persisted, live, now);
+                assert_eq!(
+                    client_is_online(time, now),
+                    online,
+                    "persisted={persisted} live={live} time={time}"
+                );
+            }
+        }
+        assert_eq!(presence_view(now + 61, 0, now), (0, false));
+        assert_eq!(presence_view(now + 60, 0, now), (now, true));
+        assert_eq!(presence_view(now - 60, 0, now), (now - 60, true));
+        assert_eq!(presence_view(now - 61, 0, now), (now - 61, false));
+        assert_eq!(presence_view(0, (now - 5) as u64, now), (now - 5, true));
+        assert_eq!(
+            presence_view(now - 30, (now - 10) as u64, now),
+            (now - 10, true)
+        );
+    }
+
+    #[tokio::test]
+    async fn short_session_presence_survives_reload_through_teardown_fold() {
+        let mut db = Database {
+            main_password: "owner12345678901".to_owned(),
+            ..Database::default()
+        };
+        db.passwords.insert(
+            "client1234567890".to_owned(),
+            PasswordEntry {
+                ip: "10.66.67.3".to_owned(),
+                name: "Client".to_owned(),
+                ..PasswordEntry::default()
+            },
+        );
+        let app = presence_test_app(db).await;
+        let current = now().max(0) as u64;
+        let session = Session::new(
+            1,
+            SocketAddr::from(([198, 51, 100, 60], 46000)),
+            "client1234567890",
+            1,
+            "salt-short",
+            false,
+            Arc::new(AtomicBool::new(false)),
+            current,
+        );
+        session.last_inbound.store(current, Ordering::Relaxed);
+        app.sessions.insert(1, session);
+
+        let revision = drop_password_sessions(&app, "client1234567890").await;
+        assert!(revision > 0, "teardown fold must persist presence");
+        app.db_persistence.wait(revision).await.unwrap();
+
+        let restored = crate::model::load_database(&app.config_dir).unwrap();
+        assert_eq!(
+            restored.passwords["client1234567890"].last_online,
+            current as i64
+        );
+        let _ = std::fs::remove_dir_all(&app.config_dir);
+    }
+
+    #[test]
+    fn traffic_snapshots_are_submitted_before_the_db_guard_is_released() {
+        let source = include_str!("protocol.rs");
+        for function in [
+            "async fn fold_sessions_activity",
+            "pub async fn flush_traffic",
+        ] {
+            let start = source.find(function).expect(function);
+            let rest = &source[start..];
+            let end = rest.find("\n}\n").expect("function end");
+            let body = &rest[..end];
+            let submit = body
+                .find("submit_traffic_locked")
+                .unwrap_or_else(|| panic!("{function} must submit through submit_traffic_locked"));
+            let unlock = body.find("drop(db)").expect("explicit unlock");
+            assert!(
+                submit < unlock,
+                "{function} must enqueue traffic before releasing the database guard"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn session_closed_event_folds_presence() {
+        let mut db = Database {
+            main_password: "owner12345678901".to_owned(),
+            ..Database::default()
+        };
+        db.passwords.insert(
+            "client1234567890".to_owned(),
+            PasswordEntry {
+                ip: "10.66.67.3".to_owned(),
+                name: "Client".to_owned(),
+                ..PasswordEntry::default()
+            },
+        );
+        let app = presence_test_app(db).await;
+        let current = now().max(0) as u64;
+        let peer = SocketAddr::from(([198, 51, 100, 80], 46000));
+        let session = Session::new(
+            1,
+            peer,
+            "client1234567890",
+            1,
+            "salt-closed",
+            false,
+            Arc::new(AtomicBool::new(false)),
+            current,
+        );
+        session.last_inbound.store(current, Ordering::Relaxed);
+        app.sessions.insert(1, session);
+
+        let (tx, rx) = mpsc::channel(8);
+        let (teardown_tx, teardown_rx) = mpsc::unbounded_channel();
+        let teardown = tokio::spawn(session_teardown_worker(app.clone(), teardown_rx));
+        let control = tokio::spawn(control_loop(app.clone(), rx, teardown_tx));
+        tx.send(ControlEvent::SessionClosed {
+            address: peer,
+            session_id: 1,
+            reason: "test-close",
+        })
+        .await
+        .unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if app.db.read().await.passwords["client1234567890"].last_online == current as i64 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "SessionClosed must fold the final presence"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(1), control).await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), teardown).await;
+        let _ = std::fs::remove_dir_all(&app.config_dir);
+    }
+
+    #[tokio::test]
+    async fn teardown_worker_drains_after_sender_drop() {
+        let mut db = Database {
+            main_password: "owner12345678901".to_owned(),
+            ..Database::default()
+        };
+        db.passwords.insert(
+            "client1234567890".to_owned(),
+            PasswordEntry {
+                ip: "10.66.67.3".to_owned(),
+                name: "Client".to_owned(),
+                ..PasswordEntry::default()
+            },
+        );
+        let app = presence_test_app(db).await;
+        let current = now().max(0) as u64;
+        let session = Session::new(
+            1,
+            SocketAddr::from(([198, 51, 100, 81], 46000)),
+            "client1234567890",
+            1,
+            "salt-drain",
+            false,
+            Arc::new(AtomicBool::new(false)),
+            current,
+        );
+        session.last_inbound.store(current, Ordering::Relaxed);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let worker = tokio::spawn(session_teardown_worker(app.clone(), rx));
+        tx.send(session).unwrap();
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .expect("teardown worker must drain queued sessions after sender drop")
+            .unwrap();
+        assert_eq!(
+            app.db.read().await.passwords["client1234567890"].last_online,
+            current as i64
+        );
+        let _ = std::fs::remove_dir_all(&app.config_dir);
+    }
+
+    #[tokio::test]
+    async fn drop_all_sessions_folds_final_activity() {
+        let mut db = Database {
+            main_password: "owner12345678901".to_owned(),
+            ..Database::default()
+        };
+        db.passwords.insert(
+            "client1234567890".to_owned(),
+            PasswordEntry {
+                ip: "10.66.67.3".to_owned(),
+                name: "Client".to_owned(),
+                ..PasswordEntry::default()
+            },
+        );
+        let app = presence_test_app(db).await;
+        let current = now().max(0) as u64;
+        let session = Session::new(
+            1,
+            SocketAddr::from(([198, 51, 100, 82], 46000)),
+            "client1234567890",
+            1,
+            "salt-drop-all",
+            false,
+            Arc::new(AtomicBool::new(false)),
+            current,
+        );
+        session.up_bytes.store(10, Ordering::Relaxed);
+        session.down_bytes.store(20, Ordering::Relaxed);
+        session.last_inbound.store(current, Ordering::Relaxed);
+        app.sessions.insert(1, session);
+
+        let before = app.db_persistence.next_revision_for_test();
+        let revision = drop_all_sessions(&app).await;
+        let after = app.db_persistence.next_revision_for_test();
+        assert_eq!(after - before, 1, "drop_all_sessions must fold once");
+        assert!(revision > 0);
+        assert!(app.sessions.is_empty());
+        app.db_persistence.wait(revision).await.unwrap();
+
+        let restored = crate::model::load_database(&app.config_dir).unwrap();
+        let entry = &restored.passwords["client1234567890"];
+        assert_eq!((entry.up_bytes, entry.down_bytes), (10, 20));
+        assert_eq!(entry.last_online, current as i64);
+        let _ = std::fs::remove_dir_all(&app.config_dir);
+    }
+
+    #[tokio::test]
+    async fn one_fold_submission_covers_a_batch_of_ghosts() {
+        let count = 8usize;
+        let mut db = Database {
+            main_password: "owner12345678901".to_owned(),
+            ..Database::default()
+        };
+        let current = now().max(0) as u64;
+        let base = current.saturating_sub(100);
+        let debug = Arc::new(AtomicBool::new(false));
+        let mut sessions = Vec::new();
+        let mut expected = Vec::new();
+        for index in 0..count {
+            let password = format!("client{index:010}");
+            db.passwords.insert(
+                password.clone(),
+                PasswordEntry {
+                    ip: format!("10.66.67.{}", 3 + index),
+                    name: format!("Client {index}"),
+                    ..PasswordEntry::default()
+                },
+            );
+            let session = Session::new(
+                index as u64 + 1,
+                SocketAddr::from(([198, 51, 100, 70 + index as u8], 46000)),
+                &password,
+                1,
+                "salt-ghost",
+                false,
+                debug.clone(),
+                current,
+            );
+            session
+                .last_inbound
+                .store(base + index as u64, Ordering::Relaxed);
+            sessions.push(session);
+            expected.push((password, (base + index as u64) as i64));
+        }
+        let app = presence_test_app(db).await;
+        let before = app.db_persistence.next_revision_for_test();
+        let revision = fold_sessions_activity(&app, &sessions).await;
+        let after = app.db_persistence.next_revision_for_test();
+        assert_eq!(
+            after - before,
+            1,
+            "a batch of ghosts must produce exactly one persistence submission"
+        );
+        assert!(revision > 0);
+        app.db_persistence.wait(revision).await.unwrap();
+
+        let restored = crate::model::load_database(&app.config_dir).unwrap();
+        for (password, timestamp) in expected {
+            assert_eq!(restored.passwords[&password].last_online, timestamp);
+        }
+        let _ = std::fs::remove_dir_all(&app.config_dir);
     }
 
     #[test]
