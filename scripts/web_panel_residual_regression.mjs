@@ -109,3 +109,45 @@ assert.match(empty.elements.get('templateIpsList').innerHTML, /Ничего не
 await empty.open();
 assert.equal(empty.calls.length, 1, 'A successful empty list is cacheable, unlike failure');
 console.log('P2.13: successful empty list cached (1 API call across 2 opens)');
+
+// C6: execute the production empty-list renderer with no clients and no groups.
+// It must invite creating the first client instead of claiming there are no
+// accesses, and must not throw before `loadClients()` has populated any data.
+const renderMainClientsCardsJs = between(
+    panel,
+    '        function renderMainClientsCards() {',
+    '\n        let clientsInFlight = false;',
+    true,
+);
+const cardsJs = `${escJs}\n${renderMainClientsCardsJs}`;
+
+{
+    const cards = { innerHTML: '' };
+    let presenceCalls = 0;
+    const context = vm.createContext({
+        window: { clientsData: [], groupsData: [] },
+        document: {
+            getElementById(id) {
+                if (id === 'clientsCards') return cards;
+                if (id === 'mainSearchInput') return null;
+                throw new Error(`Unexpected DOM access: ${id}`);
+            },
+        },
+        refreshPresenceBadges() { presenceCalls += 1; },
+    });
+    vm.runInContext(`${cardsJs}\nrenderMainClientsCards();`, context, {
+        filename: 'web_panel.rs:renderMainClientsCards',
+    });
+    assert.match(
+        cards.innerHTML,
+        /Клиентов ещё нет\. Создайте первого клиента\./,
+        'Empty list must guide the owner to create the first client',
+    );
+    assert.doesNotMatch(
+        cards.innerHTML,
+        /Нет созданных доступов\./,
+        'Legacy "no accesses" wording must be gone',
+    );
+    assert.equal(presenceCalls, 1, 'Empty list still refreshes presence badges once');
+    console.log('C6: empty client list renders the first-client invitation without throwing');
+}

@@ -1197,53 +1197,6 @@ impl FirewallRule {
     }
 }
 
-fn purge_legacy_mss_clamp() {
-    let subnet = crate::tun_device::TUN_SUBNET;
-    let mss_source = [
-        "-s",
-        subnet,
-        "-p",
-        "tcp",
-        "-m",
-        "tcp",
-        "--tcp-flags",
-        "SYN,RST",
-        "SYN",
-    ];
-    let mss_destination = [
-        "-d",
-        subnet,
-        "-p",
-        "tcp",
-        "-m",
-        "tcp",
-        "--tcp-flags",
-        "SYN,RST",
-        "SYN",
-    ];
-    for mss in [
-        "1120", "1160", "1200", "1240", "1280", "1360", "1400", "1460",
-    ] {
-        let mss_target = ["-j", "TCPMSS", "--set-mss", mss];
-        FirewallRule::new(
-            "iptables",
-            Some("mangle"),
-            "FORWARD",
-            &mss_source,
-            &mss_target,
-        )
-        .remove();
-        FirewallRule::new(
-            "iptables",
-            Some("mangle"),
-            "FORWARD",
-            &mss_destination,
-            &mss_target,
-        )
-        .remove();
-    }
-}
-
 fn managed_firewall_rules(tun_iface: &str) -> Vec<FirewallRule> {
     let subnet = crate::tun_device::TUN_SUBNET;
     vec![
@@ -1301,7 +1254,6 @@ impl KernelNetworking {
             &format!("/proc/sys/net/ipv4/conf/{tun_iface}/rp_filter"),
             "2",
         );
-        purge_legacy_mss_clamp();
         let rules = managed_firewall_rules(tun_iface);
         for rule in &rules {
             if let Err(error) = rule.install() {

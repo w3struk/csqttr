@@ -77,8 +77,6 @@ struct ExtendClientRequest {
 #[derive(Deserialize)]
 struct SettingsRequest {
     #[serde(default)]
-    main_password: Option<String>,
-    #[serde(default)]
     dns_provider: Option<String>,
     #[serde(default)]
     dns_primary: Option<String>,
@@ -488,23 +486,6 @@ fn make_client_link(
 }
 
 #[inline]
-fn make_main_link(host: &str, port: u16, db: &model::Database) -> String {
-    let vk_hashes = if db.main_vk_hashes.is_empty() {
-        &db.vk_hashes
-    } else {
-        &db.main_vk_hashes
-    };
-    make_client_link(
-        host,
-        port,
-        &db.main_password,
-        vk_hashes,
-        db.main_vk_token_enabled,
-        &db.vk_access_token,
-    )
-}
-
-#[inline]
 fn make_entry_link(
     host: &str,
     port: u16,
@@ -566,7 +547,7 @@ fn authorized(app: &App, headers: &HeaderMap) -> bool {
         return true;
     }
 
-    // main_password is the owner's tunnel secret; it must not authorize the panel.
+    // A legacy `Database::main_password` is not a panel credential.
     if let Some(key) = headers
         .get("x-api-key")
         .and_then(|v| v.to_str().ok())
@@ -1296,15 +1277,13 @@ async fn settings_get(State(state): State<WebState>) -> impl IntoResponse {
             .unwrap_or_default()
     };
     Json(serde_json::json!({
-        "main_password": db.main_password,
         "dns_provider": provider,
         "dns_primary": primary,
         "dns_secondary": secondary,
         "auto_restart_interval_hours": db.auto_restart_interval_hours(),
         "vk_token": db.vk_access_token,
         "vk_hashes": vk_hashes,
-        "peer_port": state.app.listen.port(),
-        "restart_required": db.main_password != state.app.startup_main_password
+        "peer_port": state.app.listen.port()
     }))
 }
 
@@ -1312,16 +1291,6 @@ async fn settings_post(
     State(state): State<WebState>,
     Json(request): Json<SettingsRequest>,
 ) -> Response {
-    if let Some(password) = request.main_password.as_ref()
-        && !password.is_empty()
-        && password.len() > 128
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            "password length must be 1..128 or empty",
-        )
-            .into_response();
-    }
     let dns = match request.dns_provider.as_deref() {
         Some("custom") | None
             if request.dns_primary.is_some() || request.dns_secondary.is_some() =>
@@ -1369,21 +1338,8 @@ async fn settings_post(
         None => None,
     };
     let requested_auto_restart_interval = request.auto_restart_interval_hours;
-    let (revision, retired_main_password, applied_dns) = {
+    let (revision, applied_dns) = {
         let mut db = state.app.db.write().await;
-        let retired_main_password = if let Some(password) = request.main_password {
-            if db.passwords.contains_key(&password) {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    "Пароль совпадает с паролем клиента",
-                )
-                    .into_response();
-            }
-            (db.main_password != password)
-                .then(|| std::mem::replace(&mut db.main_password, password))
-        } else {
-            None
-        };
         let applied_dns = dns
             .as_ref()
             .and_then(|(dns, _)| (db.dns != *dns).then(|| dns.clone()));
@@ -1400,11 +1356,7 @@ async fn settings_post(
         if let Some(hashes) = requested_vk_hashes {
             db.vk_hashes = hashes;
         }
-        (
-            state.app.db_persistence.submit(db.clone()),
-            retired_main_password,
-            applied_dns,
-        )
+        (state.app.db_persistence.submit(db.clone()), applied_dns)
     };
     match state.app.db_persistence.wait(revision).await {
         Ok(()) => {}
@@ -1419,16 +1371,6 @@ async fn settings_post(
     }
     if let Some(hours) = requested_auto_restart_interval {
         state.app.auto_restart_interval_tx.send_replace(hours);
-    }
-    let main_password_changed = retired_main_password.is_some();
-    if let Some(password) = retired_main_password
-        && !password.is_empty()
-    {
-        state.app.derived_keys.remove(&password);
-    }
-    if main_password_changed && let Err(message) = refresh_credentials_report(&state).await {
-        let warning = format!("saved but reload failed: {message}");
-        return (StatusCode::OK, [("x-csqtt-reload-error", warning)], "saved").into_response();
     }
     if let Some(dns) = applied_dns {
         *state.app.dns.write().await = dns;
@@ -1446,11 +1388,7 @@ async fn settings_post(
             }
         }
     }
-    let restart_required = {
-        let db = state.app.db.read().await;
-        db.main_password != state.app.startup_main_password
-    };
-    Json(serde_json::json!({ "restart_required": restart_required })).into_response()
+    Json(serde_json::json!({ "ok": true })).into_response()
 }
 
 fn is_valid_hostname(name: &str) -> bool {
@@ -1610,11 +1548,7 @@ async fn clients_get(
                 server_now: current,
                 vk_hash: entry.vk_hash.clone(),
                 ports: entry.ports.clone(),
-                ip: if entry.ip.is_empty() {
-                    "10.66.67.3".to_string()
-                } else {
-                    entry.ip.clone()
-                },
+                ip: entry.ip.clone(),
                 name: entry.name.clone(),
                 vk_hashes: entry.vk_hashes.clone(),
                 vk_token: entry.vk_token_enabled,
@@ -1634,53 +1568,6 @@ async fn clients_get(
             }
         })
         .collect();
-    if !db.main_password.is_empty() {
-        let mut session_up = 0;
-        let mut session_down = 0;
-        let mut active_sessions = 0;
-        let mut live = 0;
-        for s in state.app.sessions.iter() {
-            let sess = s.value();
-            if secret_eq(&sess.password, &db.main_password) {
-                active_sessions += 1;
-                session_up += sess.up_bytes.load(Ordering::Relaxed) as i64;
-                session_down += sess.down_bytes.load(Ordering::Relaxed) as i64;
-                live = live.max(sess.last_inbound.load(Ordering::Relaxed));
-            }
-        }
-        let (last_online, _) = protocol::presence_view(db.main_last_online, live, current);
-
-        let main_peer_port = state.app.listen.port();
-        list.push(ClientInfo {
-            password: db.main_password.clone(),
-            down: db.main_down_bytes + session_down,
-            up: db.main_up_bytes + session_up,
-            expires: 0,
-            active: true,
-            active_sessions,
-            last_online,
-            presence_window_secs: protocol::PRESENCE_WINDOW_SECS,
-            server_now: current,
-            vk_hash: String::new(),
-            ports: String::new(),
-            ip: "10.66.67.2".to_string(),
-            name: "Владелец".to_string(),
-            vk_hashes: if db.main_vk_hashes.is_empty() {
-                db.vk_hashes.clone()
-            } else {
-                db.main_vk_hashes.clone()
-            },
-            vk_token: db.main_vk_token_enabled,
-            peer_port: main_peer_port,
-            local_port: 0,
-            group_id: String::new(),
-            routing_rule_id: db.main_routing_rule_id.clone(),
-            link: make_main_link(&host, main_peer_port, &db),
-            sub_uuid: db.main_sub_uuid.clone(),
-            workers: db.main_workers,
-        });
-    }
-
     if let Some(ref gid) = query.group_id {
         let g = gid.trim();
         if g == "root" || g == "ungrouped" {
@@ -1864,14 +1751,14 @@ async fn clients_create(
                 )
                     .into_response();
             }
-            if db.passwords.contains_key(pw) || pw == db.main_password {
+            if db.passwords.contains_key(pw) {
                 return (StatusCode::BAD_REQUEST, "password already exists").into_response();
             }
             pw.to_string()
         } else {
             let candidate = (0..64)
                 .map(|_| random_password())
-                .find(|c| !db.passwords.contains_key(c) && c != &db.main_password);
+                .find(|c| !db.passwords.contains_key(c));
             let Some(p) = candidate else {
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             };
@@ -1968,77 +1855,68 @@ async fn client_update(
         if request.vk_token && db.vk_access_token.is_empty() {
             return (StatusCode::BAD_REQUEST, "configure a VK token first").into_response();
         }
-        if secret_eq(&password, &db.main_password) {
-            db.main_vk_hashes = vk_hashes;
-            db.main_vk_token_enabled = request.vk_token;
-            db.main_workers = validated_workers;
-            // Привязку правила этот handler не трогает (у main она меняется
-            // только через routing_rules_*), поэтому и уведомления не нужно.
-            (state.app.db_persistence.submit(db.clone()), Vec::new())
+        let current_group_id = match db.passwords.get(&password) {
+            Some(e) => e.group_id.clone(),
+            None => return StatusCode::NOT_FOUND.into_response(),
+        };
+        let target_group_id = request.group_id.as_deref().unwrap_or(&current_group_id);
+        let scope_names =
+            model::existing_client_names_in_scope(&db, target_group_id, Some(&password));
+        let client_name = if request.name.trim().is_empty() {
+            model::generate_unique_client_name(&scope_names)
         } else {
-            let current_group_id = match db.passwords.get(&password) {
-                Some(e) => e.group_id.clone(),
-                None => return StatusCode::NOT_FOUND.into_response(),
-            };
-            let target_group_id = request.group_id.as_deref().unwrap_or(&current_group_id);
-            let scope_names =
-                model::existing_client_names_in_scope(&db, target_group_id, Some(&password));
-            let client_name = if request.name.trim().is_empty() {
-                model::generate_unique_client_name(&scope_names)
-            } else {
-                let trimmed = request.name.trim().to_string();
-                if model::is_client_name_taken(&scope_names, &trimmed) {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        "Участник с таким именем уже существует",
-                    )
-                        .into_response();
-                }
-                trimmed
-            };
-
-            let entry = db.passwords.get_mut(&password).unwrap();
-
-            // Смена группы меняет разрешённое правило только у клиента без
-            // собственного: групповое правило стоит ниже собственного в
-            // порядке `resolve_routing_rule`. Если собственного правила нет и
-            // группа другая — старое решение больше не действительно, и
-            // клиенту нужен новый `GETCONF`.
-            let rule_binding_changed =
-                entry.routing_rule_id.is_empty() && target_group_id != current_group_id;
-            let default_peer_port = state.app.listen.port();
-            let fallback_port = if entry.dtls_port == 0 {
-                default_peer_port
-            } else {
-                entry.dtls_port
-            };
-            let peer_port = request.peer_port.unwrap_or(fallback_port);
-            let local_port = request.local_port.unwrap_or(0);
-
-            entry.name = client_name;
-            entry.expires_at = if request.days == 0 {
-                0
-            } else {
-                now().saturating_add(request.days.saturating_mul(86400))
-            };
-            entry.vk_hash = vk_hashes.clone();
-            entry.vk_hashes = vk_hashes;
-            entry.vk_token_enabled = request.vk_token;
-            entry.dtls_port = peer_port;
-            entry.wg_port = 0;
-            entry.local_port = local_port;
-            entry.ports = format!("{},0,{}", peer_port, local_port);
-            if let Some(ref g_id) = request.group_id {
-                entry.group_id = g_id.clone();
+            let trimmed = request.name.trim().to_string();
+            if model::is_client_name_taken(&scope_names, &trimmed) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "Участник с таким именем уже существует",
+                )
+                    .into_response();
             }
-            entry.workers = validated_workers;
-            let affected = if rule_binding_changed {
-                vec![password.clone()]
-            } else {
-                Vec::new()
-            };
-            (state.app.db_persistence.submit(db.clone()), affected)
+            trimmed
+        };
+
+        let entry = db.passwords.get_mut(&password).unwrap();
+
+        // Смена группы меняет разрешённое правило только у клиента без
+        // собственного: групповое правило стоит ниже собственного в
+        // порядке `resolve_routing_rule`. Если собственного правила нет и
+        // группа другая — старое решение больше не действительно, и
+        // клиенту нужен новый `GETCONF`.
+        let rule_binding_changed =
+            entry.routing_rule_id.is_empty() && target_group_id != current_group_id;
+        let default_peer_port = state.app.listen.port();
+        let fallback_port = if entry.dtls_port == 0 {
+            default_peer_port
+        } else {
+            entry.dtls_port
+        };
+        let peer_port = request.peer_port.unwrap_or(fallback_port);
+        let local_port = request.local_port.unwrap_or(0);
+
+        entry.name = client_name;
+        entry.expires_at = if request.days == 0 {
+            0
+        } else {
+            now().saturating_add(request.days.saturating_mul(86400))
+        };
+        entry.vk_hash = vk_hashes.clone();
+        entry.vk_hashes = vk_hashes;
+        entry.vk_token_enabled = request.vk_token;
+        entry.dtls_port = peer_port;
+        entry.wg_port = 0;
+        entry.local_port = local_port;
+        entry.ports = format!("{},0,{}", peer_port, local_port);
+        if let Some(ref g_id) = request.group_id {
+            entry.group_id = g_id.clone();
         }
+        entry.workers = validated_workers;
+        let affected = if rule_binding_changed {
+            vec![password.clone()]
+        } else {
+            Vec::new()
+        };
+        (state.app.db_persistence.submit(db.clone()), affected)
     };
     if let Err(response) = wait_for_persistence(&state, revision).await {
         return response;
@@ -2114,54 +1992,6 @@ async fn client_get(
     let host = resolve_client_host(&headers, &state).await;
     let current = now();
 
-    if secret_eq(&password, &db.main_password) {
-        let mut session_up = 0;
-        let mut session_down = 0;
-        let mut active_sessions = 0;
-        let mut live = 0;
-        for entry in state.app.sessions.iter() {
-            let sess = entry.value();
-            if secret_eq(&sess.password, &db.main_password) {
-                active_sessions += 1;
-                session_up += sess.up_bytes.load(Ordering::Relaxed) as i64;
-                session_down += sess.down_bytes.load(Ordering::Relaxed) as i64;
-                live = live.max(sess.last_inbound.load(Ordering::Relaxed));
-            }
-        }
-        let (last_online, _) = protocol::presence_view(db.main_last_online, live, current);
-
-        let main_peer_port = state.app.listen.port();
-        let info = ClientInfo {
-            password: db.main_password.clone(),
-            down: db.main_down_bytes + session_down,
-            up: db.main_up_bytes + session_up,
-            expires: 0,
-            active: true,
-            active_sessions,
-            last_online,
-            presence_window_secs: protocol::PRESENCE_WINDOW_SECS,
-            server_now: current,
-            vk_hash: String::new(),
-            ports: String::new(),
-            ip: "10.66.67.2".to_string(),
-            name: "Главный пароль".to_string(),
-            vk_hashes: if db.main_vk_hashes.is_empty() {
-                db.vk_hashes.clone()
-            } else {
-                db.main_vk_hashes.clone()
-            },
-            vk_token: db.main_vk_token_enabled,
-            peer_port: main_peer_port,
-            local_port: 0,
-            group_id: String::new(),
-            routing_rule_id: db.main_routing_rule_id.clone(),
-            link: make_main_link(&host, main_peer_port, &db),
-            sub_uuid: db.main_sub_uuid.clone(),
-            workers: db.main_workers,
-        };
-        return Json(info).into_response();
-    }
-
     if let Some(entry) = db.passwords.get(&password) {
         let (active_sessions, live) = live_presence(&state.app.sessions, &password);
         let (last_online, _) = protocol::presence_view(entry.last_online, live, current);
@@ -2216,18 +2046,7 @@ async fn client_reset_traffic(
 ) -> Response {
     let result = {
         let mut db = state.app.db.write().await;
-        if secret_eq(&password, &db.main_password) {
-            db.main_up_bytes = 0;
-            db.main_down_bytes = 0;
-            for s in state.app.sessions.iter() {
-                if s.value().password == password {
-                    s.value().up_bytes.store(0, Ordering::Relaxed);
-                    s.value().down_bytes.store(0, Ordering::Relaxed);
-                }
-            }
-            let revision = state.app.db_persistence.submit(db.clone());
-            Some(revision)
-        } else if let Some(entry) = db.passwords.get_mut(&password) {
+        if let Some(entry) = db.passwords.get_mut(&password) {
             entry.up_bytes = 0;
             entry.down_bytes = 0;
             for s in state.app.sessions.iter() {
@@ -2305,7 +2124,7 @@ struct ClientLinkItem {
 async fn api_links_get(State(state): State<WebState>, headers: HeaderMap) -> impl IntoResponse {
     let db = state.app.db.read().await;
     let host = resolve_client_host(&headers, &state).await;
-    let mut list: Vec<ClientLinkItem> = db
+    let list: Vec<ClientLinkItem> = db
         .passwords
         .iter()
         .map(|(password, entry)| {
@@ -2331,18 +2150,6 @@ async fn api_links_get(State(state): State<WebState>, headers: HeaderMap) -> imp
             }
         })
         .collect();
-    if !db.main_password.is_empty() {
-        let main_peer_port = state.app.listen.port();
-        list.push(ClientLinkItem {
-            name: "Владелец".to_owned(),
-            password: db.main_password.clone(),
-            link: make_main_link(&host, main_peer_port, &db),
-            expires: 0,
-            peer_port: main_peer_port,
-            group_id: String::new(),
-            sub_uuid: db.main_sub_uuid.clone(),
-        });
-    }
     Json(list)
 }
 
@@ -2385,12 +2192,6 @@ async fn api_links_batch_vk(
             db.vk_hashes = h.clone();
         }
         if apply_all {
-            if let Some(ref h) = hashes {
-                db.main_vk_hashes = h.clone();
-            }
-            if let Some(ref t) = token {
-                db.main_vk_token_enabled = !t.is_empty();
-            }
             for entry in db.passwords.values_mut() {
                 if let Some(ref h) = hashes {
                     entry.vk_hashes = h.clone();
@@ -2436,26 +2237,16 @@ async fn api_client_vk_update(
     };
     let revision = {
         let mut db = state.app.db.write().await;
-        if secret_eq(&password, &db.main_password) {
-            if let Some(h) = hashes {
-                db.main_vk_hashes = h;
-            }
-            if let Some(token_enabled) = request.vk_token {
-                db.main_vk_token_enabled = token_enabled;
-            }
-            state.app.db_persistence.submit(db.clone())
-        } else {
-            let Some(entry) = db.passwords.get_mut(&password) else {
-                return (StatusCode::NOT_FOUND, "client not found").into_response();
-            };
-            if let Some(h) = hashes {
-                entry.vk_hashes = h;
-            }
-            if let Some(token_enabled) = request.vk_token {
-                entry.vk_token_enabled = token_enabled;
-            }
-            state.app.db_persistence.submit(db.clone())
+        let Some(entry) = db.passwords.get_mut(&password) else {
+            return (StatusCode::NOT_FOUND, "client not found").into_response();
+        };
+        if let Some(h) = hashes {
+            entry.vk_hashes = h;
         }
+        if let Some(token_enabled) = request.vk_token {
+            entry.vk_token_enabled = token_enabled;
+        }
+        state.app.db_persistence.submit(db.clone())
     };
     if let Err(response) = wait_for_persistence(&state, revision).await {
         return response;
@@ -2550,52 +2341,12 @@ async fn api_settings_restart_interval(
         .into_response()
 }
 
-#[derive(Deserialize)]
-struct MasterPasswordRequest {
-    password: String,
-}
-
-async fn api_settings_master_password(
-    State(state): State<WebState>,
-    Json(request): Json<MasterPasswordRequest>,
-) -> Response {
-    if !request.password.is_empty() && request.password.len() > 128 {
-        return (
-            StatusCode::BAD_REQUEST,
-            "password length must be 1..128 or empty",
-        )
-            .into_response();
-    }
-    let (revision, retired_password) = {
-        let mut db = state.app.db.write().await;
-        if !request.password.is_empty() && db.passwords.contains_key(&request.password) {
-            return (
-                StatusCode::BAD_REQUEST,
-                "Пароль совпадает с паролем клиента",
-            )
-                .into_response();
-        }
-        let retired = (db.main_password != request.password)
-            .then(|| std::mem::replace(&mut db.main_password, request.password));
-        (state.app.db_persistence.submit(db.clone()), retired)
-    };
-    if let Err(response) = wait_for_persistence(&state, revision).await {
-        return response;
-    }
-    if let Some(p) = retired_password
-        && !p.is_empty()
-    {
-        state.app.derived_keys.remove(&p);
-    }
-    let _ = refresh_credentials_report(&state).await;
-    Json(serde_json::json!({ "ok": true })).into_response()
-}
-
-#[derive(Serialize, Deserialize, Clone)]
+/// Version 2: the owner is an ordinary `clients` entry, so there is no
+/// separate `main_password` field any more.
+#[derive(Serialize)]
 struct ServerExportData {
     version: u32,
     exported_at: i64,
-    main_password: String,
     dns: String,
     dns_provider: String,
     auto_restart_interval_hours: Option<u8>,
@@ -2603,6 +2354,37 @@ struct ServerExportData {
     vk_hashes: String,
     groups: std::collections::BTreeMap<String, ClientGroup>,
     routing_rules: std::collections::BTreeMap<String, RoutingRule>,
+    clients: Vec<ExportClientEntry>,
+}
+
+/// Accepted import payload, v1 and v2 alike. Version 1 kept the owner password
+/// in `main_password` instead of `clients`; `version` is absent there, and
+/// unknown or future fields are ignored rather than rejected.
+#[derive(Deserialize)]
+struct ServerImportConfig {
+    #[serde(default)]
+    version: u32,
+    // Not used by the importer, but keeps the payload shape of a real export:
+    // a body without it is rejected instead of importing an empty config.
+    #[allow(dead_code)]
+    exported_at: i64,
+    #[serde(default)]
+    main_password: String,
+    #[serde(default)]
+    dns: String,
+    #[serde(default)]
+    dns_provider: String,
+    #[serde(default)]
+    auto_restart_interval_hours: Option<u8>,
+    #[serde(default)]
+    vk_access_token: String,
+    #[serde(default)]
+    vk_hashes: String,
+    #[serde(default)]
+    groups: std::collections::BTreeMap<String, ClientGroup>,
+    #[serde(default)]
+    routing_rules: std::collections::BTreeMap<String, RoutingRule>,
+    #[serde(default)]
     clients: Vec<ExportClientEntry>,
 }
 
@@ -2665,9 +2447,8 @@ async fn api_export_get(State(state): State<WebState>) -> impl IntoResponse {
         })
         .collect();
     let export = ServerExportData {
-        version: 1,
+        version: 2,
         exported_at: now(),
-        main_password: db.main_password.clone(),
         dns: db.dns.clone(),
         dns_provider: db.dns_provider.clone(),
         auto_restart_interval_hours: db.auto_restart_interval_hours,
@@ -2687,17 +2468,54 @@ struct ServerImportPayload {
     #[serde(default)]
     import_settings: Option<bool>,
     #[serde(default)]
-    config: Option<ServerExportData>,
+    config: Option<serde_json::Value>,
     #[serde(flatten)]
-    direct_config: Option<ServerExportData>,
+    direct_config: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Version 1 exports keep the owner password outside `clients`; importing it
+/// creates a regular client named «Владелец». Version 2 already lists the owner
+/// in `clients`, so a stray `main_password` is ignored there.
+fn import_legacy_owner_client(
+    db: &mut model::Database,
+    export: &ServerImportConfig,
+    owner_vk_hashes: &str,
+) -> bool {
+    if export.version >= 2
+        || export.main_password.trim().is_empty()
+        || db.passwords.contains_key(&export.main_password)
+    {
+        return false;
+    }
+    let ip = model::import_ip(db, model::LEGACY_OWNER_IP);
+    let existing_names = model::existing_client_names_in_scope(db, "", None);
+    let name = if model::is_client_name_taken(existing_names.clone(), "Владелец") {
+        model::generate_unique_client_name(existing_names)
+    } else {
+        "Владелец".to_owned()
+    };
+    db.passwords.insert(
+        export.main_password.clone(),
+        PasswordEntry {
+            ip,
+            name,
+            vk_hashes: owner_vk_hashes.to_owned(),
+            sub_uuid: model::random_uuid_v4(),
+            ..Default::default()
+        },
+    );
+    true
 }
 
 async fn api_import_post(
     State(state): State<WebState>,
     Json(payload): Json<ServerImportPayload>,
 ) -> Response {
-    let export_opt = payload.config.or(payload.direct_config);
-    let Some(export) = export_opt else {
+    let config_value = match payload.config {
+        Some(config) => config,
+        None => serde_json::Value::Object(payload.direct_config),
+    };
+    let Ok(export) = serde_json::from_value::<ServerImportConfig>(config_value) else {
         return (StatusCode::BAD_REQUEST, "invalid or empty config").into_response();
     };
     let do_clients = payload.import_clients.unwrap_or(true);
@@ -2718,86 +2536,94 @@ async fn api_import_post(
         }
     }
 
-    let revision = {
-        let mut db = state.app.db.write().await;
-        if do_clients {
-            for c in export.clients {
-                if !db.passwords.contains_key(&c.password) {
-                    let sub_uuid = if c.sub_uuid.trim().is_empty() {
-                        model::random_uuid_v4()
-                    } else {
-                        c.sub_uuid
-                    };
-                    let ip = model::import_ip(&db, &c.ip);
-                    let client_name = if c.name.trim().is_empty()
-                        || model::is_client_name_taken(
-                            model::existing_client_names_in_scope(&db, &c.group_id, None),
-                            &c.name,
-                        ) {
-                        model::generate_unique_client_name(model::existing_client_names_in_scope(
-                            &db,
-                            &c.group_id,
-                            None,
-                        ))
-                    } else {
-                        c.name
-                    };
-                    db.passwords.insert(
-                        c.password.clone(),
-                        PasswordEntry {
-                            ip,
-                            expires_at: c.expires_at,
-                            down_bytes: c.down_bytes,
-                            up_bytes: c.up_bytes,
-                            last_online: 0,
-                            vk_hash: c.vk_hash,
-                            ports: c.ports,
-                            is_deactivated: c.is_deactivated,
-                            name: client_name,
-                            vk_hashes: c.vk_hashes,
-                            vk_token_enabled: c.vk_token_enabled,
-                            dtls_port: c.dtls_port,
-                            wg_port: 0,
-                            local_port: c.local_port,
-                            group_id: c.group_id,
-                            routing_rule_id: c.routing_rule_id,
-                            sub_uuid,
-                            workers: c.workers.filter(|&w| (3..=100).contains(&w)),
-                        },
-                    );
-                    added_clients += 1;
+    let revision =
+        {
+            let mut db = state.app.db.write().await;
+            if do_clients {
+                // A v1 export carries VK hashes only at the global level. Mirror
+                // the retired `make_main_link` fallback: use the imported global
+                // value when settings are applied, otherwise the target's own.
+                let owner_vk_hashes = if do_settings && !export.vk_hashes.is_empty() {
+                    export.vk_hashes.clone()
+                } else {
+                    db.vk_hashes.clone()
+                };
+                added_clients += usize::from(import_legacy_owner_client(
+                    &mut db,
+                    &export,
+                    &owner_vk_hashes,
+                ));
+                for c in export.clients {
+                    if !db.passwords.contains_key(&c.password) {
+                        let sub_uuid = if c.sub_uuid.trim().is_empty() {
+                            model::random_uuid_v4()
+                        } else {
+                            c.sub_uuid
+                        };
+                        let ip = model::import_ip(&db, &c.ip);
+                        let client_name = if c.name.trim().is_empty()
+                            || model::is_client_name_taken(
+                                model::existing_client_names_in_scope(&db, &c.group_id, None),
+                                &c.name,
+                            ) {
+                            model::generate_unique_client_name(
+                                model::existing_client_names_in_scope(&db, &c.group_id, None),
+                            )
+                        } else {
+                            c.name
+                        };
+                        db.passwords.insert(
+                            c.password.clone(),
+                            PasswordEntry {
+                                ip,
+                                expires_at: c.expires_at,
+                                down_bytes: c.down_bytes,
+                                up_bytes: c.up_bytes,
+                                last_online: 0,
+                                vk_hash: c.vk_hash,
+                                ports: c.ports,
+                                is_deactivated: c.is_deactivated,
+                                name: client_name,
+                                vk_hashes: c.vk_hashes,
+                                vk_token_enabled: c.vk_token_enabled,
+                                dtls_port: c.dtls_port,
+                                wg_port: 0,
+                                local_port: c.local_port,
+                                group_id: c.group_id,
+                                routing_rule_id: c.routing_rule_id,
+                                sub_uuid,
+                                workers: c.workers.filter(|&w| (3..=100).contains(&w)),
+                            },
+                        );
+                        added_clients += 1;
+                    }
+                }
+                for (gid, g) in export.groups {
+                    db.groups.entry(gid).or_insert(g);
+                }
+                for (rid, r) in export.routing_rules {
+                    db.routing_rules.entry(rid).or_insert(r);
                 }
             }
-            for (gid, g) in export.groups {
-                db.groups.entry(gid).or_insert(g);
+            if do_settings {
+                if !export.dns.is_empty() {
+                    applied_dns = (db.dns != export.dns).then(|| export.dns.clone());
+                    db.dns = export.dns;
+                    db.dns_provider = export.dns_provider;
+                }
+                if let Some(hours) = export.auto_restart_interval_hours {
+                    db.set_auto_restart_interval_hours(hours);
+                    applied_interval = Some(hours);
+                }
+                if !export.vk_access_token.is_empty() {
+                    db.vk_access_token = export.vk_access_token;
+                }
+                if !export.vk_hashes.is_empty() {
+                    db.vk_hashes = export.vk_hashes;
+                }
             }
-            for (rid, r) in export.routing_rules {
-                db.routing_rules.entry(rid).or_insert(r);
-            }
-        }
-        if do_settings {
-            if !export.main_password.is_empty() && !db.passwords.contains_key(&export.main_password)
-            {
-                db.main_password = export.main_password;
-            }
-            if !export.dns.is_empty() {
-                applied_dns = (db.dns != export.dns).then(|| export.dns.clone());
-                db.dns = export.dns;
-                db.dns_provider = export.dns_provider;
-            }
-            if let Some(hours) = export.auto_restart_interval_hours {
-                db.set_auto_restart_interval_hours(hours);
-                applied_interval = Some(hours);
-            }
-            if !export.vk_access_token.is_empty() {
-                db.vk_access_token = export.vk_access_token;
-            }
-            if !export.vk_hashes.is_empty() {
-                db.vk_hashes = export.vk_hashes;
-            }
-        }
-        state.app.db_persistence.submit(db.clone())
-    };
+            state.app.db_persistence.submit(db.clone())
+        };
 
     if let Err(response) = wait_for_persistence(&state, revision).await {
         return response;
@@ -2994,8 +2820,7 @@ async fn groups_delete(State(state): State<WebState>, Path(id): Path<String>) ->
     // участники группы удаляются вместе с ней, а `drop_password_sessions`
     // уничтожает ровно те сессии, которым notice был бы адресован. Выживших
     // клиентов, чьё разрешённое правило изменилось бы, нет: через группу
-    // резолвятся только её участники (все удалены), а main — через собственную
-    // привязку `main_routing_rule_id`, не через группу. Удалённые клиенты при
+    // резолвятся только её участники (все удалены). Удалённые клиенты при
     // переподключении не пройдут аутентификацию; остальные получат актуальное
     // решение обычным `GETCONF`. Тот же случай, что `client_unbind`/`client_delete`.
     for pwd in &deleted_passwords {
@@ -3143,13 +2968,6 @@ async fn client_sub_page(
     let db = state.app.db.read().await;
     let host = resolve_client_host(&headers, &state).await;
 
-    if !db.main_sub_uuid.is_empty() && db.main_sub_uuid == sub_uuid && !db.main_password.is_empty()
-    {
-        let main_peer_port = state.app.listen.port();
-        let link = make_main_link(&host, main_peer_port, &db);
-        return Html(render_client_sub_html("Владелец", &link)).into_response();
-    }
-
     let client_entry = db
         .passwords
         .iter()
@@ -3197,22 +3015,6 @@ async fn client_sub_json(
     }
     let db = state.app.db.read().await;
     let host = resolve_client_host(&headers, &state).await;
-
-    if !db.main_sub_uuid.is_empty() && db.main_sub_uuid == sub_uuid && !db.main_password.is_empty()
-    {
-        let main_peer_port = state.app.listen.port();
-        let link = make_main_link(&host, main_peer_port, &db);
-        return (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "ok": true,
-                "name": "Владелец",
-                "link": link,
-                "sub_uuid": db.main_sub_uuid,
-            })),
-        )
-            .into_response();
-    }
 
     let client_entry = db
         .passwords
@@ -3398,11 +3200,9 @@ async fn universal_sub_json(
     }
     let is_client = {
         let db = state.app.db.read().await;
-        (!db.main_sub_uuid.is_empty() && db.main_sub_uuid == trimmed)
-            || db
-                .passwords
-                .values()
-                .any(|p| !p.sub_uuid.is_empty() && p.sub_uuid == trimmed)
+        db.passwords
+            .values()
+            .any(|p| !p.sub_uuid.is_empty() && p.sub_uuid == trimmed)
     };
     if is_client {
         return client_sub_json(State(state), Path(uuid), headers, token).await;
@@ -3428,12 +3228,7 @@ async fn client_sub_link_regenerate(
 ) -> Response {
     let (revision, new_sub) = {
         let mut db = state.app.db.write().await;
-        if secret_eq(&password, &db.main_password) {
-            db.main_sub_uuid = model::random_uuid_v4();
-            let new_sub = db.main_sub_uuid.clone();
-            let rev = state.app.db_persistence.submit(db.clone());
-            (rev, new_sub)
-        } else if let Some(entry) = db.passwords.get_mut(&password) {
+        if let Some(entry) = db.passwords.get_mut(&password) {
             entry.sub_uuid = model::random_uuid_v4();
             let new_sub = entry.sub_uuid.clone();
             let rev = state.app.db_persistence.submit(db.clone());
@@ -3585,11 +3380,7 @@ async fn api_clients_batch_reset_traffic(
     let revision = {
         let mut db = state.app.db.write().await;
         for pwd in &req.passwords {
-            if pwd == &db.main_password {
-                db.main_down_bytes = 0;
-                db.main_up_bytes = 0;
-                updated += 1;
-            } else if let Some(entry) = db.passwords.get_mut(pwd) {
+            if let Some(entry) = db.passwords.get_mut(pwd) {
                 entry.down_bytes = 0;
                 entry.up_bytes = 0;
                 updated += 1;
@@ -4262,9 +4053,6 @@ async fn routing_rules_get(State(state): State<WebState>) -> Response {
             }
         }
         let mut assigned_clients = Vec::new();
-        if !db.main_password.is_empty() && db.main_routing_rule_id == rule.id {
-            assigned_clients.push(db.main_password.clone());
-        }
         for (pass, entry) in &db.passwords {
             if entry.routing_rule_id == rule.id {
                 assigned_clients.push(pass.clone());
@@ -4409,9 +4197,8 @@ fn group_member_passwords(
 /// `routing_rule_id`. Поэтому «правило забрали» не теряет участников из union'а
 /// даже если считать набор уже после мутации.
 fn group_affected_passwords(db: &model::Database, group_id: &str) -> Vec<String> {
-    // main вне группового членства и наследует правило только из собственной
-    // привязки `main_routing_rule_id`, поэтому перепривязка группы его не
-    // касается даже при совпадении rule id — иначе он получал бы лишний GETCONF.
+    // Владелец — обычная запись `passwords`, поэтому попадает в набор только
+    // через членство в группе, как и любой другой участник.
     group_member_passwords(db, group_id).into_iter().collect()
 }
 
@@ -4434,8 +4221,7 @@ fn merge_affected_passwords(before: &[String], after: &[String]) -> Vec<String> 
 ///   имеет приоритет над групповым, поэтому такого клиента изменение видно
 ///   всегда);
 /// - члены групп с этим правилом, но только те, у кого собственного правила
-///   нет — иначе группное правило их и так не касается;
-/// - `main_password`, если `main_routing_rule_id` равен `rule_id`.
+///   нет — иначе группное правило их и так не касается.
 ///
 /// Возвращает непустые пароли без дублей и в детерминированном порядке.
 /// Пустой `rule_id` — пустой набор: отвязка «на ничего» никого не трогает, а
@@ -4454,9 +4240,6 @@ fn rule_affected_passwords(db: &model::Database, rule_id: &str) -> Vec<String> {
         if entry.routing_rule_id == rule_id && !password.is_empty() {
             affected.insert(password.clone());
         }
-    }
-    if !db.main_password.is_empty() && db.main_routing_rule_id == rule_id {
-        affected.insert(db.main_password.clone());
     }
     affected.into_iter().collect()
 }
@@ -4579,9 +4362,6 @@ async fn routing_rules_create(
                 p.routing_rule_id = id.clone();
             }
         }
-        if !db.main_password.is_empty() && assigned_clients.contains(&db.main_password) {
-            db.main_routing_rule_id = id.clone();
-        }
         // Набор считаем ПОСЛЕ привязки: у нового правила ещё нет старых
         // владельцев, поэтому «кого задеть» = «кому оно теперь назначено».
         let affected = rule_affected_passwords(&db, &id);
@@ -4678,13 +4458,6 @@ async fn routing_rules_update(
                 entry.routing_rule_id.clear();
             }
         }
-        if !db.main_password.is_empty() {
-            if assigned_clients.contains(&db.main_password) {
-                db.main_routing_rule_id = id.clone();
-            } else if db.main_routing_rule_id == id {
-                db.main_routing_rule_id.clear();
-            }
-        }
         let affected = merge_affected_passwords(&before, &rule_affected_passwords(&db, &id));
         (state.app.db_persistence.submit(db.clone()), affected)
     };
@@ -4714,9 +4487,6 @@ async fn routing_rules_delete(State(state): State<WebState>, Path(id): Path<Stri
             if entry.routing_rule_id == id {
                 entry.routing_rule_id.clear();
             }
-        }
-        if db.main_routing_rule_id == id {
-            db.main_routing_rule_id.clear();
         }
         (state.app.db_persistence.submit(db.clone()), affected)
     };
@@ -5195,9 +4965,6 @@ async fn is_valid_secret_path(raw_path: &str, app: &Arc<App>) -> bool {
     let first_segment = trimmed.split('/').next().unwrap_or("");
     if !first_segment.is_empty() {
         let db = app.db.read().await;
-        if !db.main_sub_uuid.is_empty() && db.main_sub_uuid == first_segment {
-            return true;
-        }
         if db
             .passwords
             .values()
@@ -5792,10 +5559,6 @@ fn panel_router(app: Arc<App>) -> Router {
             "/api/settings/restart-interval",
             post(api_settings_restart_interval),
         )
-        .route(
-            "/api/settings/master-password",
-            post(api_settings_master_password),
-        )
         .route("/api/clients/batch-toggle", post(api_clients_batch_toggle))
         .route("/api/clients/batch-extend", post(api_clients_batch_extend))
         .route(
@@ -5988,7 +5751,7 @@ static PWA_ICON_512_PNG: LazyLock<Vec<u8>> = LazyLock::new(|| {
         .unwrap_or_default()
 });
 
-const PWA_SERVICE_WORKER: &str = r##"const CACHE_NAME = 'csqtt-panel-shell-2.5.1-pwa4';
+const PWA_SERVICE_WORKER: &str = r##"const CACHE_NAME = 'csqtt-panel-shell-2.5.1-pwa5';
 const base = self.location.pathname.replace(/\/sw\.js$/, '');
 const SHELL_ASSETS = ['/manifest.webmanifest', '/pwa-icon.svg', '/pwa-icon-192.png', '/pwa-icon-512.png', '/qrcode.min.js'].map(p => (base ? base : '') + p);
 
@@ -8512,10 +8275,6 @@ const PANEL_HTML_TEMPLATE: &str = r##"
 
         .header-actions { display: flex; gap: 16px; align-items: center; }
 
-        .restart-required-banner { display: none; width: 100%; padding: 11px 20px; background: #b91c1c; color: #fff; text-align: center; font-size: 13px; font-weight: 700; box-shadow: 0 8px 20px rgba(185, 28, 28, 0.24); transform: translateY(-100%); opacity: 0; }
-        .restart-required-banner.visible { display: block; animation: restartBannerIn 0.32s ease-out forwards; }
-        @keyframes restartBannerIn { to { transform: translateY(0); opacity: 1; } }
-
         .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 10px 20px; font-size: 14px; font-weight: 600; border-radius: 12px; border: none; cursor: pointer; transition: all 0.2s; outline: none; }
         .btn:active { transform: scale(0.96); }
         .btn-primary { background: var(--primary); color: #fff; box-shadow: 0 4px 12px color-mix(in srgb, var(--primary) 25%, transparent); }
@@ -9723,8 +9482,6 @@ const PANEL_HTML_TEMPLATE: &str = r##"
             </div>
         </div>
     </header>
-    <div id="restartRequiredBanner" class="restart-required-banner">Для применения изменений необходимо перезагрузить CSQTT на сервере (перейдите в настройки)</div>
-
     <main>
         <div class="tabs-container">
             <div class="tabs">
@@ -9861,10 +9618,6 @@ const PANEL_HTML_TEMPLATE: &str = r##"
                     <button class="settings-action-btn danger" onclick="logout()">Выйти</button>
                 </div>
                 <div class="settings-grid">
-                    <div class="glass-panel setting-card" style="display: flex; flex-direction: column; justify-content: space-between;">
-                        <div class="input-group" style="margin-bottom: 0;"><label for="mainpass">Главный пароль</label><input id="mainpass"></div>
-                        <button id="saveMainPasswordBtn" class="btn btn-primary" style="width: 100%; margin-top: 22px;" onclick="saveMainPassword()" disabled>Сохранить главный пароль</button>
-                    </div>
                     <div class="glass-panel setting-card" style="display: flex; flex-direction: column; justify-content: space-between;">
                         <div class="input-group" style="margin-bottom: 0;">
                             <label for="dns_provider">DNS Адреса</label>
@@ -10646,7 +10399,7 @@ const PANEL_HTML_TEMPLATE: &str = r##"
                 </div>
                 <div class="api-card-body">
                     <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 8px;">
-                        Генерирует новый постоянный <code>sub_uuid</code> для клиента или Главного пароля, мгновенно аннулируя старый адрес подписки.
+                        Генерирует новый постоянный <code>sub_uuid</code> для клиента, мгновенно аннулируя старый адрес подписки.
                     </p>
                     <pre class="api-code-block"><code>Ответ: { "ok": true, "sub_uuid": "e2a3b4c5-..." }</code></pre>
                 </div>
@@ -10874,7 +10627,7 @@ const PANEL_HTML_TEMPLATE: &str = r##"
                 </div>
                 <div class="api-card-body">
                     <p style="font-size: 12px; color: var(--text-muted);">
-                        Публичная веб-страница подписки клиента или Главного пароля (без необходимости авторизации). Содержит живой векторный QR-код, прямую ссылку <code>csqtt://connect?...</code>, кнопку «Подключить в приложении CSQTT» (с нативным уведомлением в приложении), контрастную кнопку копирования и инструкции.
+                        Публичная веб-страница подписки клиента (без необходимости авторизации). Содержит живой векторный QR-код, прямую ссылку <code>csqtt://connect?...</code>, кнопку «Подключить в приложении CSQTT» (с нативным уведомлением в приложении), контрастную кнопку копирования и инструкции.
                     </p>
                 </div>
             </div>
@@ -11169,17 +10922,6 @@ const PANEL_HTML_TEMPLATE: &str = r##"
                 </div>
                 <div class="api-card-body">
                     <pre class="api-code-block"><code>{ "interval_hours": 12 }</code></pre>
-                </div>
-            </div>
-
-            <div class="api-card">
-                <div class="api-card-header">
-                    <span class="api-method post">POST</span>
-                    <span class="api-path">/api/settings/master-password</span>
-                    <span class="api-desc">Смена главного пароля сервера</span>
-                </div>
-                <div class="api-card-body">
-                    <pre class="api-code-block"><code>{ "password": "новый_пароль" }</code></pre>
                 </div>
             </div>
 
@@ -11485,16 +11227,11 @@ const PANEL_HTML_TEMPLATE: &str = r##"
             }
         }
 
-        let savedMainPassword = '';
         let savedDnsProvider = 'yandex';
         let savedManualDns = '';
         let savedAutoRestartInterval = 0;
         let sharedVkToken = '';
         let sharedVkHashes = '';
-
-        function setRestartRequired(required) {
-            document.getElementById('restartRequiredBanner')?.classList.toggle('visible', Boolean(required));
-        }
 
         function syncDnsControls() {
             const provider = document.getElementById('dns_provider')?.value;
@@ -11502,16 +11239,11 @@ const PANEL_HTML_TEMPLATE: &str = r##"
         }
 
         function updateSettingsDirtyState() {
-            const mainPassword = document.getElementById('mainpass')?.value ?? '';
             const dnsProvider = document.getElementById('dns_provider')?.value ?? '';
             const manualDns = document.getElementById('dns_manual')?.value ?? '';
             const autoRestartInterval = Number(document.getElementById('auto_restart_interval')?.value ?? 0);
-            const mainButton = document.getElementById('saveMainPasswordBtn');
             const dnsButton = document.getElementById('saveDnsBtn');
             const autoRestartButton = document.getElementById('saveAutoRestartIntervalBtn');
-            if (mainButton && !mainButton.classList.contains('saving')) {
-                mainButton.disabled = mainPassword === savedMainPassword;
-            }
             if (dnsButton && !dnsButton.classList.contains('saving')) {
                 dnsButton.disabled = dnsProvider === savedDnsProvider
                     && (dnsProvider !== 'custom' || manualDns === savedManualDns);
@@ -11523,7 +11255,6 @@ const PANEL_HTML_TEMPLATE: &str = r##"
 
         async function loadSettings() {
             let r = await api("/api/settings"); if(!r.ok) return; let x = await r.json();
-            savedMainPassword = x.main_password || '';
             savedDnsProvider = x.dns_provider || 'custom';
             savedManualDns = [x.dns_primary, x.dns_secondary].filter(Boolean).join(',');
             savedAutoRestartInterval = [0, 12, 24, 48, 72].includes(Number(x.auto_restart_interval_hours))
@@ -11531,12 +11262,10 @@ const PANEL_HTML_TEMPLATE: &str = r##"
                 : 0;
             sharedVkToken = x.vk_token || '';
             sharedVkHashes = x.vk_hashes || '';
-            document.getElementById('mainpass').value = savedMainPassword;
             document.getElementById('dns_provider').value = savedDnsProvider;
             document.getElementById('dns_manual').value = savedManualDns;
             document.getElementById('auto_restart_interval').value = String(savedAutoRestartInterval);
             syncDnsControls();
-            setRestartRequired(x.restart_required);
             updateSettingsDirtyState();
             loadLocalProxy();
         }
@@ -11809,8 +11538,7 @@ const PANEL_HTML_TEMPLATE: &str = r##"
         }
 
         function renderClientCard(x) {
-            const isMain = x.name === "Главный пароль";
-            const expiryStr = isMain ? "—" : (x.expires ? new Date(x.expires * 1000).toLocaleDateString() : "∞ Бессрочно");
+            const expiryStr = x.expires ? new Date(x.expires * 1000).toLocaleDateString() : "∞ Бессрочно";
             return `
             <div class="client-card" onclick="openEditClientDlgByPassword('${esc(x.password)}')">
                 <div class="client-card-header">
@@ -11958,7 +11686,7 @@ const PANEL_HTML_TEMPLATE: &str = r##"
                 const standaloneHtml = standaloneClients.map(x => renderClientCard(x)).join('');
                 container.innerHTML = groupsHtml + standaloneHtml;
                 if (!groupsHtml && !standaloneHtml) {
-                    container.innerHTML = `<div class="empty-state" style="grid-column: 1/-1;">Нет созданных доступов.</div>`;
+                    container.innerHTML = `<div class="empty-state" style="grid-column: 1/-1;">Клиентов ещё нет. Создайте первого клиента.</div>`;
                 }
                 refreshPresenceBadges();
                 return;
@@ -12783,7 +12511,6 @@ const PANEL_HTML_TEMPLATE: &str = r##"
                 filtered.routing_rules = data.routing_rules;
             }
             if (incSettings) {
-                filtered.main_password = data.main_password;
                 filtered.dns = data.dns;
                 filtered.dns_provider = data.dns_provider;
                 filtered.auto_restart_interval_hours = data.auto_restart_interval_hours;
@@ -13142,17 +12869,14 @@ const PANEL_HTML_TEMPLATE: &str = r##"
 
         function openEditClientDlg(c) {
             activeClient = c;
-            const isMain = c.name === "Главный пароль";
 
             document.getElementById('edit_name').value = c.name || '';
-            document.getElementById('edit_name').disabled = isMain;
             const groupSelect = document.getElementById('edit_group');
             if (groupSelect) {
                 groupSelect.innerHTML = '<option value="">Без группы</option>' + (window.groupsData || []).map(g =>
                     `<option value="${esc(g.id)}">${esc(g.name || 'Без названия')}</option>`
                 ).join('');
                 groupSelect.value = c.group_id || "";
-                groupSelect.disabled = isMain;
             }
             document.getElementById('edit_pass').value = c.password || '';
 
@@ -13161,22 +12885,16 @@ const PANEL_HTML_TEMPLATE: &str = r##"
                 remainingDays = Math.max(0, Math.ceil((c.expires * 1000 - Date.now()) / 86400000));
             }
             document.getElementById('edit_days').value = c.expires ? remainingDays : 0;
-            document.getElementById('edit_days').disabled = isMain;
 
             const editWorkers = document.getElementById('edit_workers');
             if (editWorkers) {
                 editWorkers.value = c.workers || 0;
-                editWorkers.disabled = isMain;
             }
 
             document.getElementById('edit_ip_info').textContent = c.ip || '—';
             document.getElementById('edit_traffic_info').textContent = `↑ ${size(c.up)} / ↓ ${size(c.down)}`;
 
             document.getElementById('edit_statusBtn').innerHTML = c.active ? 'Выкл' : 'Вкл';
-            document.getElementById('edit_statusBtn').style.display = isMain ? 'none' : 'inline-block';
-
-            document.getElementById('edit_deleteBtn').style.display = isMain ? 'none' : 'inline-block';
-            document.getElementById('edit_saveBtn').style.display = isMain ? 'none' : 'inline-block';
 
             document.getElementById('editDlg').showModal();
         }
@@ -13786,26 +13504,6 @@ const PANEL_HTML_TEMPLATE: &str = r##"
             updateSettingsDirtyState();
         }
 
-        async function saveMainPassword() {
-            const button = document.getElementById('saveMainPasswordBtn');
-            if (!button || button.disabled) return;
-            button.classList.add('saving'); button.disabled = true;
-            const value = document.getElementById('mainpass').value;
-            const response = await api('/api/settings', {
-                method: 'POST', body: JSON.stringify({ main_password: value })
-            });
-            if (!response.ok) {
-                button.classList.remove('saving');
-                showToast(await response.text(), 'error');
-                updateSettingsDirtyState();
-                return;
-            }
-            const result = await response.json();
-            savedMainPassword = value;
-            setRestartRequired(result.restart_required);
-            await animateSavedButton(button, 'Сохранить главный пароль');
-        }
-
         async function saveDnsSettings() {
             const button = document.getElementById('saveDnsBtn');
             const provider = document.getElementById('dns_provider')?.value || '';
@@ -13844,12 +13542,10 @@ const PANEL_HTML_TEMPLATE: &str = r##"
                 updateSettingsDirtyState();
                 return;
             }
-            const result = await response.json();
             savedDnsProvider = provider;
             savedManualDns = provider === 'custom'
                 ? [payload.dns_primary, payload.dns_secondary].filter(Boolean).join(',')
                 : savedManualDns;
-            setRestartRequired(result.restart_required);
             await animateSavedButton(button, 'Применить DNS');
         }
         async function saveAutoRestartInterval() {
@@ -13932,7 +13628,6 @@ const PANEL_HTML_TEMPLATE: &str = r##"
             startUpdateInterval(ms);
         }
 
-        document.getElementById('mainpass')?.addEventListener('input', updateSettingsDirtyState);
         const dnsProviderSelect = document.getElementById('dns_provider');
         dnsProviderSelect?.addEventListener('change', () => {
             syncDnsControls();
@@ -14252,7 +13947,7 @@ mod tests {
         use super::super::{ROUTING_RULE_BODY_LIMIT_BYTES, WEB_BODY_LIMIT_BYTES, panel_router};
         use crate::{
             App,
-            model::{self, Database, DatabasePersistence, RoutingRule},
+            model::{self, Database, DatabasePersistence, PasswordEntry, RoutingRule},
         };
         use axum::{
             Router,
@@ -14287,7 +13982,6 @@ mod tests {
                     tokio::sync::watch::channel(db.auto_restart_interval_hours());
                 let app = Arc::new(App {
                     dns: tokio::sync::RwLock::new(db.dns.clone()),
-                    startup_main_password: db.main_password.clone(),
                     db: tokio::sync::RwLock::new(db),
                     db_persistence,
                     log_file_path: config_dir.join("csqtt.log"),
@@ -14392,13 +14086,17 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn main_password_never_authorizes_panel_api() {
-            let target = Fixture::new(Database {
-                main_password: "owner-main-password".to_owned(),
-                ..Default::default()
-            })
-            .await;
-            target.app.db.write().await.main_password = "rotated-main-password".to_owned();
+        async fn client_password_never_authorizes_panel_api() {
+            let mut db = Database::default();
+            db.passwords.insert(
+                "owner-main-password".to_owned(),
+                PasswordEntry {
+                    ip: "10.66.67.2".to_owned(),
+                    name: "Владелец".to_owned(),
+                    ..Default::default()
+                },
+            );
+            let target = Fixture::new(db).await;
 
             for password in ["owner-main-password", "rotated-main-password"] {
                 for uri in ["/api/settings", "/api/clients", "/api/export"] {
@@ -14427,6 +14125,338 @@ mod tests {
             eprintln!(
                 "main password rejected as x-api-key/Bearer; panel password still authorizes"
             );
+        }
+
+        #[tokio::test]
+        async fn settings_has_no_main_password_field() {
+            let mut db = Database::default();
+            db.passwords.insert(
+                "OwnerMainPass123".to_owned(),
+                PasswordEntry {
+                    ip: "10.66.67.2".to_owned(),
+                    name: "Владелец".to_owned(),
+                    ..Default::default()
+                },
+            );
+            let fixture = Fixture::new(db).await;
+            let response = fixture.request("GET", "/api/settings", Vec::new()).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let json: Value = serde_json::from_slice(&body).unwrap();
+            assert!(json.get("main_password").is_none());
+            assert!(json.get("restart_required").is_none());
+        }
+
+        #[tokio::test]
+        async fn master_password_route_is_absent() {
+            let mut db = Database::default();
+            db.passwords.insert(
+                "OwnerMainPass123".to_owned(),
+                PasswordEntry {
+                    ip: "10.66.67.2".to_owned(),
+                    name: "Владелец".to_owned(),
+                    ..Default::default()
+                },
+            );
+            let target = Fixture::new(db).await;
+            let before = target.snapshots().await;
+            let response = target
+                .request(
+                    "POST",
+                    "/api/settings/master-password",
+                    br#"{"password":"InjectedOwnerPass1"}"#.to_vec(),
+                )
+                .await;
+            // The production router answers unknown paths with the stealth abort,
+            // never with a route that could mutate the owner.
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(response.headers().contains_key("x-csqtt-stealth-rst"));
+            assert_eq!(target.snapshots().await, before);
+        }
+
+        #[tokio::test]
+        async fn settings_post_ignores_legacy_main_password() {
+            let mut db = Database::default();
+            db.passwords.insert(
+                "OwnerMainPass123".to_owned(),
+                PasswordEntry {
+                    ip: "10.66.67.2".to_owned(),
+                    name: "Владелец".to_owned(),
+                    ..Default::default()
+                },
+            );
+            let fixture = Fixture::new(db).await;
+            let response = fixture
+                .request(
+                    "POST",
+                    "/api/settings",
+                    br#"{"main_password":"InjectedOwnerPass1","dns_provider":"cloudflare"}"#
+                        .to_vec(),
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let db = fixture.app.db.read().await;
+            assert_eq!(db.passwords.len(), 1);
+            assert!(!db.passwords.contains_key("InjectedOwnerPass1"));
+            assert_eq!(db.dns, "1.1.1.1,1.0.0.1");
+        }
+
+        #[tokio::test]
+        async fn clients_list_includes_owner_as_regular_client() {
+            let mut db = Database::default();
+            db.passwords.insert(
+                "OwnerMainPass123".to_owned(),
+                PasswordEntry {
+                    ip: "10.66.67.2".to_owned(),
+                    name: "Владелец".to_owned(),
+                    ..Default::default()
+                },
+            );
+            let fixture = Fixture::new(db).await;
+            let response = fixture.request("GET", "/api/clients", Vec::new()).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let list: Value = serde_json::from_slice(&body).unwrap();
+            let clients = list.as_array().unwrap();
+            assert_eq!(clients.len(), 1);
+            assert_eq!(clients[0]["password"], "OwnerMainPass123");
+            assert_eq!(clients[0]["name"], "Владелец");
+            assert_eq!(clients[0]["ip"], "10.66.67.2");
+            assert_eq!(clients[0]["active"], true);
+        }
+
+        #[tokio::test]
+        async fn clients_list_does_not_invent_dot3_for_empty_ip() {
+            let mut db = Database::default();
+            db.passwords.insert(
+                "EmptyIpClient12".to_owned(),
+                PasswordEntry {
+                    name: "Без адреса".to_owned(),
+                    ..Default::default()
+                },
+            );
+            let fixture = Fixture::new(db).await;
+            // Fixture repairs empty addresses on startup; clear it afterwards to
+            // observe what the panel does with a genuinely empty entry.
+            fixture
+                .app
+                .db
+                .write()
+                .await
+                .passwords
+                .get_mut("EmptyIpClient12")
+                .unwrap()
+                .ip
+                .clear();
+            let response = fixture.request("GET", "/api/clients", Vec::new()).await;
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let list: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(list[0]["ip"], "");
+        }
+
+        #[tokio::test]
+        async fn clients_get_with_empty_database_returns_empty_list() {
+            let fixture = Fixture::new(Database::default()).await;
+            let response = fixture.request("GET", "/api/clients", Vec::new()).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let list: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(list, json!([]));
+
+            let response = fixture
+                .request(
+                    "POST",
+                    "/api/clients",
+                    serde_json::to_vec(&json!({"name": "Первый", "days": 0})).unwrap(),
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let response = fixture.request("GET", "/api/clients", Vec::new()).await;
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let list: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(list.as_array().unwrap().len(), 1);
+            assert_eq!(list[0]["name"], "Первый");
+        }
+
+        #[tokio::test]
+        async fn owner_is_mutable_through_regular_handlers() {
+            const OWNER: &str = "OwnerMainPass123";
+            let mut db = Database::default();
+            db.passwords.insert(
+                "OwnerMainPass123".to_owned(),
+                PasswordEntry {
+                    ip: "10.66.67.2".to_owned(),
+                    name: "Владелец".to_owned(),
+                    ..Default::default()
+                },
+            );
+            let fixture = Fixture::new(db).await;
+            let original_sub = fixture.app.db.read().await.passwords[OWNER]
+                .sub_uuid
+                .clone();
+
+            let response = fixture
+                .request(
+                    "POST",
+                    &format!("/api/clients/{OWNER}"),
+                    serde_json::to_vec(&json!({
+                        "name": "Владелец",
+                        "days": 30,
+                        "workers": 0,
+                        "hash": "",
+                        "vk_token": false,
+                        "group_id": "",
+                    }))
+                    .unwrap(),
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+
+            for path in [
+                format!("/api/clients/{OWNER}/toggle"),
+                format!("/api/clients/{OWNER}/reset-traffic"),
+                format!("/api/clients/{OWNER}/unbind"),
+            ] {
+                let response = fixture.request("POST", &path, Vec::new()).await;
+                assert_eq!(response.status(), StatusCode::OK, "{path}");
+            }
+            let response = fixture
+                .request(
+                    "POST",
+                    &format!("/api/clients/{OWNER}/extend"),
+                    br#"{"days":30}"#.to_vec(),
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let response = fixture
+                .request(
+                    "PUT",
+                    &format!("/api/clients/{OWNER}/vk"),
+                    br#"{"vk_hashes":"abcdef1234567890","vk_token":false}"#.to_vec(),
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let response = fixture
+                .request(
+                    "POST",
+                    &format!("/api/clients/{OWNER}/sub-link/regenerate"),
+                    Vec::new(),
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let response = fixture
+                .request("POST", "/api/groups", br#"{"name":"Owner group"}"#.to_vec())
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let group: Value = serde_json::from_slice(&body).unwrap();
+            let group_id = group["id"].as_str().unwrap().to_owned();
+            let response = fixture
+                .request(
+                    "POST",
+                    "/api/clients/batch-group",
+                    serde_json::to_vec(&json!({
+                        "passwords": [OWNER],
+                        "group_id": group_id,
+                    }))
+                    .unwrap(),
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let response = fixture
+                .request(
+                    "POST",
+                    "/api/routing-rules",
+                    serde_json::to_vec(&json!({
+                        "name": "Owner rule",
+                        "assigned_clients": [OWNER],
+                    }))
+                    .unwrap(),
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let rule: Value = serde_json::from_slice(&body).unwrap();
+            let rule_id = rule["id"].as_str().unwrap().to_owned();
+
+            for (path, body) in [
+                (
+                    "/api/clients/batch-toggle",
+                    serde_json::to_vec(&json!({"passwords": [OWNER], "active": true})).unwrap(),
+                ),
+                (
+                    "/api/clients/batch-extend",
+                    serde_json::to_vec(&json!({"passwords": [OWNER], "days": 1})).unwrap(),
+                ),
+                (
+                    "/api/clients/batch-reset-traffic",
+                    serde_json::to_vec(&json!({"passwords": [OWNER]})).unwrap(),
+                ),
+            ] {
+                let response = fixture.request("POST", path, body).await;
+                assert_eq!(response.status(), StatusCode::OK, "{path}");
+            }
+
+            let db = fixture.app.db.read().await;
+            let entry = &db.passwords[OWNER];
+            assert_eq!(entry.name, "Владелец");
+            assert_eq!(entry.group_id, group_id);
+            assert_eq!(entry.routing_rule_id, rule_id);
+            assert!(entry.expires_at > model::now());
+            assert_eq!(entry.vk_hashes, "abcdef1234567890");
+            assert_ne!(entry.sub_uuid, original_sub);
+            assert!(!entry.is_deactivated);
+        }
+
+        #[tokio::test]
+        async fn deactivated_owner_is_inactive_in_panel_and_denied_in_tunnel() {
+            const OWNER: &str = "OwnerMainPass123";
+            let mut db = Database::default();
+            db.passwords.insert(
+                "OwnerMainPass123".to_owned(),
+                PasswordEntry {
+                    ip: "10.66.67.2".to_owned(),
+                    name: "Владелец".to_owned(),
+                    ..Default::default()
+                },
+            );
+            let fixture = Fixture::new(db).await;
+            let session = crate::protocol::Session::new(
+                7,
+                "127.0.0.1:40000".parse().unwrap(),
+                OWNER,
+                1,
+                "owner-session-salt",
+                false,
+                fixture.app.stream_debug_active.clone(),
+                model::now() as u64,
+            );
+            fixture.app.sessions.insert(session.id, session);
+
+            let response = fixture
+                .request("POST", &format!("/api/clients/{OWNER}/toggle"), Vec::new())
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+
+            // Deactivation resolves through the ordinary `passwords` entry, so the
+            // tunnel teardown drops the owner's live session just like a client's.
+            assert!(fixture.app.sessions.is_empty());
+
+            let response = fixture.request("GET", "/api/clients", Vec::new()).await;
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let list: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(list[0]["password"], OWNER);
+            assert_eq!(list[0]["active"], false);
+
+            let response = fixture
+                .request("GET", &format!("/api/clients/{OWNER}"), Vec::new())
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let info: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(info["active"], false);
         }
 
         fn large_rule() -> RoutingRule {
@@ -14481,14 +14511,13 @@ mod tests {
         #[tokio::test]
         async fn import_validates_all_rules_before_mutating_memory_or_storage() {
             let target = Fixture::new(Database {
-                main_password: "existing-main-password".to_owned(),
                 dns: "77.88.8.8,77.88.8.1".to_owned(),
                 ..Default::default()
             })
             .await;
             let before = target.snapshots().await;
             let mut export: Value = serde_json::from_slice(&target.export().await).unwrap();
-            export["main_password"] = json!("changed-main-password");
+            export["vk_hashes"] = json!("changed-vk-hashes");
             export["dns"] = json!("1.1.1.1,1.0.0.1");
             export["dns_provider"] = json!("cloudflare");
             export["auto_restart_interval_hours"] = json!(3);
@@ -14574,14 +14603,274 @@ mod tests {
                 "P2.12: import 262144 bytes -> 200, 262145 -> 413; settings/clients/groups 16385 bytes -> 413"
             );
         }
+
+        /// Owner as it lives in `passwords` after Task 1's migration.
+        fn owner_password_entry() -> PasswordEntry {
+            PasswordEntry {
+                ip: "10.66.67.2".to_owned(),
+                expires_at: 1_700_000_000,
+                down_bytes: 11,
+                up_bytes: 22,
+                vk_hash: "owner-hash".to_owned(),
+                ports: "46000-46010".to_owned(),
+                name: "Владелец".to_owned(),
+                vk_hashes: "hash_a,hash_b".to_owned(),
+                vk_token_enabled: true,
+                dtls_port: 46000,
+                local_port: 46001,
+                group_id: "owner-group".to_owned(),
+                routing_rule_id: "owner-rule".to_owned(),
+                sub_uuid: "owner-sub-uuid".to_owned(),
+                workers: Some(5),
+                ..Default::default()
+            }
+        }
+
+        /// Export payload as written by a v1 server: owner password outside `clients`.
+        fn v1_export_payload(main_password: &str) -> Value {
+            json!({
+                "exported_at": 1_700_000_000,
+                "main_password": main_password,
+                "dns": "9.9.9.9,149.112.112.112",
+                "dns_provider": "custom",
+                "auto_restart_interval_hours": 24,
+                "vk_access_token": "",
+                "vk_hashes": "",
+                "groups": {},
+                "routing_rules": {},
+                "clients": [],
+            })
+        }
+
+        #[tokio::test]
+        async fn export_v2_has_owner_in_clients_and_no_main_password() {
+            const OWNER: &str = "OwnerMainPass123";
+            let mut db = Database::default();
+            db.passwords
+                .insert(OWNER.to_owned(), owner_password_entry());
+            let fixture = Fixture::new(db).await;
+
+            let export: Value = serde_json::from_slice(&fixture.export().await).unwrap();
+            assert_eq!(export["version"], 2);
+            assert!(
+                export.get("main_password").is_none(),
+                "v2 export must not carry a separate owner password"
+            );
+            let clients = export["clients"].as_array().unwrap();
+            assert_eq!(clients.len(), 1);
+            let owner = &clients[0];
+            assert_eq!(owner["password"], OWNER);
+            assert_eq!(owner["name"], "Владелец");
+            assert_eq!(owner["ip"], "10.66.67.2");
+            assert_eq!(owner["expires_at"], 1_700_000_000);
+            assert_eq!(owner["down_bytes"], 11);
+            assert_eq!(owner["up_bytes"], 22);
+            assert_eq!(owner["vk_hash"], "owner-hash");
+            assert_eq!(owner["ports"], "46000-46010");
+            assert_eq!(owner["vk_hashes"], "hash_a,hash_b");
+            assert_eq!(owner["vk_token_enabled"], true);
+            assert_eq!(owner["dtls_port"], 46000);
+            assert_eq!(owner["local_port"], 46001);
+            assert_eq!(owner["group_id"], "owner-group");
+            assert_eq!(owner["routing_rule_id"], "owner-rule");
+            assert_eq!(owner["sub_uuid"], "owner-sub-uuid");
+            assert_eq!(owner["workers"], 5);
+        }
+
+        #[tokio::test]
+        async fn import_v1_main_password_creates_owner_client_when_free() {
+            const OWNER: &str = "LegacyOwnerPass1";
+            // (import_clients, import_settings, owner expected)
+            for (import_clients, import_settings, expect_owner) in [
+                (false, false, false),
+                (false, true, false),
+                (true, false, true),
+                (true, true, true),
+            ] {
+                let target = Fixture::new(Database {
+                    dns: "77.88.8.8,77.88.8.1".to_owned(),
+                    dns_provider: "yandex".to_owned(),
+                    ..Default::default()
+                })
+                .await;
+                let mut export = v1_export_payload(OWNER);
+                // A v1 export may omit `version` entirely; an explicit `version: 1`
+                // is the same format.
+                if import_clients {
+                    export["version"] = json!(1);
+                }
+                let body = serde_json::to_vec(&json!({
+                    "import_clients": import_clients,
+                    "import_settings": import_settings,
+                    "config": export,
+                }))
+                .unwrap();
+
+                let response = target.request("POST", "/api/import", body).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let answer: Value = serde_json::from_slice(
+                    &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    answer["added_clients"],
+                    if expect_owner { 1 } else { 0 },
+                    "import_clients={import_clients} import_settings={import_settings}"
+                );
+
+                let db = target.app.db.read().await;
+                if expect_owner {
+                    let owner = db
+                        .passwords
+                        .get(OWNER)
+                        .expect("v1 main_password becomes an owner client");
+                    assert_eq!(owner.name, "Владелец");
+                    assert_eq!(owner.ip, "10.66.67.2");
+                    assert!(!owner.sub_uuid.is_empty());
+                    assert_eq!(owner.expires_at, 0);
+                } else {
+                    assert!(
+                        !db.passwords.contains_key(OWNER),
+                        "import_clients=false must not create the owner"
+                    );
+                }
+                if import_settings {
+                    assert_eq!(db.dns, "9.9.9.9,149.112.112.112");
+                    assert_eq!(db.dns_provider, "custom");
+                } else {
+                    assert_eq!(db.dns, "77.88.8.8,77.88.8.1");
+                    assert_eq!(db.dns_provider, "yandex");
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn import_v1_owner_inherits_global_vk_hashes_and_unique_name() {
+            const OWNER: &str = "LegacyOwnerVk1";
+            let mut db = Database {
+                vk_hashes: "target-global-hash".to_owned(),
+                ..Default::default()
+            };
+            db.passwords.insert(
+                "existing-owner-name".to_owned(),
+                PasswordEntry {
+                    name: "Владелец".to_owned(),
+                    ..Default::default()
+                },
+            );
+            let fixture = Fixture::new(db).await;
+            let mut export = v1_export_payload(OWNER);
+            export["vk_hashes"] = json!("export-global-hash");
+            let body = serde_json::to_vec(&json!({
+                "import_clients": true,
+                "import_settings": true,
+                "config": export,
+            }))
+            .unwrap();
+            let response = fixture.request("POST", "/api/import", body).await;
+            assert!(response.status().is_success());
+            let db = fixture.app.db.read().await;
+            let owner = db.passwords.get(OWNER).expect("owner client");
+            assert_eq!(owner.vk_hashes, "export-global-hash");
+            assert_ne!(owner.name, "Владелец");
+        }
+
+        #[tokio::test]
+        async fn import_v1_owner_uses_target_hashes_without_settings() {
+            const OWNER: &str = "LegacyOwnerVk2";
+            let db = Database {
+                vk_hashes: "target-global-hash".to_owned(),
+                ..Default::default()
+            };
+            let fixture = Fixture::new(db).await;
+            let mut export = v1_export_payload(OWNER);
+            export["vk_hashes"] = json!("export-global-hash");
+            let body = serde_json::to_vec(&json!({
+                "import_clients": true,
+                "import_settings": false,
+                "config": export,
+            }))
+            .unwrap();
+            let response = fixture.request("POST", "/api/import", body).await;
+            assert!(response.status().is_success());
+            let db = fixture.app.db.read().await;
+            let owner = db.passwords.get(OWNER).expect("owner client");
+            assert_eq!(owner.vk_hashes, "target-global-hash");
+        }
+
+        #[tokio::test]
+        async fn import_v1_does_not_overwrite_existing_client_with_same_password() {
+            const OWNER: &str = "LegacyOwnerPass1";
+            let mut db = Database::default();
+            db.passwords.insert(
+                OWNER.to_owned(),
+                PasswordEntry {
+                    ip: "10.66.67.7".to_owned(),
+                    name: "Existing client".to_owned(),
+                    up_bytes: 42,
+                    ..Default::default()
+                },
+            );
+            let target = Fixture::new(db).await;
+            let body = serde_json::to_vec(&json!({
+                "import_clients": true,
+                "import_settings": false,
+                "config": v1_export_payload(OWNER),
+            }))
+            .unwrap();
+
+            let response = target.request("POST", "/api/import", body).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let answer: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            assert_eq!(answer["added_clients"], 0);
+
+            let db = target.app.db.read().await;
+            assert_eq!(db.passwords.len(), 1);
+            let existing = &db.passwords[OWNER];
+            assert_eq!(existing.name, "Existing client");
+            assert_eq!(existing.ip, "10.66.67.7");
+            assert_eq!(existing.up_bytes, 42);
+        }
+
+        #[tokio::test]
+        async fn import_v2_round_trips_owner() {
+            const OWNER: &str = "OwnerMainPass123";
+            let mut db = Database::default();
+            db.passwords
+                .insert(OWNER.to_owned(), owner_password_entry());
+            let source = Fixture::new(db).await;
+            let source_entry = source.app.db.read().await.passwords[OWNER].clone();
+
+            let mut export: Value = serde_json::from_slice(&source.export().await).unwrap();
+            // A v2 payload may still contain the retired field; it is ignored.
+            export["main_password"] = json!("InjectedOwnerPass1");
+            let body =
+                serde_json::to_vec(&json!({"import_clients": true, "config": export})).unwrap();
+
+            let target = Fixture::new(Database::default()).await;
+            let response = target.request("POST", "/api/import", body).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let answer: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            assert_eq!(answer["added_clients"], 1);
+
+            let db = target.app.db.read().await;
+            assert_eq!(db.passwords.len(), 1);
+            assert!(!db.passwords.contains_key("InjectedOwnerPass1"));
+            assert_eq!(
+                serde_json::to_value(&db.passwords[OWNER]).unwrap(),
+                serde_json::to_value(&source_entry).unwrap(),
+                "every exported owner field round-trips through clients"
+            );
+        }
     }
 
-    /// База с одним правилом `rule_1`, прямым клиентом, группой и main.
+    /// База с одним правилом `rule_1`, прямым клиентом и группой.
     fn affected_fixture() -> crate::model::Database {
-        let mut db = crate::model::Database {
-            main_password: "main-pass".to_owned(),
-            ..Default::default()
-        };
+        let mut db = crate::model::Database::default();
         db.passwords.insert(
             "direct-pass".to_owned(),
             crate::model::PasswordEntry {
@@ -14629,23 +14918,6 @@ mod tests {
             !affected.contains(&"overridden-pass".to_owned()),
             "клиент с собственным правилом не зависит от групповой привязки"
         );
-        assert!(
-            !affected.contains(&"main-pass".to_owned()),
-            "main привязывается отдельно и не попадает в набор по умолчанию"
-        );
-    }
-
-    #[test]
-    fn rule_affected_passwords_includes_main_only_for_its_own_binding() {
-        let mut db = affected_fixture();
-        db.main_routing_rule_id = "rule_1".to_owned();
-        let affected = rule_affected_passwords(&db, "rule_1");
-        assert!(affected.contains(&"main-pass".to_owned()));
-        // Другое правило main не имеет отношения к затронутым.
-        assert_eq!(
-            rule_affected_passwords(&db, "rule_2"),
-            vec!["overridden-pass".to_owned()]
-        );
     }
 
     #[test]
@@ -14668,16 +14940,18 @@ mod tests {
     }
 
     #[test]
-    fn group_affected_passwords_never_includes_main() {
+    fn group_affected_passwords_excludes_direct_bindings() {
         let mut db = affected_fixture();
-        // Даже при совпадении с правилом группы main резолвится только через
-        // `main_routing_rule_id` и на членство в группе не опирается.
-        db.main_routing_rule_id = "rule_1".to_owned();
-        assert_eq!(
-            group_affected_passwords(&db, "g1"),
-            vec!["group-pass".to_owned()]
+        // Клиент с собственным правилом не состоит в группе, поэтому
+        // перепривязка группы его не затрагивает.
+        db.passwords.insert(
+            "owner-pass".to_owned(),
+            crate::model::PasswordEntry {
+                ip: "10.66.67.2".to_owned(),
+                routing_rule_id: "rule_1".to_owned(),
+                ..Default::default()
+            },
         );
-        db.main_routing_rule_id = "rule_other".to_owned();
         assert_eq!(
             group_affected_passwords(&db, "g1"),
             vec!["group-pass".to_owned()]
@@ -14689,7 +14963,6 @@ mod tests {
     #[test]
     fn group_rebinding_keeps_the_member_in_the_union() {
         let mut db = affected_fixture();
-        db.main_routing_rule_id = "rule_1".to_owned();
         let before = group_affected_passwords(&db, "g1");
         assert_eq!(before, vec!["group-pass".to_owned()]);
 
@@ -14702,11 +14975,7 @@ mod tests {
         assert_eq!(after, vec!["group-pass".to_owned()]);
 
         let merged = merge_affected_passwords(&before, &after);
-        assert_eq!(
-            merged,
-            vec!["group-pass".to_owned()],
-            "main не наследует группу и в набор не попадает"
-        );
+        assert_eq!(merged, vec!["group-pass".to_owned()]);
     }
 
     #[test]
@@ -14862,6 +15131,16 @@ mod tests {
         assert!(!PANEL_HTML.contains("refreshDnsProviderPings"));
         assert!(PANEL_HTML.contains("dns_provider: 'custom'"));
         assert!(PANEL_HTML.contains("syncDnsControls"));
+    }
+
+    #[test]
+    fn panel_html_has_no_master_password_and_guides_first_client() {
+        assert!(!PANEL_HTML.contains("id=\"mainpass\""));
+        assert!(!PANEL_HTML.contains("master-password"));
+        assert!(!PANEL_HTML.contains("savedMainPassword"));
+        assert!(!PANEL_HTML.contains("isMain"));
+        assert!(!PANEL_HTML.contains("restart_required"));
+        assert!(PANEL_HTML.contains("Клиентов ещё нет. Создайте первого клиента."));
     }
 
     #[test]

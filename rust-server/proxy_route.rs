@@ -10,13 +10,6 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-const LEGACY_POLICY_TABLE: &str = "1066";
-const LEGACY_POLICY_PRIORITY: &str = "1066";
-const NAT_COMMENT: &str = "CSQTT_LOCAL_SOCKS";
-const MARK_COMMENT: &str = "CSQTT_LOCAL_SOCKS_MARK";
-const POLICY_MARK: &str = "0x422";
-const LEGACY_NAT_COMMENT: &str = "CSQTT_SOCKS";
-const LEGACY_QUIC_COMMENT: &str = "CSQTT_CASCADE_NO_QUIC";
 const TPROXY_TABLE: &str = "30001";
 const TPROXY_PRIORITY: &str = "30001";
 const TPROXY_RULE_MARK: &str = "0x7531/0x7531";
@@ -69,7 +62,6 @@ impl ProxyRoute {
             remove_tproxy_status_file(&status_path);
             let _guard = POLICY_LOCK.lock().await;
             cleanup_shared_policy().await;
-            cleanup_legacy_proxy_policy().await;
             return Err(error);
         }
 
@@ -142,7 +134,6 @@ impl ProxyRoute {
         let _guard = POLICY_LOCK.lock().await;
         ACTIVE_RUNTIME.store(0, Ordering::Release);
         cleanup_shared_policy().await;
-        cleanup_legacy_proxy_policy().await;
         verify_proxy_policy_clean().await
     }
 }
@@ -498,7 +489,6 @@ pub(crate) fn socks_udp_response(packet: &[u8]) -> Result<(SocketAddr, &[u8])> {
 
 async fn activate_tproxy(runtime_id: u64, port: u16) -> Result<()> {
     let _guard = POLICY_LOCK.lock().await;
-    cleanup_legacy_proxy_policy().await;
     let _ = command_output("sysctl", &["-w", "net.ipv4.ip_forward=1"]).await;
     let _ = command_output("sysctl", &["-w", "net.ipv4.conf.all.rp_filter=2"]).await;
     let _ = command_output("sysctl", &["-w", "net.ipv4.conf.default.rp_filter=2"]).await;
@@ -777,171 +767,6 @@ fn iptables_spec_tokens(spec: &str) -> Vec<String> {
     tokens
 }
 
-async fn remove_from_subnet_rule() {
-    while command_success(
-        "ip",
-        &[
-            "rule",
-            "del",
-            "from",
-            crate::tun_device::TUN_SUBNET,
-            "priority",
-            LEGACY_POLICY_PRIORITY,
-            "table",
-            LEGACY_POLICY_TABLE,
-        ],
-    )
-    .await
-    {}
-}
-
-async fn drop_new_flow_mark_rules() {
-    while command_success(
-        "iptables",
-        &[
-            "-t",
-            "mangle",
-            "-D",
-            "PREROUTING",
-            "-s",
-            crate::tun_device::TUN_SUBNET,
-            "-m",
-            "conntrack",
-            "--ctstate",
-            "NEW",
-            "-m",
-            "comment",
-            "--comment",
-            MARK_COMMENT,
-            "-j",
-            "CONNMARK",
-            "--set-xmark",
-            POLICY_MARK,
-        ],
-    )
-    .await
-    {}
-}
-
-async fn cleanup_mark_rules() {
-    drop_new_flow_mark_rules().await;
-    while command_success(
-        "iptables",
-        &[
-            "-t",
-            "mangle",
-            "-D",
-            "PREROUTING",
-            "-s",
-            crate::tun_device::TUN_SUBNET,
-            "-m",
-            "comment",
-            "--comment",
-            MARK_COMMENT,
-            "-j",
-            "CONNMARK",
-            "--restore-mark",
-        ],
-    )
-    .await
-    {}
-    while command_success(
-        "ip",
-        &[
-            "rule",
-            "del",
-            "fwmark",
-            POLICY_MARK,
-            "priority",
-            LEGACY_POLICY_PRIORITY,
-            "table",
-            LEGACY_POLICY_TABLE,
-        ],
-    )
-    .await
-    {}
-}
-
-async fn cleanup_nat_exemption(tun_name: &str) {
-    for comment in [NAT_COMMENT, LEGACY_NAT_COMMENT] {
-        while command_success(
-            "iptables",
-            &[
-                "-t",
-                "nat",
-                "-D",
-                "POSTROUTING",
-                "-s",
-                crate::tun_device::TUN_SUBNET,
-                "-o",
-                tun_name,
-                "-m",
-                "comment",
-                "--comment",
-                comment,
-                "-j",
-                "ACCEPT",
-            ],
-        )
-        .await
-        {}
-    }
-}
-
-async fn cleanup_all_nat_exemptions() {
-    let rules = command_output("iptables", &["-t", "nat", "-S", "POSTROUTING"])
-        .await
-        .unwrap_or_default();
-    let mut interfaces = std::collections::BTreeSet::new();
-    for line in rules.lines() {
-        if (line.contains(NAT_COMMENT) || line.contains(LEGACY_NAT_COMMENT))
-            && let Some(index) = line.find(" -o ")
-            && let Some(interface) = line[index + 4..].split_whitespace().next()
-        {
-            interfaces.insert(interface.to_owned());
-        }
-    }
-    for interface in interfaces {
-        cleanup_nat_exemption(&interface).await;
-    }
-}
-
-async fn cleanup_legacy_quic_rule() {
-    while command_success(
-        "iptables",
-        &[
-            "-D",
-            "FORWARD",
-            "-s",
-            crate::tun_device::TUN_SUBNET,
-            "-p",
-            "udp",
-            "--dport",
-            "443",
-            "-m",
-            "comment",
-            "--comment",
-            LEGACY_QUIC_COMMENT,
-            "-j",
-            "REJECT",
-            "--reject-with",
-            "icmp-port-unreachable",
-        ],
-    )
-    .await
-    {}
-}
-
-async fn cleanup_legacy_proxy_policy() {
-    tokio::join!(
-        cleanup_legacy_quic_rule(),
-        cleanup_mark_rules(),
-        remove_from_subnet_rule(),
-        cleanup_all_nat_exemptions()
-    );
-    let _ = command_output("ip", &["route", "flush", "table", LEGACY_POLICY_TABLE]).await;
-}
-
 async fn cleanup_shared_policy() {
     let stale_rules = cleanup_stale_tproxy_rules();
     let policy_rule = async {
@@ -983,25 +808,15 @@ async fn verify_proxy_policy_clean() -> Result<()> {
             rules.push_str(&chunk);
         }
     }
-    for marker in [
-        "CSQTT_TPROXY",
-        NAT_COMMENT,
-        MARK_COMMENT,
-        LEGACY_NAT_COMMENT,
-        LEGACY_QUIC_COMMENT,
-    ] {
-        if rules.contains(marker) {
-            bail!("stale netfilter rule remains: {marker}");
-        }
+    if rules.contains("CSQTT_TPROXY") {
+        bail!("stale netfilter rule remains: CSQTT_TPROXY");
     }
     let rules = command_output("ip", &["-4", "rule", "show"]).await?;
     for line in rules.lines() {
         let owned_tproxy = line.trim_start().starts_with("30001:")
             && line.contains("fwmark 0x7531")
             && line.contains("lookup 30001");
-        let owned_legacy = line.trim_start().starts_with("1066:")
-            && (line.contains("lookup 1066") || line.contains("fwmark 0x422"));
-        if owned_tproxy || owned_legacy {
+        if owned_tproxy {
             bail!("stale policy rule remains: {}", line.trim());
         }
     }

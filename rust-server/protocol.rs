@@ -805,12 +805,6 @@ impl PasswordEpochState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum CredentialAccess {
-    Main,
-    Slot(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionEpochIdentity {
     password: String,
     generation_id: u64,
@@ -1992,9 +1986,6 @@ async fn build_credentials(app: &Arc<App>) -> Result<Arc<CredentialSet>> {
     let keys_to_derive = {
         let db = db_read(app).await?;
         let mut keys = Vec::new();
-        if !db.main_password.is_empty() {
-            keys.push(db.main_password.clone());
-        }
         for pass in db.passwords.keys() {
             if !pass.is_empty() {
                 keys.push(pass.clone());
@@ -4568,7 +4559,7 @@ async fn handle_getworkers(
     let server_limit = access
         .as_ref()
         .ok()
-        .and_then(|a| resolve_worker_limit_access(&db, a));
+        .and_then(|key| resolve_worker_limit_access(&db, key));
 
     let (agreed, limit_val) = match server_limit {
         Some(limit) if (3..=MAX_STREAM_WORKERS_U16 as u32).contains(&limit) => {
@@ -4626,80 +4617,59 @@ async fn handle_getworkers(
 fn getconf_credential_access(
     db: &Database,
     password: &str,
-) -> std::result::Result<CredentialAccess, &'static str> {
+) -> std::result::Result<String, &'static str> {
     let token = password.trim();
     if token.is_empty() {
         return Err("DENIED:wrong_password");
     }
-    if !db.main_password.is_empty() && secret_eq(&db.main_password, token) {
-        return Ok(CredentialAccess::Main);
-    }
-    if let Some((slot_key, entry)) = db.passwords.get_key_value(token) {
+    if let Some(entry) = db.passwords.get(token) {
         if entry.is_deactivated {
             return Err("DENIED:deactivated");
         }
         if is_expired(entry) {
             return Err("DENIED:expired");
         }
-        return Ok(CredentialAccess::Slot(slot_key.clone()));
+        return Ok(token.to_owned());
     }
     Err("DENIED:wrong_password")
 }
 
-fn resolve_worker_limit_access(db: &Database, access: &CredentialAccess) -> Option<u32> {
-    match access {
-        CredentialAccess::Main => db
-            .main_workers
-            .filter(|&w| (3..=MAX_STREAM_WORKERS_U16 as u32).contains(&w)),
-        CredentialAccess::Slot(key) => {
-            if let Some(entry) = db.passwords.get(key) {
-                if let Some(w) = entry.workers
-                    && (3..=MAX_STREAM_WORKERS_U16 as u32).contains(&w)
-                {
-                    return Some(w);
-                }
-                if !entry.group_id.is_empty()
-                    && let Some(group) = db.groups.get(&entry.group_id)
-                    && let Some(w) = group.workers
-                    && (3..=MAX_STREAM_WORKERS_U16 as u32).contains(&w)
-                {
-                    return Some(w);
-                }
-            }
-            None
+fn resolve_worker_limit_access(db: &Database, key: &str) -> Option<u32> {
+    if let Some(entry) = db.passwords.get(key) {
+        if let Some(w) = entry.workers
+            && (3..=MAX_STREAM_WORKERS_U16 as u32).contains(&w)
+        {
+            return Some(w);
+        }
+        if !entry.group_id.is_empty()
+            && let Some(group) = db.groups.get(&entry.group_id)
+            && let Some(w) = group.workers
+            && (3..=MAX_STREAM_WORKERS_U16 as u32).contains(&w)
+        {
+            return Some(w);
         }
     }
+    None
 }
 
 fn resolve_routing_rule_access<'a>(
     db: &'a Database,
-    access: &CredentialAccess,
+    key: &str,
 ) -> Option<&'a crate::model::RoutingRule> {
-    match access {
-        CredentialAccess::Main => {
-            if !db.main_routing_rule_id.is_empty() {
-                db.routing_rules.get(&db.main_routing_rule_id)
-            } else {
-                None
-            }
+    if let Some(entry) = db.passwords.get(key) {
+        if !entry.routing_rule_id.is_empty()
+            && let Some(rule) = db.routing_rules.get(&entry.routing_rule_id)
+        {
+            return Some(rule);
         }
-        CredentialAccess::Slot(key) => {
-            if let Some(entry) = db.passwords.get(key) {
-                if !entry.routing_rule_id.is_empty()
-                    && let Some(rule) = db.routing_rules.get(&entry.routing_rule_id)
-                {
-                    return Some(rule);
-                }
-                if !entry.group_id.is_empty()
-                    && let Some(group) = db.groups.get(&entry.group_id)
-                    && !group.routing_rule_id.is_empty()
-                {
-                    return db.routing_rules.get(&group.routing_rule_id);
-                }
-            }
-            None
+        if !entry.group_id.is_empty()
+            && let Some(group) = db.groups.get(&entry.group_id)
+            && !group.routing_rule_id.is_empty()
+        {
+            return db.routing_rules.get(&group.routing_rule_id);
         }
     }
+    None
 }
 
 fn session_epoch_identity(session: &Session) -> SessionEpochIdentity {
@@ -5487,7 +5457,7 @@ async fn handle_getconf(
         let server_worker_limit = access
             .as_ref()
             .ok()
-            .and_then(|a| resolve_worker_limit_access(&db, a));
+            .and_then(|key| resolve_worker_limit_access(&db, key));
         let current_session_desired = {
             let direct = session.desired_stream_count.load(Ordering::Acquire) as u16;
             if (3..=MAX_STREAM_WORKERS_U16).contains(&direct) {
@@ -5561,21 +5531,17 @@ async fn handle_getconf(
                         u64::from(worker_id),
                         session.id,
                     );
-                    let ip_str = match &access {
-                        CredentialAccess::Main => crate::model::OWNER_TUNNEL_IP.to_string(),
-                        CredentialAccess::Slot(slot_key) => {
-                            let needs_ip =
-                                db.passwords.get(slot_key).is_some_and(|e| e.ip.is_empty());
-                            let next_ip = if needs_ip { get_next_ip(&db) } else { None };
-                            if let Some(entry) = db.passwords.get_mut(slot_key) {
-                                if let Some(ip) = next_ip {
-                                    entry.ip = ip;
-                                    changed = true;
-                                }
-                                entry.ip.clone()
-                            } else {
-                                String::new()
+                    let ip_str = {
+                        let needs_ip = db.passwords.get(&access).is_some_and(|e| e.ip.is_empty());
+                        let next_ip = if needs_ip { get_next_ip(&db) } else { None };
+                        if let Some(entry) = db.passwords.get_mut(&access) {
+                            if let Some(ip) = next_ip {
+                                entry.ip = ip;
+                                changed = true;
                             }
+                            entry.ip.clone()
+                        } else {
+                            String::new()
                         }
                     };
                     if !ip_str.is_empty() {
@@ -5872,7 +5838,7 @@ fn disconnect_request_authorized(
         && secret_eq(&requester.password, password)
         && requester.session_salt == target_salt
         && epoch.matches(requester.generation_id, target_salt)
-        && (secret_eq(password, &db.main_password) || db.passwords.contains_key(password))
+        && db.passwords.contains_key(password)
 }
 
 pub async fn handle_disconnect(
@@ -6006,36 +5972,18 @@ fn fold_session_activity(
     let up = session.up_bytes.swap(0, Ordering::Relaxed) as i64;
     let down = session.down_bytes.swap(0, Ordering::Relaxed) as i64;
     let last_online = presence_time(session.last_inbound.load(Ordering::Relaxed), current);
-    let is_main = secret_eq(&session.password, &db.main_password);
 
-    if let Some(entry) = db.passwords.get_mut(&session.password) {
-        if apply_session_activity(entry, up, down, last_online) {
-            traffic.passwords.insert(
-                session.password.clone(),
-                TrafficCounters {
-                    up_bytes: entry.up_bytes,
-                    down_bytes: entry.down_bytes,
-                    last_online: entry.last_online,
-                },
-            );
-        }
-    } else if is_main && (up != 0 || down != 0) {
-        db.main_up_bytes = db.main_up_bytes.saturating_add(up);
-        db.main_down_bytes = db.main_down_bytes.saturating_add(down);
-        traffic.main = Some(TrafficCounters {
-            up_bytes: db.main_up_bytes,
-            down_bytes: db.main_down_bytes,
-            last_online: db.main_last_online,
-        });
-    }
-
-    if is_main && last_online > db.main_last_online {
-        db.main_last_online = last_online;
-        traffic.main = Some(TrafficCounters {
-            up_bytes: db.main_up_bytes,
-            down_bytes: db.main_down_bytes,
-            last_online: db.main_last_online,
-        });
+    if let Some(entry) = db.passwords.get_mut(&session.password)
+        && apply_session_activity(entry, up, down, last_online)
+    {
+        traffic.passwords.insert(
+            session.password.clone(),
+            TrafficCounters {
+                up_bytes: entry.up_bytes,
+                down_bytes: entry.down_bytes,
+                last_online: entry.last_online,
+            },
+        );
     }
 }
 
@@ -6240,11 +6188,15 @@ mod tests {
     }
 
     #[test]
-    fn password_authentication_authorizes_main_and_slots() {
-        let mut db = Database {
-            main_password: "OwnerSecretPass1".to_owned(),
-            ..Database::default()
-        };
+    fn password_authentication_authorizes_owner_and_slots() {
+        let mut db = Database::default();
+        db.passwords.insert(
+            "OwnerSecretPass1".to_owned(),
+            PasswordEntry {
+                ip: "10.66.67.2".to_owned(),
+                ..PasswordEntry::default()
+            },
+        );
         db.passwords.insert(
             "SlotSecretPass01".to_owned(),
             PasswordEntry {
@@ -6263,12 +6215,12 @@ mod tests {
 
         assert_eq!(
             getconf_credential_access(&db, "OwnerSecretPass1"),
-            Ok(CredentialAccess::Main)
+            Ok("OwnerSecretPass1".to_owned())
         );
 
         assert_eq!(
             getconf_credential_access(&db, "SlotSecretPass01"),
-            Ok(CredentialAccess::Slot("SlotSecretPass01".to_owned()))
+            Ok("SlotSecretPass01".to_owned())
         );
 
         assert_eq!(
@@ -6283,6 +6235,95 @@ mod tests {
         assert_eq!(
             getconf_credential_access(&db, ""),
             Err("DENIED:wrong_password")
+        );
+    }
+
+    #[test]
+    fn owner_client_gets_owner_ip_routing_and_workers() {
+        let mut db = Database::default();
+        db.routing_rules.insert(
+            "rule-1".into(),
+            crate::model::RoutingRule {
+                id: "rule-1".into(),
+                ..Default::default()
+            },
+        );
+        db.passwords.insert(
+            "OwnerPass...".into(),
+            PasswordEntry {
+                ip: "10.66.67.2".into(),
+                routing_rule_id: "rule-1".into(),
+                workers: Some(7),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            getconf_credential_access(&db, "OwnerPass...").unwrap(),
+            "OwnerPass..."
+        );
+        assert_eq!(
+            resolve_session_ip(&db, "OwnerPass...").as_deref(),
+            Some("10.66.67.2")
+        );
+        assert_eq!(resolve_worker_limit_access(&db, "OwnerPass..."), Some(7));
+        assert_eq!(
+            resolve_routing_rule_access(&db, "OwnerPass...").unwrap().id,
+            "rule-1"
+        );
+    }
+
+    #[test]
+    fn expired_and_deactivated_owner_are_denied() {
+        let mut expired = Database::default();
+        expired.passwords.insert(
+            "OwnerExpiredPass1".to_owned(),
+            PasswordEntry {
+                ip: "10.66.67.2".to_owned(),
+                expires_at: now() - 1,
+                ..PasswordEntry::default()
+            },
+        );
+        assert_eq!(
+            getconf_credential_access(&expired, "OwnerExpiredPass1"),
+            Err("DENIED:expired")
+        );
+
+        let mut deactivated = Database::default();
+        deactivated.passwords.insert(
+            "OwnerDeactPass123".to_owned(),
+            PasswordEntry {
+                ip: "10.66.67.2".to_owned(),
+                is_deactivated: true,
+                ..PasswordEntry::default()
+            },
+        );
+        assert_eq!(
+            getconf_credential_access(&deactivated, "OwnerDeactPass123"),
+            Err("DENIED:deactivated")
+        );
+    }
+
+    #[test]
+    fn unknown_and_empty_password_are_denied() {
+        // A retired legacy `main_password` without an owner entry no longer
+        // authorizes: owner authority lives in `passwords`.
+        let db = Database::default();
+        assert_eq!(
+            getconf_credential_access(&db, "LegacyOwnerPass1"),
+            Err("DENIED:wrong_password")
+        );
+        assert_eq!(
+            getconf_credential_access(&db, "UnknownPassword1"),
+            Err("DENIED:wrong_password")
+        );
+        assert_eq!(
+            getconf_credential_access(&db, "   "),
+            Err("DENIED:wrong_password")
+        );
+        assert_eq!(
+            resolve_session_ip(&db, "LegacyOwnerPass1"),
+            None,
+            "legacy main password must not get an IP without an owner entry"
         );
     }
 
@@ -6414,7 +6455,6 @@ mod tests {
             tokio::sync::watch::channel(db.auto_restart_interval_hours());
         Arc::new(App {
             dns: tokio::sync::RwLock::new(db.dns.clone()),
-            startup_main_password: db.main_password.clone(),
             db: tokio::sync::RwLock::new(db),
             db_persistence,
             log_file_path: config_dir.join("csqtt.log"),
@@ -6514,15 +6554,20 @@ mod tests {
 
     #[tokio::test]
     async fn flush_persists_presence_without_byte_delta() {
-        let mut db = Database {
-            main_password: "owner12345678901".to_owned(),
-            ..Database::default()
-        };
+        let mut db = Database::default();
         db.passwords.insert(
             "client1234567890".to_owned(),
             PasswordEntry {
                 ip: "10.66.67.3".to_owned(),
                 name: "Client".to_owned(),
+                ..PasswordEntry::default()
+            },
+        );
+        db.passwords.insert(
+            "owner12345678901".to_owned(),
+            PasswordEntry {
+                ip: "10.66.67.2".to_owned(),
+                name: "Владелец".to_owned(),
                 ..PasswordEntry::default()
             },
         );
@@ -6562,8 +6607,139 @@ mod tests {
             restored.passwords["client1234567890"].last_online,
             current as i64
         );
-        assert_eq!(restored.main_last_online, current as i64);
+        assert_eq!(
+            restored.passwords["owner12345678901"].last_online,
+            current as i64
+        );
         let _ = std::fs::remove_dir_all(&app.config_dir);
+    }
+
+    #[tokio::test]
+    async fn owner_session_folds_counters_into_password_entry() {
+        let mut db = Database::default();
+        db.passwords.insert(
+            "OwnerFoldPass123".to_owned(),
+            PasswordEntry {
+                ip: "10.66.67.2".to_owned(),
+                name: "Владелец".to_owned(),
+                ..PasswordEntry::default()
+            },
+        );
+        let app = presence_test_app(db).await;
+        let current = now().max(0) as u64;
+        let owner = Session::new(
+            1,
+            SocketAddr::from(([198, 51, 100, 50], 46000)),
+            "OwnerFoldPass123",
+            1,
+            "salt-owner-fold",
+            false,
+            Arc::new(AtomicBool::new(false)),
+            current,
+        );
+        owner.up_bytes.store(111, Ordering::Relaxed);
+        owner.down_bytes.store(222, Ordering::Relaxed);
+        owner.last_inbound.store(current, Ordering::Relaxed);
+        app.sessions.insert(1, owner);
+
+        let revision = flush_traffic(&app).await;
+        assert!(revision > 0, "owner activity must reach persistence");
+        app.db_persistence.wait(revision).await.unwrap();
+
+        let restored = crate::model::load_database(&app.config_dir).unwrap();
+        let entry = &restored.passwords["OwnerFoldPass123"];
+        assert_eq!((entry.up_bytes, entry.down_bytes), (111, 222));
+        assert_eq!(entry.last_online, current as i64);
+        let _ = std::fs::remove_dir_all(&app.config_dir);
+    }
+
+    #[test]
+    fn owner_disconnect_request_is_authorized_by_entry() {
+        let mut db = Database::default();
+        db.passwords
+            .insert("OwnerDiscPass123".to_owned(), PasswordEntry::default());
+        let requester = SessionEpochIdentity {
+            password: "OwnerDiscPass123".to_owned(),
+            generation_id: 7,
+            session_salt: "salt-owner-disconnect".to_owned(),
+        };
+        let epoch = PasswordEpochState::new(7, "salt-owner-disconnect".to_owned());
+        assert!(disconnect_request_authorized(
+            &db,
+            "OwnerDiscPass123",
+            &requester,
+            "salt-owner-disconnect",
+            &epoch,
+        ));
+
+        // A bare legacy main password is no longer an authorization source.
+        let legacy = Database::default();
+        assert!(!disconnect_request_authorized(
+            &legacy,
+            "OwnerDiscPass123",
+            &requester,
+            "salt-owner-disconnect",
+            &epoch,
+        ));
+    }
+
+    #[tokio::test]
+    async fn build_credentials_includes_migrated_owner() {
+        let mut db = Database::default();
+        db.passwords.insert(
+            "OwnerCredPass123".to_owned(),
+            PasswordEntry {
+                ip: "10.66.67.2".to_owned(),
+                ..PasswordEntry::default()
+            },
+        );
+        db.passwords.insert(
+            "ClientCredPass12".to_owned(),
+            PasswordEntry {
+                ip: "10.66.67.3".to_owned(),
+                ..PasswordEntry::default()
+            },
+        );
+        let app = presence_test_app(db).await;
+        let credentials = build_credentials(&app).await.unwrap();
+        let keys: Vec<&str> = credentials
+            .entries
+            .iter()
+            .map(|credential| &*credential.password)
+            .collect();
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&"OwnerCredPass123"));
+        assert!(keys.contains(&"ClientCredPass12"));
+        let _ = std::fs::remove_dir_all(&app.config_dir);
+    }
+
+    #[test]
+    fn owner_link_payload_matches_legacy_main_link() {
+        // The legacy `make_main_link` (web_panel) built its payload from
+        // `Database::main_password` and the main VK hashes. The owner migration
+        // stores both on the owner entry, so the owner's entry link must decode
+        // to exactly the payload the legacy link carried.
+        const LEGACY_OWNER_LINK_PAYLOAD: &str = "connect?v=2&host=eu.example.com&peer=46000&password=OwnerMainPass123&hashes=abcdef123456";
+        let mut db = Database::default();
+        db.passwords.insert(
+            "OwnerMainPass123".to_owned(),
+            PasswordEntry {
+                ip: "10.66.67.2".to_owned(),
+                vk_hashes: "abcdef123456".to_owned(),
+                ..PasswordEntry::default()
+            },
+        );
+        let entry = &db.passwords["OwnerMainPass123"];
+        let mut payload =
+            "connect?v=2&host=eu.example.com&peer=46000&password=OwnerMainPass123".to_owned();
+        if !entry.vk_hashes.is_empty() {
+            payload.push_str("&hashes=");
+            payload.push_str(&entry.vk_hashes);
+        }
+        let link = crate::web_panel::encrypt_csqtt_link(&payload);
+        let decrypted =
+            crate::web_panel::decrypt_csqtt_link(&link).expect("owner link must decrypt");
+        assert_eq!(decrypted, LEGACY_OWNER_LINK_PAYLOAD);
     }
 
     #[test]
@@ -6603,10 +6779,7 @@ mod tests {
 
     #[tokio::test]
     async fn short_session_presence_survives_reload_through_teardown_fold() {
-        let mut db = Database {
-            main_password: "owner12345678901".to_owned(),
-            ..Database::default()
-        };
+        let mut db = Database::default();
         db.passwords.insert(
             "client1234567890".to_owned(),
             PasswordEntry {
@@ -6666,10 +6839,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_closed_event_folds_presence() {
-        let mut db = Database {
-            main_password: "owner12345678901".to_owned(),
-            ..Database::default()
-        };
+        let mut db = Database::default();
         db.passwords.insert(
             "client1234567890".to_owned(),
             PasswordEntry {
@@ -6725,10 +6895,7 @@ mod tests {
 
     #[tokio::test]
     async fn teardown_worker_drains_after_sender_drop() {
-        let mut db = Database {
-            main_password: "owner12345678901".to_owned(),
-            ..Database::default()
-        };
+        let mut db = Database::default();
         db.passwords.insert(
             "client1234567890".to_owned(),
             PasswordEntry {
@@ -6767,10 +6934,7 @@ mod tests {
 
     #[tokio::test]
     async fn drop_all_sessions_folds_final_activity() {
-        let mut db = Database {
-            main_password: "owner12345678901".to_owned(),
-            ..Database::default()
-        };
+        let mut db = Database::default();
         db.passwords.insert(
             "client1234567890".to_owned(),
             PasswordEntry {
@@ -6814,10 +6978,7 @@ mod tests {
     #[tokio::test]
     async fn one_fold_submission_covers_a_batch_of_ghosts() {
         let count = 8usize;
-        let mut db = Database {
-            main_password: "owner12345678901".to_owned(),
-            ..Database::default()
-        };
+        let mut db = Database::default();
         let current = now().max(0) as u64;
         let base = current.saturating_sub(100);
         let debug = Arc::new(AtomicBool::new(false));
@@ -6869,52 +7030,31 @@ mod tests {
     }
 
     #[test]
-    fn legacy_json_migration_with_16_char_passwords_and_ip() {
-        use crate::model::{Database, PasswordEntry, load_database};
+    fn sixteen_char_passwords_resolve_credentials_and_keep_their_ip() {
+        use crate::model::{Database, PasswordEntry, load_database, save_database};
 
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let directory = std::env::temp_dir().join(format!("csqtt-legacy-getconf-{unique}"));
-        std::fs::create_dir_all(&directory).unwrap();
-
-        let mut legacy = Database {
-            main_password: "OwnerMainPass123".to_owned(),
-            ..Database::default()
-        };
-        legacy.passwords.insert(
+        let directory = std::env::temp_dir().join(format!("csqtt-getconf-{unique}"));
+        let mut db = Database::default();
+        db.passwords.insert(
             "16charclientpass".to_owned(),
             PasswordEntry {
-                ip: "".to_owned(),
+                ip: "10.66.67.3".to_owned(),
                 ..PasswordEntry::default()
             },
         );
-        std::fs::write(
-            directory.join("passwords.json"),
-            serde_json::to_vec_pretty(&legacy).unwrap(),
-        )
-        .unwrap();
+        save_database(&directory, &db).unwrap();
 
-        let migrated = load_database(&directory).unwrap();
-        assert_eq!(migrated.passwords.len(), 1);
-        let (new_pass, entry) = migrated.passwords.iter().next().unwrap();
-        assert_eq!(new_pass.len(), 16);
-        assert!(!entry.ip.is_empty());
+        let loaded = load_database(&directory).unwrap();
+        let entry = &loaded.passwords["16charclientpass"];
+        assert_eq!(entry.ip, "10.66.67.3");
         assert_eq!(
-            getconf_credential_access(&migrated, new_pass),
-            Ok(CredentialAccess::Slot(new_pass.clone()))
+            getconf_credential_access(&loaded, "16charclientpass"),
+            Ok("16charclientpass".to_owned())
         );
-        assert_eq!(
-            getconf_credential_access(&migrated, "OwnerMainPass123"),
-            Ok(CredentialAccess::Main)
-        );
-        let mut epoch = PasswordEpochState::default();
-        assert_eq!(
-            epoch.admit(1_786_000_000, "fresh-session-salt"),
-            PasswordEpochDecision::Replaced
-        );
-        assert!(!directory.join("passwords.json").exists());
         let _ = std::fs::remove_dir_all(directory);
     }
 
@@ -7486,10 +7626,7 @@ mod tests {
 
     #[test]
     fn test_two_stage_handshake_getworkers_parsing_and_limits() {
-        let mut db = Database {
-            main_workers: Some(15),
-            ..Database::default()
-        };
+        let mut db = Database::default();
         db.passwords.insert(
             "client-key".to_string(),
             PasswordEntry {
@@ -7500,8 +7637,7 @@ mod tests {
         db.passwords
             .insert("unlimited-key".to_string(), PasswordEntry::default());
 
-        let access = CredentialAccess::Slot("client-key".to_string());
-        let limit = resolve_worker_limit_access(&db, &access);
+        let limit = resolve_worker_limit_access(&db, "client-key");
         assert_eq!(limit, Some(10));
 
         let requested = 25u32;
@@ -7521,8 +7657,7 @@ mod tests {
         assert_eq!(agreed, 10);
         assert_eq!(limit_val, 10);
 
-        let access_unlimited = CredentialAccess::Slot("unlimited-key".to_string());
-        let limit_unlimited = resolve_worker_limit_access(&db, &access_unlimited);
+        let limit_unlimited = resolve_worker_limit_access(&db, "unlimited-key");
         assert_eq!(limit_unlimited, None);
         let (agreed_u, limit_val_u) = match limit_unlimited {
             Some(l) if (3..=MAX_STREAM_WORKERS_U16 as u32).contains(&l) => (requested.min(l), l),

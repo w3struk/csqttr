@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use base64::Engine;
 use hkdf::Hkdf;
 use rand::{RngCore, rngs::OsRng};
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -237,32 +237,17 @@ impl<'de> serde::Deserialize<'de> for LocalProxyState {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Database {
-    pub main_password: String,
     pub dns: String,
     #[serde(default)]
     pub dns_provider: String,
     #[serde(default)]
     pub auto_restart_interval_hours: Option<u8>,
-    pub main_up_bytes: i64,
-    pub main_down_bytes: i64,
-    #[serde(default, skip_serializing)]
-    pub main_last_online: i64,
     pub admin_id: String,
     pub bot_token: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub vk_access_token: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub vk_hashes: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub main_sub_uuid: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub main_vk_hashes: String,
-    #[serde(default)]
-    pub main_vk_token_enabled: bool,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub main_routing_rule_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub main_workers: Option<u32>,
     #[serde(default, alias = "slots")]
     pub passwords: BTreeMap<String, PasswordEntry>,
     pub web_sessions: BTreeMap<String, i64>,
@@ -284,20 +269,16 @@ pub struct TrafficCounters {
 
 #[derive(Debug, Default)]
 pub struct TrafficSnapshot {
-    pub main: Option<TrafficCounters>,
     pub passwords: BTreeMap<String, TrafficCounters>,
 }
 
 impl TrafficSnapshot {
     fn merge_from(&mut self, mut newer: Self) {
-        if newer.main.is_some() {
-            self.main = newer.main;
-        }
         self.passwords.append(&mut newer.passwords);
     }
 
     fn is_empty(&self) -> bool {
-        self.main.is_none() && self.passwords.is_empty()
+        self.passwords.is_empty()
     }
 }
 
@@ -313,14 +294,6 @@ impl Database {
 
     pub fn repair_stale_password_bindings(&mut self) -> Vec<String> {
         let mut repairs = Vec::new();
-        if self.main_password.trim().is_empty() {
-            self.main_password = random_password();
-            repairs.push("main_password regenerated".to_owned());
-        }
-        if self.main_sub_uuid.trim().is_empty() {
-            self.main_sub_uuid = random_uuid_v4();
-            repairs.push("main_sub_uuid regenerated".to_owned());
-        }
         let mut old_keys: Vec<String> = self.passwords.keys().cloned().collect();
         old_keys.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
         for key in old_keys {
@@ -329,9 +302,7 @@ impl Database {
             let mut entry = self.passwords.remove(&key).unwrap();
             let new_key = if needs_new_key {
                 let mut candidate = random_password();
-                while secret_eq(&candidate, &self.main_password)
-                    || self.passwords.contains_key(&candidate)
-                {
+                while self.passwords.contains_key(&candidate) {
                     candidate = random_password();
                 }
                 repairs.push(format!("password tag={tag} rekeyed"));
@@ -355,12 +326,6 @@ impl Database {
     }
 
     pub fn resolve_routing_rule<'a>(&'a self, password: &str) -> Option<&'a RoutingRule> {
-        if secret_eq(password, &self.main_password)
-            && !self.main_routing_rule_id.is_empty()
-            && let Some(rule) = self.routing_rules.get(&self.main_routing_rule_id)
-        {
-            return Some(rule);
-        }
         if let Some(entry) = self.passwords.get(password) {
             if !entry.routing_rule_id.is_empty()
                 && let Some(rule) = self.routing_rules.get(&entry.routing_rule_id)
@@ -379,9 +344,6 @@ impl Database {
     }
 
     pub fn resolve_worker_limit(&self, password: &str) -> Option<u32> {
-        if secret_eq(password, &self.main_password) {
-            return self.main_workers.filter(|&w| (3..=100).contains(&w));
-        }
         if let Some(entry) = self.passwords.get(password) {
             if let Some(w) = entry.workers
                 && (3..=100).contains(&w)
@@ -756,17 +718,17 @@ pub fn is_expired(entry: &PasswordEntry) -> bool {
     entry.expires_at != 0 && now() > entry.expires_at
 }
 
-pub const OWNER_TUNNEL_IP: &str = "10.66.67.2";
+pub const SCHEMA_VERSION: i64 = 2;
 
 // The address an IMPORTED client gets: its own only when it is in this server's pool and no client already has it —
 // an export merged into a server with clients (or two clients of one export on one address) gave two clients one
 // tunnel address, and each broke the other's traffic. Clients are inserted one by one, so earlier ones in the same
 // import count as taken.
-// Is `ip` an address of this server's client pool (.3–.250 of 10.66.67.0/24, as get_next_ip hands out)? One from
+// Is `ip` an address of this server's client pool (.2–.250 of 10.66.67.0/24, as get_next_ip hands out)? One from
 // elsewhere — another server's export, a store copied between servers — is not a usable address here.
 pub fn ip_in_pool(ip: &str) -> bool {
     ip.parse::<std::net::Ipv4Addr>()
-        .is_ok_and(|a| a.octets()[..3] == [10, 66, 67] && (3..=250).contains(&a.octets()[3]))
+        .is_ok_and(|a| a.octets()[..3] == [10, 66, 67] && (2..=250).contains(&a.octets()[3]))
 }
 
 pub fn import_ip(db: &Database, ip: &str) -> String {
@@ -778,7 +740,7 @@ pub fn import_ip(db: &Database, ip: &str) -> String {
 
 pub fn get_next_ip(db: &Database) -> Option<String> {
     let mut buf = String::with_capacity(16);
-    for i in 3..=250u8 {
+    for i in 2..=250u8 {
         buf.clear();
         use std::fmt::Write;
         let _ = write!(buf, "10.66.67.{i}");
@@ -791,9 +753,6 @@ pub fn get_next_ip(db: &Database) -> Option<String> {
 }
 
 pub fn resolve_session_ip(db: &Database, session_password: &str) -> Option<String> {
-    if secret_eq(session_password, &db.main_password) {
-        return Some(OWNER_TUNNEL_IP.to_owned());
-    }
     db.passwords.get(session_password).and_then(|entry| {
         if !entry.ip.is_empty() {
             Some(entry.ip.clone())
@@ -804,20 +763,15 @@ pub fn resolve_session_ip(db: &Database, session_password: &str) -> Option<Strin
 }
 
 const DATABASE_FILE: &str = "csqtt.db";
-const LEGACY_DATABASE_FILE: &str = "passwords.json";
-const LEGACY_DATABASE_IMPORTED_FILE: &str = "passwords.json.imported";
-const LEGACY_DATABASE_FILES: [&str; 2] = [LEGACY_DATABASE_FILE, LEGACY_DATABASE_IMPORTED_FILE];
+/// JSON databases written by releases older than the SQLite schema. They are
+/// never imported any more, but startup must not silently start over while one
+/// is still around.
+const RETIRED_DATABASE_FILES: [&str; 2] = ["passwords.json", "passwords.json.imported"];
 
 const DATABASE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS counters (
-    id              INTEGER PRIMARY KEY CHECK (id = 1),
-    main_up_bytes   INTEGER NOT NULL DEFAULT 0,
-    main_down_bytes INTEGER NOT NULL DEFAULT 0,
-    main_last_online INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS passwords (
     password       TEXT PRIMARY KEY,
@@ -877,6 +831,34 @@ CREATE TABLE IF NOT EXISTS routing_rules (
 );
 ";
 
+fn open_read_only(path: &Path) -> Result<Connection> {
+    Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("open {} read-only", path.display()))
+}
+
+fn table_exists(connection: &Connection, table: &str) -> Result<bool> {
+    let count: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("check table {table}"))?;
+    Ok(count > 0)
+}
+
+fn meta_value(connection: &Connection, key: &str) -> Result<Option<String>> {
+    connection
+        .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
+            row.get(0)
+        })
+        .optional()
+        .with_context(|| format!("read meta {key}"))
+}
+
 fn open_database_connection(config_dir: &Path) -> Result<Connection> {
     fs::create_dir_all(config_dir)?;
     #[cfg(unix)]
@@ -895,31 +877,15 @@ fn open_database_connection(config_dir: &Path) -> Result<Connection> {
     connection
         .execute_batch(DATABASE_SCHEMA)
         .with_context(|| format!("schema {}", path.display()))?;
+    // Task 7 retired the single-row `counters` table: the owner is an ordinary
+    // client now. Drop it here so existing databases lose it exactly once.
+    connection
+        .execute_batch("DROP TABLE IF EXISTS counters")
+        .with_context(|| format!("drop retired counters table in {}", path.display()))?;
     ensure_password_columns(&connection)?;
-    ensure_counter_columns(&connection)?;
     ensure_routing_rule_columns(&connection)?;
     ensure_client_group_columns(&connection)?;
     Ok(connection)
-}
-
-fn ensure_counter_columns(connection: &Connection) -> Result<()> {
-    let mut statement = connection
-        .prepare("PRAGMA table_info(counters)")
-        .context("prepare counters schema check")?;
-    let columns = statement
-        .query_map([], |row| row.get::<_, String>(1))
-        .context("read counters schema")?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .context("collect counters schema")?;
-    if !columns.iter().any(|column| column == "main_last_online") {
-        connection
-            .execute(
-                "ALTER TABLE counters ADD COLUMN main_last_online INTEGER NOT NULL DEFAULT 0",
-                [],
-            )
-            .context("add main_last_online column")?;
-    }
-    Ok(())
 }
 
 fn ensure_client_group_columns(connection: &Connection) -> Result<()> {
@@ -1101,14 +1067,9 @@ fn write_database_snapshot(connection: &mut Connection, db: &Database) -> Result
         .transaction()
         .context("begin database transaction")?;
     let auto_restart_interval_hours = db.auto_restart_interval_hours().to_string();
+    let schema_version = SCHEMA_VERSION.to_string();
     for (key, value) in [
-        ("main_password", db.main_password.as_str()),
-        ("main_sub_uuid", db.main_sub_uuid.as_str()),
-        ("main_vk_hashes", db.main_vk_hashes.as_str()),
-        (
-            "main_vk_token_enabled",
-            if db.main_vk_token_enabled { "1" } else { "0" },
-        ),
+        ("schema_version", schema_version.as_str()),
         ("dns", db.dns.as_str()),
         ("dns_provider", db.dns_provider.as_str()),
         (
@@ -1119,7 +1080,6 @@ fn write_database_snapshot(connection: &mut Connection, db: &Database) -> Result
         ("bot_token", db.bot_token.as_str()),
         ("vk_access_token", db.vk_access_token.as_str()),
         ("vk_hashes", db.vk_hashes.as_str()),
-        ("main_routing_rule_id", db.main_routing_rule_id.as_str()),
     ] {
         transaction
             .execute(
@@ -1128,19 +1088,6 @@ fn write_database_snapshot(connection: &mut Connection, db: &Database) -> Result
                 rusqlite::params![key, value],
             )
             .context("write meta")?;
-    }
-    if let Some(w) = db.main_workers {
-        transaction
-            .execute(
-                "INSERT INTO meta (key, value) VALUES ('main_workers', ?1)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                rusqlite::params![w.to_string()],
-            )
-            .context("write main_workers")?;
-    } else {
-        transaction
-            .execute("DELETE FROM meta WHERE key = 'main_workers'", [])
-            .context("clear main_workers")?;
     }
     if let Some(active) = db.logging_active {
         transaction
@@ -1155,17 +1102,6 @@ fn write_database_snapshot(connection: &mut Connection, db: &Database) -> Result
             .execute("DELETE FROM meta WHERE key = 'logging_active'", [])
             .context("clear logging_active")?;
     }
-    transaction
-        .execute(
-            "INSERT INTO counters (id, main_up_bytes, main_down_bytes, main_last_online)
-             VALUES (1, ?1, ?2, ?3)
-             ON CONFLICT(id) DO UPDATE SET
-                main_up_bytes = excluded.main_up_bytes,
-                main_down_bytes = excluded.main_down_bytes,
-                main_last_online = MAX(counters.main_last_online, excluded.main_last_online)",
-            rusqlite::params![db.main_up_bytes, db.main_down_bytes, db.main_last_online],
-        )
-        .context("write counters")?;
     for password in existing_row_keys(&transaction, "SELECT password FROM passwords")? {
         if !db.passwords.contains_key(&password) {
             transaction
@@ -1390,10 +1326,6 @@ fn read_database_snapshot(config_dir: &Path) -> Result<Database> {
             let key: String = row.get(0).context("read meta key")?;
             let value: String = row.get(1).context("read meta value")?;
             match key.as_str() {
-                "main_password" => db.main_password = value,
-                "main_sub_uuid" => db.main_sub_uuid = value,
-                "main_vk_hashes" => db.main_vk_hashes = value,
-                "main_vk_token_enabled" => db.main_vk_token_enabled = value == "1",
                 "dns" => db.dns = value,
                 "dns_provider" => db.dns_provider = value,
                 "auto_restart_interval_hours" => {
@@ -1405,32 +1337,10 @@ fn read_database_snapshot(config_dir: &Path) -> Result<Database> {
                 "bot_token" => db.bot_token = value,
                 "vk_access_token" => db.vk_access_token = value,
                 "vk_hashes" => db.vk_hashes = value,
-                "main_routing_rule_id" => db.main_routing_rule_id = value,
-                "main_workers" => {
-                    db.main_workers = value
-                        .parse::<u32>()
-                        .ok()
-                        .and_then(|w| (3..=100).contains(&w).then_some(w));
-                }
                 "logging_active" => db.logging_active = Some(value == "1"),
                 _ => {}
             }
         }
-    }
-    if let Ok((up_bytes, down_bytes, last_online)) = connection.query_row(
-        "SELECT main_up_bytes, main_down_bytes, main_last_online FROM counters WHERE id = 1",
-        [],
-        |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2).unwrap_or(0),
-            ))
-        },
-    ) {
-        db.main_up_bytes = up_bytes;
-        db.main_down_bytes = down_bytes;
-        db.main_last_online = last_online;
     }
     {
         let mut select = connection
@@ -1484,13 +1394,7 @@ fn read_database_snapshot(config_dir: &Path) -> Result<Database> {
             String,
             std::collections::HashSet<String>,
         > = std::collections::HashMap::new();
-        for (pass, entry) in db.passwords.iter_mut() {
-            if pass == &db.main_password {
-                if entry.name.trim().is_empty() || entry.name == "Главный пароль" {
-                    entry.name = "Владелец".to_string();
-                }
-                continue;
-            }
+        for entry in db.passwords.values_mut() {
             let group_key = entry.group_id.trim().to_string();
             let group_names = names_by_group.entry(group_key).or_default();
             let trimmed = entry.name.trim();
@@ -1618,63 +1522,79 @@ pub fn load_database(config_dir: &Path) -> Result<Database> {
     let _guard = DATABASE_SAVE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let database_exists = config_dir.join(DATABASE_FILE).exists();
-    let legacy_paths: Vec<PathBuf> = LEGACY_DATABASE_FILES
-        .iter()
-        .map(|name| config_dir.join(name))
-        .filter(|path| path.exists())
-        .collect();
-    if database_exists {
-        let mut db = read_database_snapshot(config_dir)?;
-        repair_loaded_database(config_dir, &mut db)?;
-        if !legacy_paths.is_empty() {
-            eprintln!(
-                "[DB] Ignoring {} retired JSON database file(s); {DATABASE_FILE} is authoritative",
-                legacy_paths.len()
-            );
-        }
-        return Ok(db);
-    }
-    if legacy_paths.is_empty() {
+    if !config_dir.join(DATABASE_FILE).exists() {
         return Ok(Database::default());
     }
-
-    let mut legacy_databases = Vec::with_capacity(legacy_paths.len());
-    for legacy_path in &legacy_paths {
-        let data =
-            fs::read(legacy_path).with_context(|| format!("read {}", legacy_path.display()))?;
-        let mut legacy: Database = serde_json::from_slice(&data)
-            .with_context(|| format!("parse {}", legacy_path.display()))?;
-        legacy.bot_token.clear();
-        legacy.admin_id.clear();
-        legacy.web_sessions.clear();
-        legacy.local_proxy.normalize();
-        legacy_databases.push(legacy);
-    }
-
-    let mut connection = open_database_connection(config_dir)?;
-    for legacy in &legacy_databases {
-        import_legacy_database_rows(&mut connection, legacy)
-            .context("commit legacy JSON rows into SQLite")?;
-    }
-    drop(connection);
-
     let mut db = read_database_snapshot(config_dir)?;
-    for legacy in &legacy_databases {
-        verify_legacy_database_rows(&db, legacy)
-            .context("verify legacy JSON import into SQLite")?;
-    }
     repair_loaded_database(config_dir, &mut db)?;
-
-    for legacy_path in &legacy_paths {
-        fs::remove_file(legacy_path)
-            .with_context(|| format!("remove retired legacy database {}", legacy_path.display()))?;
-    }
-    eprintln!(
-        "[DB] Imported {} retired JSON database file(s) into {DATABASE_FILE} and removed them",
-        legacy_paths.len()
-    );
     Ok(db)
+}
+
+/// Refuses to start on a database this release cannot read. Must run before
+/// `load_database` and before anything else opens the writer connection.
+///
+/// Supported: no database at all (fresh install) and `schema_version=2`.
+/// A database with a different or missing version, an unreadable one, or the
+/// retired JSON files without a database are all rejected. Retired JSON files
+/// next to a schema-2 database are harmless leftovers: warn and leave them be.
+pub fn ensure_supported_database(config_dir: &Path) -> Result<()> {
+    let database = config_dir.join(DATABASE_FILE);
+    let retired: Vec<&str> = RETIRED_DATABASE_FILES
+        .iter()
+        .copied()
+        .filter(|name| config_dir.join(name).exists())
+        .collect();
+    if !database.exists() {
+        if !retired.is_empty() {
+            bail!(
+                "обнаружена база старого формата ({}), но {DATABASE_FILE} отсутствует. \
+                 Сначала обновитесь до 2.5.2 командой `install.sh --force`, затем установите \
+                 текущую версию: данные старой базы не будут импортированы этой сборкой",
+                retired.join(", ")
+            );
+        }
+        return Ok(());
+    }
+    match read_schema_version(config_dir) {
+        Ok(Some(version)) if version == SCHEMA_VERSION => {}
+        Ok(Some(version)) => bail!(
+            "неподдерживаемая версия базы данных: schema_version={version}, требуется \
+             {SCHEMA_VERSION}. Сначала обновитесь до 2.5.2 командой `install.sh --force`, \
+             затем установите текущую версию"
+        ),
+        Ok(None) => bail!(
+            "в {DATABASE_FILE} нет schema_version={SCHEMA_VERSION}: база создана старой \
+             версией. Сначала обновитесь до 2.5.2 командой `install.sh --force`, затем \
+             установите текущую версию"
+        ),
+        Err(error) => bail!(
+            "не удалось прочитать версию {DATABASE_FILE}: {error:#}. Сначала обновитесь до \
+             2.5.2 командой `install.sh --force`, затем установите текущую версию"
+        ),
+    }
+    if !retired.is_empty() {
+        eprintln!(
+            "[DB] WARN ignoring retired JSON database file(s) {}; {DATABASE_FILE} is authoritative",
+            retired.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Reads `meta.schema_version` without opening the writer connection used by
+/// `load_database`. Startup calls this *before* loading: the first save always
+/// writes the current schema version, so a version read afterwards cannot tell
+/// a fresh install from an upgraded one.
+pub fn read_schema_version(config_dir: &Path) -> Result<Option<i64>> {
+    let path = config_dir.join(DATABASE_FILE);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let connection = open_read_only(&path)?;
+    if !table_exists(&connection, "meta")? {
+        return Ok(None);
+    }
+    Ok(meta_value(&connection, "schema_version")?.and_then(|value| value.parse::<i64>().ok()))
 }
 
 fn repair_loaded_database(config_dir: &Path, db: &mut Database) -> Result<()> {
@@ -1702,162 +1622,6 @@ fn repair_loaded_database(config_dir: &Path, db: &mut Database) -> Result<()> {
         repairs.len()
     );
     Ok(())
-}
-
-fn import_legacy_database_rows(connection: &mut Connection, legacy: &Database) -> Result<()> {
-    let transaction = connection
-        .transaction()
-        .context("begin legacy JSON import transaction")?;
-
-    for (key, value) in [
-        ("main_password", legacy.main_password.as_str()),
-        ("dns", legacy.dns.as_str()),
-        ("vk_access_token", legacy.vk_access_token.as_str()),
-        ("vk_hashes", legacy.vk_hashes.as_str()),
-        ("main_routing_rule_id", legacy.main_routing_rule_id.as_str()),
-    ] {
-        transaction
-            .execute(
-                "INSERT INTO meta (key, value) VALUES (?1, ?2)
-                 ON CONFLICT(key) DO UPDATE SET value =
-                    CASE WHEN meta.value = '' THEN excluded.value ELSE meta.value END",
-                rusqlite::params![key, value],
-            )
-            .with_context(|| format!("merge legacy meta {key}"))?;
-    }
-    if let Some(active) = legacy.logging_active {
-        transaction
-            .execute(
-                "INSERT INTO meta (key, value) VALUES ('logging_active', ?1)
-                 ON CONFLICT(key) DO NOTHING",
-                rusqlite::params![if active { "1" } else { "0" }],
-            )
-            .context("merge legacy logging_active")?;
-    }
-    transaction
-        .execute(
-            "INSERT INTO counters (id, main_up_bytes, main_down_bytes, main_last_online)
-             VALUES (1, ?1, ?2, ?3)
-             ON CONFLICT(id) DO UPDATE SET
-                main_up_bytes = MAX(counters.main_up_bytes, excluded.main_up_bytes),
-                main_down_bytes = MAX(counters.main_down_bytes, excluded.main_down_bytes),
-                main_last_online = MAX(counters.main_last_online, excluded.main_last_online)",
-            rusqlite::params![
-                legacy.main_up_bytes,
-                legacy.main_down_bytes,
-                legacy.main_last_online.clamp(0, now()),
-            ],
-        )
-        .context("merge legacy main traffic counters")?;
-
-    {
-        let mut insert = transaction
-            .prepare(
-                "INSERT INTO passwords (
-                    password, ip, expires_at, down_bytes, up_bytes,
-                    vk_hash, ports, is_deactivated, name, vk_hashes, vk_token_enabled,
-                    dtls_port, wg_port, local_port, last_online
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
-                ON CONFLICT(password) DO NOTHING",
-            )
-            .context("prepare legacy passwords import")?;
-        for (password, entry) in &legacy.passwords {
-            insert
-                .execute(rusqlite::params![
-                    password,
-                    entry.ip,
-                    entry.expires_at,
-                    entry.down_bytes,
-                    entry.up_bytes,
-                    entry.vk_hash,
-                    entry.ports,
-                    i64::from(entry.is_deactivated),
-                    entry.name,
-                    entry.vk_hashes,
-                    i64::from(entry.vk_token_enabled),
-                    entry.dtls_port,
-                    entry.wg_port,
-                    entry.local_port,
-                    entry.last_online.clamp(0, now()),
-                ])
-                .with_context(|| format!("merge legacy password {}", secret_tag(password)))?;
-        }
-    }
-    {
-        let mut insert = transaction
-            .prepare(
-                "INSERT INTO local_proxy_profiles (id, sort_order, name, port, username, password)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(id) DO NOTHING",
-            )
-            .context("prepare legacy proxy profiles import")?;
-        for (sort_order, profile) in legacy.local_proxy.profiles.iter().enumerate() {
-            insert
-                .execute(rusqlite::params![
-                    profile.id,
-                    sort_order as i64,
-                    profile.name,
-                    profile.port,
-                    profile.username,
-                    profile.password,
-                ])
-                .with_context(|| format!("merge legacy proxy profile {}", profile.id))?;
-        }
-    }
-    if !legacy.local_proxy.active_profile_id.is_empty() {
-        transaction
-            .execute(
-                "INSERT INTO local_proxy_state (id, active_profile_id) VALUES (1, ?1)
-                 ON CONFLICT(id) DO UPDATE SET active_profile_id =
-                    CASE WHEN local_proxy_state.active_profile_id = ''
-                         THEN excluded.active_profile_id
-                         ELSE local_proxy_state.active_profile_id END",
-                rusqlite::params![legacy.local_proxy.active_profile_id],
-            )
-            .context("merge legacy active proxy profile")?;
-    }
-    transaction
-        .commit()
-        .context("commit legacy JSON import transaction")?;
-    Ok(())
-}
-
-fn verify_legacy_database_rows(sqlite: &Database, legacy: &Database) -> Result<()> {
-    if !legacy.main_password.is_empty()
-        && !sqlite.main_password.is_empty()
-        && sqlite.main_password != legacy.main_password
-    {
-        bail!("legacy main password conflicts with existing SQLite state");
-    }
-    for (password, legacy_entry) in &legacy.passwords {
-        let Some(sqlite_entry) = sqlite.passwords.get(password) else {
-            bail!(
-                "legacy password {} is missing after import",
-                secret_tag(password)
-            );
-        };
-        if !legacy_password_matches(sqlite_entry, legacy_entry) {
-            bail!(
-                "legacy password {} conflicts with existing SQLite state",
-                secret_tag(password)
-            );
-        }
-    }
-    Ok(())
-}
-
-fn legacy_password_matches(sqlite: &PasswordEntry, legacy: &PasswordEntry) -> bool {
-    sqlite.ip == legacy.ip
-        && sqlite.expires_at == legacy.expires_at
-        && sqlite.vk_hash == legacy.vk_hash
-        && sqlite.ports == legacy.ports
-        && sqlite.is_deactivated == legacy.is_deactivated
-        && (sqlite.name == legacy.name || legacy.name.trim().is_empty())
-        && sqlite.vk_hashes == legacy.vk_hashes
-        && sqlite.vk_token_enabled == legacy.vk_token_enabled
-        && sqlite.dtls_port == legacy.dtls_port
-        && sqlite.wg_port == legacy.wg_port
-        && sqlite.local_port == legacy.local_port
 }
 
 fn persist_database_update(
@@ -1896,19 +1660,6 @@ fn write_traffic(connection: &mut Connection, traffic: &TrafficSnapshot) -> Resu
         .transaction()
         .context("begin traffic persistence transaction")?;
 
-    if let Some(main) = traffic.main {
-        transaction
-            .execute(
-                "INSERT INTO counters (id, main_up_bytes, main_down_bytes, main_last_online)
-                 VALUES (1, ?1, ?2, ?3)
-                 ON CONFLICT(id) DO UPDATE SET
-                    main_up_bytes = excluded.main_up_bytes,
-                    main_down_bytes = excluded.main_down_bytes,
-                    main_last_online = MAX(counters.main_last_online, excluded.main_last_online)",
-                rusqlite::params![main.up_bytes, main.down_bytes, main.last_online],
-            )
-            .context("write main traffic counters")?;
-    }
     for (password, counters) in &traffic.passwords {
         transaction
             .execute(
@@ -1943,23 +1694,22 @@ mod tests {
         db.passwords.insert("existing".into(), entry("10.66.67.3"));
         // a free in-pool address is kept
         assert_eq!(super::import_ip(&db, "10.66.67.40"), "10.66.67.40");
-        // a taken one, or one from another subnet, gets the next free address
-        assert_eq!(super::import_ip(&db, "10.66.67.3"), "10.66.67.4");
-        assert_eq!(super::import_ip(&db, "10.66.68.9"), "10.66.67.4");
+        // a taken one, or one from another subnet, gets the next free address (.2 is in the pool now)
+        assert_eq!(super::import_ip(&db, "10.66.67.3"), "10.66.67.2");
+        assert_eq!(super::import_ip(&db, "10.66.68.9"), "10.66.67.2");
         // an earlier client of the same import counts as taken
         db.passwords
-            .insert("imported-1".into(), entry("10.66.67.4"));
-        assert_eq!(super::import_ip(&db, "10.66.67.4"), "10.66.67.5");
+            .insert("imported-1".into(), entry("10.66.67.2"));
+        assert_eq!(super::import_ip(&db, "10.66.67.2"), "10.66.67.4");
     }
 
     #[test]
     fn ip_in_pool_is_this_servers_pool_only() {
-        // stock config (no --tun-addr): 10.66.67.3–.250
-        assert!(super::ip_in_pool("10.66.67.3") && super::ip_in_pool("10.66.67.250"));
+        // stock config (no --tun-addr): 10.66.67.2–.250
+        assert!(super::ip_in_pool("10.66.67.2") && super::ip_in_pool("10.66.67.250"));
         for bad in [
             "",
             "10.66.67.1",
-            "10.66.67.2",
             "10.66.67.251",
             "10.66.68.3",
             "fd66:67::3",
@@ -1971,8 +1721,186 @@ mod tests {
 
     use super::{
         Database, DatabasePersistence, PasswordEntry, PersistenceQueue, PersistenceUpdate,
-        RoutingRule, TrafficCounters, TrafficSnapshot, load_database, save_database,
+        RoutingRule, TrafficCounters, TrafficSnapshot, load_database, read_schema_version,
+        save_database,
     };
+    use std::path::Path;
+
+    fn seed_schema_version(dir: &Path, version: i64) {
+        std::fs::create_dir_all(dir).unwrap();
+        let conn = rusqlite::Connection::open(dir.join("csqtt.db")).unwrap();
+        conn.execute_batch(super::DATABASE_SCHEMA).unwrap();
+        conn.execute(
+            "INSERT INTO meta(key,value) VALUES('schema_version',?1)",
+            [version.to_string()],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn read_schema_version_returns_none_without_meta() {
+        let dir = temp_dir("schema-version-no-meta");
+        assert_eq!(read_schema_version(&dir).unwrap(), None);
+        let conn = rusqlite::Connection::open(dir.join("csqtt.db")).unwrap();
+        conn.execute_batch("CREATE TABLE passwords (password TEXT PRIMARY KEY);")
+            .unwrap();
+        drop(conn);
+        assert_eq!(read_schema_version(&dir).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_schema_version_returns_two() {
+        let dir = temp_dir("schema-version-two");
+        seed_schema_version(&dir, 2);
+        assert_eq!(read_schema_version(&dir).unwrap(), Some(2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_supported_database_accepts_fresh_install() {
+        let dir = temp_dir("support-fresh-install");
+        super::ensure_supported_database(&dir).unwrap();
+        assert!(!dir.join("csqtt.db").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_supported_database_accepts_schema_two_with_retired_json_leftovers() {
+        let dir = temp_dir("support-schema-two-leftovers");
+        seed_schema_version(&dir, 2);
+        let retired = dir.join("passwords.json");
+        let retired_imported = dir.join("passwords.json.imported");
+        let old_backup = dir.join("csqtt.db.pre-owner-migration");
+        std::fs::write(&retired, b"{}").unwrap();
+        std::fs::write(&retired_imported, b"{}").unwrap();
+        std::fs::write(&old_backup, b"old backup").unwrap();
+        super::ensure_supported_database(&dir).unwrap();
+        assert_eq!(read_schema_version(&dir).unwrap(), Some(2));
+        assert!(
+            retired.exists(),
+            "retired files are reported, never removed"
+        );
+        assert!(retired_imported.exists());
+        assert_eq!(std::fs::read(&old_backup).unwrap(), b"old backup");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_supported_database_rejects_old_schema_version() {
+        let dir = temp_dir("support-old-schema");
+        seed_schema_version(&dir, 1);
+        let error = super::ensure_supported_database(&dir)
+            .expect_err("schema_version=1 must be refused")
+            .to_string();
+        assert!(error.contains("schema_version=1"), "{error}");
+        assert!(error.contains("install.sh --force"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_supported_database_rejects_missing_schema_version_without_writing() {
+        let dir = temp_dir("support-no-schema-version");
+        {
+            let conn = rusqlite::Connection::open(dir.join("csqtt.db")).unwrap();
+            conn.execute_batch(super::DATABASE_SCHEMA).unwrap();
+        }
+        let before = std::fs::read(dir.join("csqtt.db")).unwrap();
+        let error = super::ensure_supported_database(&dir)
+            .expect_err("a database without schema_version must be refused")
+            .to_string();
+        assert!(error.contains("schema_version=2"), "{error}");
+        assert!(error.contains("install.sh --force"), "{error}");
+        assert_eq!(
+            std::fs::read(dir.join("csqtt.db")).unwrap(),
+            before,
+            "the refusal must not touch the database"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_supported_database_rejects_retired_json_without_database() {
+        let dir = temp_dir("support-json-only");
+        let retired = dir.join("passwords.json");
+        std::fs::write(&retired, br#"{"main_password":"OldOwnerPass1"}"#).unwrap();
+        let error = super::ensure_supported_database(&dir)
+            .expect_err("a JSON-only install must be refused")
+            .to_string();
+        assert!(error.contains("passwords.json"), "{error}");
+        assert!(error.contains("install.sh --force"), "{error}");
+        assert!(!dir.join("csqtt.db").exists());
+        assert!(retired.exists(), "user data must survive the refusal");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_supported_database_rejects_unreadable_database() {
+        let dir = temp_dir("support-unreadable");
+        std::fs::write(dir.join("csqtt.db"), b"not a sqlite database").unwrap();
+        let error = super::ensure_supported_database(&dir)
+            .expect_err("an unreadable database must be refused")
+            .to_string();
+        assert!(error.contains("install.sh --force"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fresh_database_has_no_clients() {
+        let dir = temp_dir("fresh-database-no-clients");
+        save_database(&dir, &Database::default()).unwrap();
+        let db = load_database(&dir).unwrap();
+        assert!(db.passwords.is_empty());
+        assert!(!dir.join("csqtt.db.pre-owner-migration").exists());
+    }
+
+    #[test]
+    fn repair_assigns_first_client_dot2() {
+        let mut db = Database::default();
+        db.passwords.insert(
+            "first-client-pw".to_owned(),
+            PasswordEntry {
+                ip: String::new(),
+                ..PasswordEntry::default()
+            },
+        );
+        db.repair_stale_password_bindings();
+        assert_eq!(db.passwords["first-client-pw"].ip, "10.66.67.2");
+    }
+
+    #[test]
+    fn repair_leaves_no_empty_client_ip() {
+        let mut db = Database::default();
+        for key in ["client-a", "client-b", "client-c"] {
+            db.passwords.insert(
+                key.to_owned(),
+                PasswordEntry {
+                    ip: String::new(),
+                    ..PasswordEntry::default()
+                },
+            );
+        }
+        db.repair_stale_password_bindings();
+        let mut ips = std::collections::HashSet::new();
+        for (password, entry) in &db.passwords {
+            assert!(!entry.ip.is_empty(), "{password} has no IP");
+            assert!(ips.insert(entry.ip.clone()), "duplicate IP {}", entry.ip);
+        }
+    }
+
+    #[test]
+    fn import_keeps_owner_dot2() {
+        let mut db = Database::default();
+        assert_eq!(super::import_ip(&db, "10.66.67.2"), "10.66.67.2");
+        db.passwords.insert(
+            "OwnerPass1234567".to_owned(),
+            PasswordEntry {
+                ip: "10.66.67.2".to_owned(),
+                ..PasswordEntry::default()
+            },
+        );
+        assert_eq!(super::import_ip(&db, "10.66.67.2"), "10.66.67.3");
+    }
 
     #[test]
     fn dns_survives_database_restart() {
@@ -2197,133 +2125,13 @@ mod tests {
     }
 
     #[test]
-    fn legacy_json_is_imported_into_sqlite_and_removed() {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!("csqtt-json-import-test-{unique}"));
-        std::fs::create_dir_all(&directory).unwrap();
-        let mut legacy = Database {
-            main_password: "legacy-main-pass".to_owned(),
-            dns: "9.9.9.9".to_owned(),
-            main_up_bytes: 11,
-            main_down_bytes: 12,
-            ..Database::default()
-        };
-        legacy.passwords.insert(
-            "legacy-client-pw".to_owned(),
-            PasswordEntry {
-                ip: "10.66.67.3".to_owned(),
-                up_bytes: 13,
-                down_bytes: 14,
-                ..PasswordEntry::default()
-            },
-        );
-        let legacy_path = directory.join(super::LEGACY_DATABASE_FILE);
-        std::fs::write(&legacy_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
-
-        let restored = load_database(&directory).unwrap();
-        assert_eq!(restored.main_password, "legacy-main-pass");
-        assert_eq!(restored.main_up_bytes, 11);
-        assert!(restored.passwords.contains_key("legacy-client-pw"));
-        assert_eq!(restored.passwords["legacy-client-pw"].ip, "10.66.67.3");
-        assert!(directory.join(super::DATABASE_FILE).exists());
-        assert!(!legacy_path.exists());
-        assert!(
-            !directory
-                .join(super::LEGACY_DATABASE_IMPORTED_FILE)
-                .exists()
-        );
-        let _ = std::fs::remove_dir_all(directory);
-    }
-
-    #[test]
-    fn legacy_json_import_preserves_passwords_and_ip() {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!("csqtt-json-full-import-{unique}"));
-        std::fs::create_dir_all(&directory).unwrap();
-
-        let mut legacy = Database {
-            main_password: "old-main-pass-16".to_owned(),
-            dns: "77.88.8.8,77.88.8.1".to_owned(),
-            main_up_bytes: 900,
-            main_down_bytes: 1_800,
-            ..Database::default()
-        };
-        legacy.passwords.insert(
-            "client-pass-16-1".to_owned(),
-            PasswordEntry {
-                ip: "10.66.67.3".to_owned(),
-                expires_at: 1_900_000_000,
-                name: "first legacy user".to_owned(),
-                vk_hashes: "hash-a\nhash-b".to_owned(),
-                up_bytes: 11,
-                down_bytes: 22,
-                dtls_port: 46000,
-                wg_port: 51820,
-                local_port: 1080,
-                ..PasswordEntry::default()
-            },
-        );
-        legacy.passwords.insert(
-            "client-pass-16-2".to_owned(),
-            PasswordEntry {
-                ip: "10.66.67.4".to_owned(),
-                is_deactivated: true,
-                name: "disabled legacy user".to_owned(),
-                up_bytes: 33,
-                down_bytes: 44,
-                ..PasswordEntry::default()
-            },
-        );
-
-        let legacy_path = directory.join(super::LEGACY_DATABASE_FILE);
-        std::fs::write(&legacy_path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
-
-        let restored = load_database(&directory).unwrap();
-        assert_eq!(restored.main_password, "old-main-pass-16");
-        assert_eq!(restored.dns, "77.88.8.8,77.88.8.1");
-        assert_eq!(
-            (restored.main_up_bytes, restored.main_down_bytes),
-            (900, 1_800)
-        );
-
-        let first = restored.passwords.get("client-pass-16-1").unwrap();
-        assert_eq!(first.ip, "10.66.67.3");
-        assert_eq!(first.name, "first legacy user");
-        assert_eq!(first.vk_hashes, "hash-a\nhash-b");
-        assert_eq!(
-            (first.dtls_port, first.wg_port, first.local_port),
-            (46000, 51820, 1080)
-        );
-
-        let second = restored.passwords.get("client-pass-16-2").unwrap();
-        assert!(second.is_deactivated);
-        assert_eq!(second.ip, "10.66.67.4");
-
-        assert!(directory.join(super::DATABASE_FILE).exists());
-        assert!(!legacy_path.exists());
-
-        let reloaded = load_database(&directory).unwrap();
-        assert_eq!(reloaded.passwords.len(), 2);
-        let _ = std::fs::remove_dir_all(directory);
-    }
-
-    #[test]
     fn load_repairs_stale_passwords_and_assigns_ip() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
         let directory = std::env::temp_dir().join(format!("csqtt-binding-repair-{unique}"));
-        let mut database = Database {
-            main_password: "short".to_owned(),
-            ..Database::default()
-        };
+        let mut database = Database::default();
         database.passwords.insert(
             "old8pass".to_owned(),
             PasswordEntry {
@@ -2334,105 +2142,12 @@ mod tests {
         save_database(&directory, &database).unwrap();
 
         let restored = load_database(&directory).unwrap();
-        assert_eq!(restored.main_password, "short");
         assert!(restored.passwords.contains_key("old8pass"));
         let entry = &restored.passwords["old8pass"];
-        assert_eq!(entry.ip, "10.66.67.3");
+        assert_eq!(entry.ip, "10.66.67.2");
 
         let reloaded = load_database(&directory).unwrap();
-        assert_eq!(reloaded.main_password, restored.main_password);
-        assert_eq!(reloaded.passwords["old8pass"].ip, "10.66.67.3");
-        let _ = std::fs::remove_dir_all(directory);
-    }
-
-    #[test]
-    fn existing_sqlite_ignores_legacy_json() {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!("csqtt-json-merge-test-{unique}"));
-        let mut sqlite = Database {
-            main_password: "sqlite-main-16ch".to_owned(),
-            main_up_bytes: 50,
-            ..Database::default()
-        };
-        sqlite.passwords.insert(
-            "sqlite-client-16".to_owned(),
-            PasswordEntry {
-                name: "current".to_owned(),
-                ip: "10.66.67.10".to_owned(),
-                ..PasswordEntry::default()
-            },
-        );
-        save_database(&directory, &sqlite).unwrap();
-
-        let mut legacy = Database {
-            main_password: "sqlite-main-16ch".to_owned(),
-            main_up_bytes: 10,
-            ..Database::default()
-        };
-        legacy.passwords.insert(
-            "legacy-client-16".to_owned(),
-            PasswordEntry {
-                name: "imported".to_owned(),
-                ip: "10.66.67.11".to_owned(),
-                ..PasswordEntry::default()
-            },
-        );
-        legacy.passwords.insert(
-            "sqlite-client-16".to_owned(),
-            PasswordEntry {
-                name: "current".to_owned(),
-                ip: "10.66.67.10".to_owned(),
-                up_bytes: 1,
-                ..PasswordEntry::default()
-            },
-        );
-        let legacy_path = directory.join(super::LEGACY_DATABASE_FILE);
-        std::fs::write(&legacy_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
-
-        let restored = load_database(&directory).unwrap();
-        assert_eq!(restored.main_password, "sqlite-main-16ch");
-        assert_eq!(restored.main_up_bytes, 50);
-        assert_eq!(restored.passwords.len(), 1);
-        assert_eq!(restored.passwords["sqlite-client-16"].name, "current");
-        assert_eq!(restored.passwords["sqlite-client-16"].ip, "10.66.67.10");
-        assert!(legacy_path.exists());
-        let _ = std::fs::remove_dir_all(directory);
-    }
-
-    #[test]
-    fn existing_sqlite_ignores_conflicting_legacy_password() {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!("csqtt-json-password-conflict-{unique}"));
-        let mut sqlite = Database::default();
-        sqlite.passwords.insert(
-            "shared-password-".to_owned(),
-            PasswordEntry {
-                ip: "10.66.67.3".to_owned(),
-                ..PasswordEntry::default()
-            },
-        );
-        save_database(&directory, &sqlite).unwrap();
-
-        let mut legacy = Database::default();
-        legacy.passwords.insert(
-            "shared-password-".to_owned(),
-            PasswordEntry {
-                ip: "10.66.67.4".to_owned(),
-                ..PasswordEntry::default()
-            },
-        );
-        let legacy_path = directory.join(super::LEGACY_DATABASE_FILE);
-        std::fs::write(&legacy_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
-
-        let restored = load_database(&directory).unwrap();
-        assert_eq!(restored.passwords["shared-password-"].ip, "10.66.67.3");
-        assert!(legacy_path.exists());
+        assert_eq!(reloaded.passwords["old8pass"].ip, "10.66.67.2");
         let _ = std::fs::remove_dir_all(directory);
     }
 
@@ -2481,7 +2196,7 @@ mod tests {
         let mut queue = PersistenceQueue::default();
         let (traffic_revision, _) = queue.submit_traffic(TrafficSnapshot::default());
         let (snapshot_revision, _) = queue.submit_snapshot(Database {
-            main_up_bytes: 42,
+            dns: "snapshot".to_owned(),
             ..Database::default()
         });
         assert!(snapshot_revision > traffic_revision);
@@ -2489,7 +2204,7 @@ mod tests {
             panic!("expected latest database snapshot");
         };
         assert_eq!(revision, snapshot_revision);
-        assert_eq!(snapshot.main_up_bytes, 42);
+        assert_eq!(snapshot.dns, "snapshot");
     }
 
     #[tokio::test]
@@ -2503,13 +2218,13 @@ mod tests {
         let mut final_revision = 0;
         for mutation in 1..=512 {
             final_revision = persistence.submit(Database {
-                main_up_bytes: mutation,
+                dns: format!("dns-{mutation}"),
                 ..Database::default()
             });
         }
         persistence.wait(final_revision).await.unwrap();
         let restored = load_database(&directory).unwrap();
-        assert_eq!(restored.main_up_bytes, 512);
+        assert_eq!(restored.dns, "dns-512");
         let _ = std::fs::remove_dir_all(directory);
     }
 
@@ -2520,11 +2235,7 @@ mod tests {
             .unwrap_or_default()
             .as_nanos();
         let directory = std::env::temp_dir().join(format!("csqtt-traffic-test-{unique}"));
-        let mut database = Database {
-            main_up_bytes: 1,
-            main_down_bytes: 2,
-            ..Database::default()
-        };
+        let mut database = Database::default();
         database.passwords.insert(
             "client-password1".to_owned(),
             PasswordEntry {
@@ -2537,14 +2248,7 @@ mod tests {
         save_database(&directory, &database).unwrap();
 
         let persistence = DatabasePersistence::new(directory.clone()).unwrap();
-        let mut traffic = TrafficSnapshot {
-            main: Some(TrafficCounters {
-                up_bytes: 101,
-                down_bytes: 102,
-                last_online: 0,
-            }),
-            ..TrafficSnapshot::default()
-        };
+        let mut traffic = TrafficSnapshot::default();
         traffic.passwords.insert(
             "client-password1".to_owned(),
             TrafficCounters {
@@ -2557,10 +2261,6 @@ mod tests {
         persistence.wait(revision).await.unwrap();
 
         let restored = load_database(&directory).unwrap();
-        assert_eq!(
-            (restored.main_up_bytes, restored.main_down_bytes),
-            (101, 102)
-        );
         let password = restored.passwords.get("client-password1").unwrap();
         assert_eq!((password.up_bytes, password.down_bytes), (103, 104));
         let _ = std::fs::remove_dir_all(directory);
@@ -2585,7 +2285,8 @@ mod tests {
             tasks.spawn(async move {
                 for _ in 0..256 {
                     let mut database = database.lock().await;
-                    database.main_up_bytes = database.main_up_bytes.saturating_add(1);
+                    let current = database.dns.parse::<u32>().unwrap_or(0);
+                    database.dns = current.saturating_add(1).to_string();
                     let revision = persistence.submit(database.clone());
                     final_revision.fetch_max(revision, std::sync::atomic::Ordering::AcqRel);
                 }
@@ -2597,7 +2298,7 @@ mod tests {
         let final_revision = final_revision.load(std::sync::atomic::Ordering::Acquire);
         persistence.wait(final_revision).await.unwrap();
         let restored = load_database(&directory).unwrap();
-        assert_eq!(restored.main_up_bytes, 4096);
+        assert_eq!(restored.dns, "4096");
         let _ = std::fs::remove_dir_all(directory);
     }
 
@@ -2702,33 +2403,24 @@ mod tests {
 
     #[test]
     fn repair_migrates_passwords_and_assigns_ip() {
-        let mut db = super::Database {
-            main_password: "".to_string(),
-            ..super::Database::default()
-        };
+        let mut db = super::Database::default();
         db.passwords
             .insert("legacy-slot-pw".to_owned(), super::PasswordEntry::default());
         db.passwords
             .insert("".to_owned(), super::PasswordEntry::default());
 
         assert!(!db.repair_stale_password_bindings().is_empty());
-        assert_eq!(db.main_password.len(), super::PASSWORD_LEN);
-        assert!(db.main_password.chars().all(|c| c.is_ascii_alphanumeric()));
-        let main_sub_uuid = db.main_sub_uuid.clone();
-        assert!(!main_sub_uuid.is_empty());
 
         let legacy_entry = db.passwords.get("legacy-slot-pw").unwrap();
-        assert_eq!(legacy_entry.ip, "10.66.67.3");
+        assert_eq!(legacy_entry.ip, "10.66.67.2");
         assert!(!legacy_entry.sub_uuid.is_empty());
 
         let (_, slot_entry) = db
             .passwords
             .iter()
-            .find(|(k, _)| {
-                k.len() == super::PASSWORD_LEN && *k != &db.main_password && *k != "legacy-slot-pw"
-            })
+            .find(|(k, _)| k.len() == super::PASSWORD_LEN && *k != "legacy-slot-pw")
             .unwrap();
-        assert_eq!(slot_entry.ip, "10.66.67.4");
+        assert_eq!(slot_entry.ip, "10.66.67.3");
         assert!(!slot_entry.sub_uuid.is_empty());
 
         assert!(db.repair_stale_password_bindings().is_empty());
@@ -2742,10 +2434,7 @@ mod tests {
             .as_nanos();
         let directory = std::env::temp_dir().join(format!("csqtt-pass-ip-test-{unique}"));
         let persistence = super::DatabasePersistence::new(directory.clone()).unwrap();
-        let mut db = super::Database {
-            main_password: "owner12345678901".to_string(),
-            ..super::Database::default()
-        };
+        let mut db = super::Database::default();
         db.passwords.insert(
             "slot123456789012".to_string(),
             super::PasswordEntry {
@@ -2758,66 +2447,11 @@ mod tests {
         persistence.wait(revision).await.unwrap();
 
         let restored = super::load_database(&directory).unwrap();
-        assert_eq!(restored.main_password, "owner12345678901");
         let slot = restored
             .passwords
             .get("slot123456789012")
             .expect("slot must exist");
         assert_eq!(slot.ip, "10.66.67.55");
-        let _ = std::fs::remove_dir_all(directory);
-    }
-
-    #[test]
-    fn test_legacy_slot_migration_sets_vladilets() {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!("csqtt-vladilets-test-{unique}"));
-        std::fs::create_dir_all(&directory).unwrap();
-
-        let conn = rusqlite::Connection::open(directory.join("csqtt.db")).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
-             CREATE TABLE passwords (
-                 password TEXT PRIMARY KEY,
-                 ip TEXT NOT NULL DEFAULT '',
-                 expires_at INTEGER NOT NULL DEFAULT 0,
-                 down_bytes INTEGER NOT NULL DEFAULT 0,
-                 up_bytes INTEGER NOT NULL DEFAULT 0,
-                 vk_hash TEXT NOT NULL DEFAULT '',
-                 ports TEXT NOT NULL DEFAULT '',
-                 is_deactivated INTEGER NOT NULL DEFAULT 0,
-                 name TEXT NOT NULL DEFAULT '',
-                 vk_hashes TEXT NOT NULL DEFAULT '',
-                 vk_token_enabled INTEGER NOT NULL DEFAULT 0,
-                 dtls_port INTEGER NOT NULL DEFAULT 0,
-                 wg_port INTEGER NOT NULL DEFAULT 0,
-                 local_port INTEGER NOT NULL DEFAULT 0,
-                 group_id TEXT NOT NULL DEFAULT '',
-                 routing_rule_id TEXT NOT NULL DEFAULT '',
-                 sub_uuid TEXT NOT NULL DEFAULT '',
-                 workers INTEGER DEFAULT NULL
-             );
-             INSERT INTO meta (key, value) VALUES ('main_password', 'main123456789012');
-             INSERT INTO passwords (password, name) VALUES ('main123456789012', 'Главный пароль');
-             INSERT INTO passwords (password, name) VALUES ('client1234567890', 'Клиент');",
-        )
-        .unwrap();
-        drop(conn);
-
-        let db = super::load_database(&directory).unwrap();
-        let owner = db
-            .passwords
-            .get("main123456789012")
-            .expect("owner slot exists");
-        assert_eq!(owner.name, "Владелец");
-
-        let participant = db
-            .passwords
-            .get("client1234567890")
-            .expect("participant slot exists");
-        assert_eq!(participant.ip, "10.66.67.3");
         let _ = std::fs::remove_dir_all(directory);
     }
 
@@ -2881,7 +2515,6 @@ mod tests {
         drop(connection);
 
         let db = super::load_database(&directory).unwrap();
-        assert_eq!(db.main_last_online, 0);
         assert_eq!(db.passwords["oldclientpass001"].last_online, 0);
 
         let connection = rusqlite::Connection::open(directory.join(super::DATABASE_FILE)).unwrap();
@@ -2890,17 +2523,12 @@ mod tests {
                 .iter()
                 .any(|column| column == "last_online")
         );
-        assert!(
-            columns_of(&connection, "counters")
-                .iter()
-                .any(|column| column == "main_last_online")
-        );
         let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
-    fn counters_presence_migration_is_independent_of_passwords() {
-        let directory = temp_dir("csqtt-presence-counter-migration");
+    fn counters_table_is_gone_after_upgrade() {
+        let directory = temp_dir("csqtt-counters-dropped");
         let connection = rusqlite::Connection::open(directory.join(super::DATABASE_FILE)).unwrap();
         connection
             .execute_batch(
@@ -2938,8 +2566,29 @@ mod tests {
         drop(connection);
 
         let db = super::load_database(&directory).unwrap();
-        assert_eq!(db.main_last_online, 0);
         assert_eq!(db.passwords["oldclientpass002"].last_online, 123);
+        let connection = rusqlite::Connection::open(directory.join(super::DATABASE_FILE)).unwrap();
+        let counters_tables: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'counters'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(counters_tables, 0, "counters must be dropped on upgrade");
+        drop(connection);
+
+        let reloaded = super::load_database(&directory).unwrap();
+        assert_eq!(reloaded.passwords["oldclientpass002"].last_online, 123);
+        let connection = rusqlite::Connection::open(directory.join(super::DATABASE_FILE)).unwrap();
+        let counters_tables: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'counters'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(counters_tables, 0, "reload must not bring counters back");
         let _ = std::fs::remove_dir_all(directory);
     }
 
@@ -2947,10 +2596,7 @@ mod tests {
     async fn traffic_persistence_never_lowers_last_online() {
         let directory = temp_dir("csqtt-presence-monotonic");
         let persistence = super::DatabasePersistence::new(directory.clone()).unwrap();
-        let mut db = super::Database {
-            main_password: "owner12345678901".to_owned(),
-            ..super::Database::default()
-        };
+        let mut db = super::Database::default();
         db.passwords.insert(
             "client1234567890".to_owned(),
             super::PasswordEntry {
@@ -2962,14 +2608,7 @@ mod tests {
         let revision = persistence.submit(db);
         persistence.wait(revision).await.unwrap();
 
-        let mut fresh = super::TrafficSnapshot {
-            main: Some(super::TrafficCounters {
-                up_bytes: 0,
-                down_bytes: 0,
-                last_online: 300,
-            }),
-            ..super::TrafficSnapshot::default()
-        };
+        let mut fresh = super::TrafficSnapshot::default();
         fresh.passwords.insert(
             "client1234567890".to_owned(),
             super::TrafficCounters {
@@ -2981,14 +2620,7 @@ mod tests {
         let revision = persistence.submit_traffic(fresh);
         persistence.wait(revision).await.unwrap();
 
-        let mut stale = super::TrafficSnapshot {
-            main: Some(super::TrafficCounters {
-                up_bytes: 0,
-                down_bytes: 0,
-                last_online: 100,
-            }),
-            ..super::TrafficSnapshot::default()
-        };
+        let mut stale = super::TrafficSnapshot::default();
         stale.passwords.insert(
             "client1234567890".to_owned(),
             super::TrafficCounters {
@@ -3001,11 +2633,9 @@ mod tests {
         persistence.wait(revision).await.unwrap();
 
         let restored = super::load_database(&directory).unwrap();
-        assert_eq!(restored.main_last_online, 300);
         assert_eq!(restored.passwords["client1234567890"].last_online, 300);
 
         let mut stale_snapshot = restored.clone();
-        stale_snapshot.main_last_online = 50;
         stale_snapshot
             .passwords
             .get_mut("client1234567890")
@@ -3013,7 +2643,6 @@ mod tests {
             .last_online = 50;
         super::save_database(&directory, &stale_snapshot).unwrap();
         let reloaded = super::load_database(&directory).unwrap();
-        assert_eq!(reloaded.main_last_online, 300);
         assert_eq!(reloaded.passwords["client1234567890"].last_online, 300);
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -3026,42 +2655,5 @@ mod tests {
         };
         let value = serde_json::to_value(&entry).unwrap();
         assert!(value.get("last_online").is_none());
-
-        let db = super::Database {
-            main_last_online: 123,
-            ..super::Database::default()
-        };
-        let value = serde_json::to_value(&db).unwrap();
-        assert!(value.get("main_last_online").is_none());
-    }
-
-    #[test]
-    fn legacy_import_clamps_future_presence_timestamps() {
-        let directory = temp_dir("csqtt-presence-import-clamp");
-        let future = super::now().saturating_add(100_000);
-        let mut legacy = super::Database {
-            main_last_online: future,
-            ..super::Database::default()
-        };
-        legacy.passwords.insert(
-            "client1234567890".to_owned(),
-            super::PasswordEntry {
-                ip: "10.66.67.3".to_owned(),
-                name: "Legacy".to_owned(),
-                last_online: future,
-                ..super::PasswordEntry::default()
-            },
-        );
-        let mut connection = super::open_database_connection(&directory).unwrap();
-        super::import_legacy_database_rows(&mut connection, &legacy).unwrap();
-        drop(connection);
-
-        let db = super::load_database(&directory).unwrap();
-        assert!(db.main_last_online > 0);
-        assert!(db.main_last_online <= super::now());
-        let entry = &db.passwords["client1234567890"];
-        assert!(entry.last_online > 0);
-        assert!(entry.last_online <= super::now());
-        let _ = std::fs::remove_dir_all(directory);
     }
 }

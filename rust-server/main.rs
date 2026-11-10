@@ -44,8 +44,9 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use dashmap::DashMap;
 use model::{
-    DEFAULT_AUTO_RESTART_INTERVAL_HOURS, Database, DatabasePersistence, load_database, now,
-    random_password, save_database,
+    DEFAULT_AUTO_RESTART_INTERVAL_HOURS, Database, DatabasePersistence,
+    apply_legacy_initial_client_seed, consume_deploy_overrides, load_database, now,
+    random_password, read_schema_version, save_database,
 };
 use protocol::Session;
 use std::{
@@ -79,9 +80,10 @@ struct Args {
 
     #[arg(
         long,
+        hide = true,
         env = "CSQTT_MAIN_PASSWORD",
         default_value = "",
-        help = "Основной пароль CSQTT"
+        help = "Устаревший основной пароль: только для первого клиента"
     )]
     password: String,
 
@@ -164,6 +166,7 @@ struct Args {
 
 #[derive(Debug, Default, serde::Deserialize)]
 struct DeployOverrides {
+    /// Retired field: accepted only as a first-client seed on a fresh install.
     #[serde(default)]
     main_password: String,
 }
@@ -280,7 +283,6 @@ pub struct App {
     pub db: RwLock<Database>,
     pub db_persistence: DatabasePersistence,
     pub dns: RwLock<String>,
-    pub startup_main_password: String,
     pub config_dir: std::path::PathBuf,
     pub listen: SocketAddr,
     pub web_port: u16,
@@ -935,7 +937,6 @@ fn print_cli_help() {
   --listen АДРЕС              UDP-адрес, по умолчанию 0.0.0.0:46000\n  \
   --web-port ПОРТ             HTTPS-порт панели, по умолчанию 46002\n  \
   --config-dir ПУТЬ           Каталог конфигурации, по умолчанию /etc/csqtt\n  \
-  --password ПАРОЛЬ           Основной пароль CSQTT\n  \
   --web-user ЛОГИН            Логин веб-панели\n  \
   --web-pass ПАРОЛЬ           Пароль веб-панели\n  \
   --dns IP[,IP]               Один или два DNS IPv4-адреса\n  \
@@ -1043,11 +1044,6 @@ async fn async_main() -> Result<()> {
         Err(_) => eprintln!("[PROXY] startup policy cleanup timed out"),
     }
 
-    let mut db = load_database(&args.config_dir)?;
-    db.admin_id.clear();
-    db.bot_token.clear();
-    db.web_sessions.clear();
-
     let deploy_overrides_path = args.config_dir.join("deploy-overrides.json");
     let deploy_overrides_present = deploy_overrides_path.exists();
     let deploy_overrides = if deploy_overrides_present {
@@ -1059,14 +1055,35 @@ async fn async_main() -> Result<()> {
         DeployOverrides::default()
     };
 
-    if !args.password.is_empty() {
-        db.main_password = args.password.clone();
-    } else if !deploy_overrides.main_password.is_empty() {
-        db.main_password = deploy_overrides.main_password.clone();
-    }
-    if db.main_password.is_empty() {
-        db.main_password = random_password();
-        println!("[INIT] generated main password: {}", db.main_password);
+    // Read the version before `load_database`: every save writes the current
+    // schema version, so a fresh install is indistinguishable from an upgraded
+    // one afterwards. An unreadable version is treated as already migrated so
+    // the downgrade guard fails closed: a broken read must not let an old APK
+    // seed the owner into a database we could not classify.
+    let schema_version_before_load = match read_schema_version(&args.config_dir) {
+        Ok(version) => version,
+        Err(error) => {
+            eprintln!(
+                "[INIT] read schema_version before load failed; legacy seed disabled: {error:#}"
+            );
+            Some(model::SCHEMA_VERSION)
+        }
+    };
+
+    let mut db = load_database(&args.config_dir)?;
+    db.admin_id.clear();
+    db.bot_token.clear();
+    db.web_sessions.clear();
+
+    let legacy_password = if !args.password.is_empty() {
+        args.password.clone()
+    } else {
+        deploy_overrides.main_password.clone()
+    };
+    if apply_legacy_initial_client_seed(&mut db, schema_version_before_load, &legacy_password) {
+        println!(
+            "[INIT] legacy main_password seeds the first client; use the panel to create clients"
+        );
     }
 
     let runtime_dns = if let Some(configured) =
@@ -1103,28 +1120,19 @@ async fn async_main() -> Result<()> {
     };
 
     save_database(&args.config_dir, &db)?;
-    if deploy_overrides_path.exists() {
-        std::fs::remove_file(&deploy_overrides_path).with_context(|| {
-            format!(
-                "remove consumed deploy overrides {}",
-                deploy_overrides_path.display()
-            )
-        })?;
-    }
+    consume_deploy_overrides(&args.config_dir)?;
 
     let web_sessions = DashMap::new();
 
     let logging_active_val = db.logging_active.unwrap_or(true);
     let (auto_restart_interval_tx, auto_restart_interval_rx) =
         tokio::sync::watch::channel(db.auto_restart_interval_hours());
-    let startup_main_password = db.main_password.clone();
     let initial_public_ip = args.public_ip.trim().to_string();
     let public_ip_arc = Arc::new(RwLock::new(initial_public_ip));
     let app = Arc::new(App {
         db_persistence: DatabasePersistence::new(args.config_dir.clone())?,
         db: RwLock::new(db),
         dns: RwLock::new(runtime_dns.clone()),
-        startup_main_password,
         config_dir: args.config_dir.clone(),
         listen: args.listen,
         web_port: args.web_port,
