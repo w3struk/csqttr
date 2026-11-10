@@ -10136,7 +10136,7 @@ const PANEL_HTML_TEMPLATE: &str = r##"
         </div>
         <div class="input-group">
             <label for="ruleMode">Режим исключения приложений</label>
-            <select id="ruleMode">
+            <select id="ruleMode" onchange="onRuleAppsModeChange()">
                 <option value="blacklist">Чёрный список</option>
                 <option value="whitelist">Белый список</option>
             </select>
@@ -12415,6 +12415,14 @@ const PANEL_HTML_TEMPLATE: &str = r##"
             }).join('');
         }
 
+        function onRuleAppsModeChange() {
+            const mode = document.getElementById('ruleMode').value;
+            const row = document.getElementById('rulePresetAppsRow');
+            if (row) {
+                row.style.display = (mode === 'whitelist') ? 'none' : 'flex';
+            }
+        }
+
         function onRuleDomainsModeChange() {
             const mode = document.getElementById('ruleDomainsMode').value;
             const row = document.getElementById('ruleTemplateDomainsRow');
@@ -12508,6 +12516,7 @@ const PANEL_HTML_TEMPLATE: &str = r##"
             const defaultName = rule ? (rule.name || '') : `Правило${randomNum}`;
             document.getElementById('ruleName').value = defaultName;
             document.getElementById('ruleMode').value = rule ? (rule.mode || 'blacklist') : 'blacklist';
+            onRuleAppsModeChange();
             document.getElementById('rulePackages').value = rule && rule.packages ? rule.packages.join('\n') : '';
             document.getElementById('ruleDomainsMode').value = rule ? (rule.domains_mode || (rule.domains_is_whitelist ? 'whitelist' : 'blacklist')) : 'blacklist';
             onRuleDomainsModeChange();
@@ -12648,7 +12657,7 @@ const PANEL_HTML_TEMPLATE: &str = r##"
                     domains_is_whitelist: domains_mode === 'whitelist',
                     direct_domains: domains,
                     template_domains,
-                    preset_apps: document.getElementById('rulePresetApps').checked,
+                    preset_apps: (mode === 'whitelist') ? false : document.getElementById('rulePresetApps').checked,
                     ip_mode,
                     ip_is_whitelist: ip_mode === 'whitelist',
                     template_ips,
@@ -14938,6 +14947,25 @@ mod tests {
         assert!(
             !html.contains("До 512 адресов;"),
             "единый хинт про лимиты должен быть разбит на доменный и адресный"
+        );
+    }
+
+    #[test]
+    fn app_whitelist_hides_the_ru_preset_like_domains_and_ips() {
+        let html = PANEL_HTML.as_str();
+        assert!(
+            html.contains("id=\"ruleMode\" onchange=\"onRuleAppsModeChange()\""),
+            "смена режима приложений должна скрывать строку пресета"
+        );
+        assert!(
+            html.contains("function onRuleAppsModeChange()"),
+            "обработчик режима приложений отсутствует"
+        );
+        assert!(
+            html.contains(
+                "preset_apps: (mode === 'whitelist') ? false : document.getElementById('rulePresetApps').checked"
+            ),
+            "в белом режиме приложений preset_apps обязан уходить false, как template_domains и template_ips"
         );
     }
 
