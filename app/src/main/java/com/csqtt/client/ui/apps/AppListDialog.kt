@@ -388,18 +388,24 @@ internal fun AppListDialog(
                         softWrap = false,
                         overflow = TextOverflow.Ellipsis,
                     )
-                    // Подмена: белый список правила непуст, но ни одного из его
+                    // Подмена: СЫРОЕ правило непусто, но ни одного из его
                     // пакетов нет среди установленных (например, они в приватном
-                    // пространстве). Тогда план — «все приложения», и пользовательский
-                    // выбор на него не влияет. Признак считается вызывающим по
-                    // нефильтрованному набору установленных тем же предикатом, что у
-                    // сборщика плана, счётчиков карточки и per-UID триггера.
+                    // пространстве). Тогда план — «все приложения», и исключения
+                    // пользователя продолжают действовать. Признак считается
+                    // вызывающим по нефильтрованному набору установленных тем же
+                    // предикатом, что у сборщика плана, счётчиков карточки и
+                    // per-UID триггера.
                     if (serverLocked) {
                         Text(
-                            text = if (substituted) {
-                                "Ваши выборы не применяются, пока действует правило на все приложения"
-                            } else {
-                                "Режим задан правилом сервера. Вы редактируете свой ${if (isWhitelist) "белый" else "чёрный"} список — он дополняет правило"
+                            text = when {
+                                substituted ->
+                                    "Правило применено ко всем приложениям. Ваши исключения продолжают действовать"
+                                isWhitelist ->
+                                    "Отмеченные приложения идут мимо туннеля. В туннель пускает только правило " +
+                                        "сервера: приложения можно исключать, но не добавлять"
+                                else ->
+                                    "Отмеченные приложения идут мимо туннеля. Ваш чёрный список дополняет " +
+                                        "правило сервера"
                             },
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -473,15 +479,18 @@ internal fun AppListDialog(
                                             key = { "section-${section.source.name}-${it.packageName}" },
                                             contentType = { "preset-row" },
                                         ) { app ->
+                                            val state = AppDialogPolicy.rowState(
+                                                source = AppSectionSource.RED,
+                                                isWhitelist = isWhitelist,
+                                                packageName = app.packageName,
+                                                userBlack = activeSelection,
+                                                orangeTunnelEnabled = orangeTunnelEnabled,
+                                                substituted = substituted,
+                                            )
                                             AppRow(
                                                 app = app.copy(presetRisk = PresetRisk.RED),
-                                                isSelected = presetRowChecked(
-                                                    risk = PresetRisk.RED,
-                                                    isWhitelist = isWhitelist,
-                                                    packageName = app.packageName,
-                                                    orangeTunnelEnabled = orangeTunnelEnabled,
-                                                ),
-                                                enabled = false,
+                                                isSelected = state.checked,
+                                                enabled = state.enabled,
                                                 onClick = {},
                                             )
                                         }
@@ -501,11 +510,19 @@ internal fun AppListDialog(
                                             key = { "section-${section.source.name}-${it.packageName}" },
                                             contentType = { "server-row" },
                                         ) { app ->
+                                            val state = AppDialogPolicy.rowState(
+                                                source = AppSectionSource.SERVER,
+                                                isWhitelist = isWhitelist,
+                                                packageName = app.packageName,
+                                                userBlack = activeSelection,
+                                                orangeTunnelEnabled = orangeTunnelEnabled,
+                                                substituted = substituted,
+                                            )
                                             AppRow(
                                                 app = app.copy(serverRule = true),
-                                                isSelected = true,
-                                                enabled = false,
-                                                onClick = {},
+                                                isSelected = state.checked,
+                                                enabled = state.enabled,
+                                                onClick = { onToggleApp(app.packageName) },
                                             )
                                         }
                                     }
@@ -525,15 +542,18 @@ internal fun AppListDialog(
                                             key = { "section-${section.source.name}-${it.packageName}" },
                                             contentType = { "preset-row" },
                                         ) { app ->
+                                            val state = AppDialogPolicy.rowState(
+                                                source = AppSectionSource.ORANGE,
+                                                isWhitelist = isWhitelist,
+                                                packageName = app.packageName,
+                                                userBlack = activeSelection,
+                                                orangeTunnelEnabled = orangeTunnelEnabled,
+                                                substituted = substituted,
+                                            )
                                             AppRow(
                                                 app = app.copy(presetRisk = PresetRisk.ORANGE),
-                                                isSelected = presetRowChecked(
-                                                    risk = PresetRisk.ORANGE,
-                                                    isWhitelist = isWhitelist,
-                                                    packageName = app.packageName,
-                                                    orangeTunnelEnabled = orangeTunnelEnabled,
-                                                ),
-                                                enabled = true,
+                                                isSelected = state.checked,
+                                                enabled = state.enabled,
                                                 onClick = { onToggleOrange(app.packageName) },
                                             )
                                         }
@@ -545,9 +565,25 @@ internal fun AppListDialog(
                                             key = { "section-${section.source.name}-${it.packageName}" },
                                             contentType = { "application" },
                                         ) { app ->
+                                            val state = if (serverLocked) {
+                                                AppDialogPolicy.rowState(
+                                                    source = AppSectionSource.USER,
+                                                    isWhitelist = isWhitelist,
+                                                    packageName = app.packageName,
+                                                    userBlack = activeSelection,
+                                                    orangeTunnelEnabled = orangeTunnelEnabled,
+                                                    substituted = substituted,
+                                                )
+                                            } else {
+                                                AppRowState(
+                                                    checked = app.packageName in activeSelection,
+                                                    enabled = true,
+                                                )
+                                            }
                                             AppRow(
                                                 app = app,
-                                                isSelected = app.packageName in activeSelection,
+                                                isSelected = state.checked,
+                                                enabled = state.enabled,
                                                 onClick = { onToggleApp(app.packageName) },
                                             )
                                         }
@@ -560,24 +596,6 @@ internal fun AppListDialog(
             }
         }
     }
-}
-
-/**
- * Effective checkbox state of a preset row — "is this app routed the way the
- * level dictates", not "is the package in the mode's own list".
- *
- * In the blacklist mode the checkbox means "excluded from the tunnel", in the
- * whitelist mode it means "goes through the tunnel".
- */
-private fun presetRowChecked(
-    risk: PresetRisk,
-    isWhitelist: Boolean,
-    packageName: String,
-    orangeTunnelEnabled: Set<String>,
-): Boolean = when (risk) {
-    PresetRisk.RED -> !isWhitelist                 // чёрный: всегда исключён; белый: никогда в туннеле
-    PresetRisk.ORANGE -> if (isWhitelist) packageName in orangeTunnelEnabled
-                         else packageName !in orangeTunnelEnabled
 }
 
 @Composable

@@ -1,11 +1,12 @@
 package com.csqtt.client
 
 /**
- * Объединение серверного правила и локального списка приложений.
+ * Слияние серверного правила и локального списка приложений.
  *
- * Режим задаёт оператор, а не профиль: правило чёрное — читается локальный
- * чёрный список, правило белое — локальный белый. Список противоположного
- * режима не читается вовсе, иначе список читался бы «наоборот».
+ * Режим задаёт оператор, а единственный пользовательский слой под правилом —
+ * чёрный список: под чёрным правилом он дополняет запрет, под белым —
+ * вычитается из разрешённого набора. Локальный белый список под правилом не
+ * читается; он остаётся для локального режима, когда правила нет.
  *
  * Пустой результат легален и означает «никто через тоннель»: пустой белый
  * набор — это «никто», а не «все». Отказ поднимать VPN формирует сборщик плана
@@ -16,9 +17,8 @@ internal object MergedRoutingPolicy {
         ruleIsWhite: Boolean,
         rulePackages: Set<String>,
         localBlack: Set<String>,
-        localWhite: Set<String>,
     ): Set<String> = if (ruleIsWhite) {
-        rulePackages + localWhite
+        rulePackages - localBlack
     } else {
         rulePackages + localBlack
     }
@@ -26,7 +26,7 @@ internal object MergedRoutingPolicy {
     /**
      * Итог для карточки «Маршрутизация приложений»: сколько установленных
      * приложений идёт через тоннель, сколько мимо и кто их туда принёс —
-     * правило сервера вместе с пресетом или локальный список.
+     * правило сервера вместе с пресетом или локальный чёрный список.
      *
      * Считаются только установленные приложения, транспортные пакеты и сам
      * CSQTT исключаются всегда. [installedPackages] — сырой набор имён из
@@ -37,17 +37,18 @@ internal object MergedRoutingPolicy {
      * правило, и в локальный список, считается один раз и относится к правилу;
      * пакет пресета из локального списка «вашим» не становится.
      *
-     * Белый режим считается обычными формулами и при пустом эффективном
-     * наборе даёт «0 в туннеле» — ветки «правило на все приложения» здесь нет.
-     * «На все приложения» бывает только подменой невидимого непустого белого
-     * набора: тогда счётчики считаются device-wide формулами (локальный список
-     * в план не входит, поэтому `localAttributed = 0`).
+     * Белый режим вычитает локальный чёрный список. Пакет, исключённый
+     * пользователем, относится к «вашим»; возвращённый оранжевый сильнее
+     * списка. «На все приложения» бывает только подменой невидимого непустого
+     * СЫРОГО правила: предикат считается до вычитания, иначе исключение
+     * последнего видимого пакета включало бы device-wide план и расширяло
+     * покрытие. В подменённом плане исключения пользователя продолжают
+     * действовать.
      */
     fun cardCounts(
         ruleIsWhite: Boolean,
         rulePackages: Set<String>,
         localBlack: Set<String>,
-        localWhite: Set<String>,
         preset: PresetApps,
         userEnabled: Set<String>,
         installedPackages: Set<String>,
@@ -57,41 +58,40 @@ internal object MergedRoutingPolicy {
         val counted = installedPackages - transportPackages
         val alwaysExcluded = (preset.red intersect counted).size
         val optOut = (preset.orange intersect counted).size
-        val effective = effectivePackages(ruleIsWhite, rulePackages, localBlack, localWhite)
+        val effective = effectivePackages(ruleIsWhite, rulePackages, localBlack)
 
-        // Подмена (спека §2, §7.8): непустой белый набор, в котором не видно ни
-        // одного установленного пакета. Предикат общий с VpnAppRouting.build и
-        // per-UID триггером; оценивается по эффективному набору до возвращённых
-        // оранжевых. Формулы — прежние device-wide: всё, кроме пресета и
-        // не возвращённых оранжевых.
+        // Подмена: непустой невидимый белый набор правила. Предикат оценивается
+        // по сырому правилу, до вычитания чёрного списка, и до возвращённых
+        // оранжевых. Формулы — прежние device-wide: всё, кроме пресета и не
+        // возвращённых оранжевых, минус исключения пользователя.
         if (ruleIsWhite &&
-            AppRoutingPolicy.isServerWhitelistInvisible(ruleIsWhite, effective) {
+            AppRoutingPolicy.isServerWhitelistInvisible(ruleIsWhite, rulePackages) {
                 it in installedPackages
             }
         ) {
-            val inTunnelSet = counted - preset.red - (preset.orange - orange)
+            val userExcluded = localBlack - orange
+            val inTunnelSet = counted - preset.red - (preset.orange - orange) - userExcluded
             return MergedCardCounts(
                 inTunnel = inTunnelSet.size,
                 excluded = counted.size - inTunnelSet.size,
                 serverAttributed = inTunnelSet.size,
-                localAttributed = 0,
+                localAttributed = (userExcluded - preset.all).count { it in counted },
                 alwaysExcluded = alwaysExcluded,
                 optOut = optOut,
             )
         }
 
         if (ruleIsWhite) {
-            // «В тоннель»: объединённый набор минус весь пресет, плюс
-            // возвращённые пользователем оранжевые.
+            // «В тоннель»: правило минус чёрный список, минус весь пресет,
+            // плюс возвращённые пользователем оранжевые.
             val inTunnelSet = (effective - preset.all) + orange
             val inTunnel = (inTunnelSet intersect counted).size
-            val serverAttributed = ((rulePackages - preset.all) + orange).count { it in counted }
-            val localAttributed = (localWhite - rulePackages - preset.all).count { it in counted }
             return MergedCardCounts(
                 inTunnel = inTunnel,
                 excluded = counted.size - inTunnel,
-                serverAttributed = serverAttributed,
-                localAttributed = localAttributed,
+                serverAttributed = inTunnelSet.count { it in counted },
+                localAttributed = ((localBlack intersect rulePackages) - preset.all - orange)
+                    .count { it in counted },
                 alwaysExcluded = alwaysExcluded,
                 optOut = optOut,
             )

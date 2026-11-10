@@ -29,6 +29,8 @@ class VpnAppRoutingTest {
         rulePackages: Set<String> = emptySet(),
         orangeEnabled: Set<String> = emptySet(),
         hasServerRule: Boolean = true,
+        userExcluded: Set<String> = emptySet(),
+        serverRulePackages: Set<String> = rulePackages,
     ): VpnAppsPlan = VpnAppRouting.build(
         hasServerRule = hasServerRule,
         isWhite = isWhite,
@@ -38,6 +40,8 @@ class VpnAppRoutingTest {
         transportPackages = transport,
         selfPackage = self,
         isInstalled = { it in installed },
+        userExcluded = userExcluded,
+        serverRulePackages = serverRulePackages,
     )
 
     @Test
@@ -159,8 +163,33 @@ class VpnAppRoutingTest {
             message.contains("правило сервера задано в белом режиме"),
         )
         assertTrue(
-            "и список, который надо заполнить: $message",
-            message.contains("белый список"),
+            "и отправляет к тому, кто может его поправить: $message",
+            message.contains("поправьте правило на сервере"),
+        )
+        assertFalse(
+            "пользователь не может добавить приложение в белый список под правилом: $message",
+            message.contains("добавьте приложения"),
+        )
+    }
+
+    @Test
+    fun `a red app in the rule does not hide the user exclusion cause`() {
+        val plan = build(
+            isWhite = true,
+            rulePackages = setOf("com.bank"),
+            serverRulePackages = setOf("com.vpn", "com.bank"),
+            userExcluded = setOf("com.vpn"),
+        )
+
+        assertTrue("allow-набор пуст — отказ", plan is VpnAppsPlan.Failure)
+        val message = (plan as VpnAppsPlan.Failure).message
+        assertTrue(
+            "причина исключения пользователя названа: $message",
+            message.contains("исключили установленные приложения"),
+        )
+        assertTrue(
+            "и совет снять исключения есть: $message",
+            message.contains("Снимите исключения в списке приложений"),
         )
     }
 
@@ -400,6 +429,161 @@ class VpnAppRoutingTest {
         assertFalse(
             "локальный режим не лечится правкой серверного правила: $message",
             message.contains("Поправьте правило на сервере"),
+        )
+    }
+
+    // --- Исключения пользователя ---------------------------------------------
+
+    @Test
+    fun `substituted whitelist keeps the user exclusions out of the tunnel`() {
+        val plan = build(
+            isWhite = true,
+            rulePackages = setOf("com.example.notinstalled"),
+            userExcluded = setOf("com.vpn"),
+        ) as VpnAppsPlan.Disallow
+
+        assertTrue("план остаётся device-wide", plan.deviceWide)
+        assertTrue("исключение пользователя в disallow-списке", "com.vpn" in plan.packages)
+        assertEquals(
+            "транспорт и пресет по-прежнему мимо",
+            setOf("com.vkontakte.android", "com.bank", "ru.sberbankmobile", "com.vpn"),
+            plan.packages.toSet(),
+        )
+    }
+
+    @Test
+    fun `a restored orange wins over the user exclusion in the substituted plan`() {
+        val plan = build(
+            isWhite = true,
+            rulePackages = setOf("com.example.notinstalled"),
+            orangeEnabled = setOf("ru.sberbankmobile"),
+            userExcluded = setOf("ru.sberbankmobile"),
+        ) as VpnAppsPlan.Disallow
+
+        assertEquals(
+            "возвращённый оранжевый остался в туннеле",
+            setOf("com.vkontakte.android", "com.bank"),
+            plan.packages.toSet(),
+        )
+    }
+
+    @Test
+    fun `a visible rule does not become substituted after excluding its installed app`() {
+        val plan = build(
+            isWhite = true,
+            rulePackages = setOf("com.example.notinstalled"),
+            serverRulePackages = setOf("com.vpn", "com.example.notinstalled"),
+            userExcluded = setOf("com.vpn"),
+        )
+
+        assertTrue("подмены нет — это отказ", plan is VpnAppsPlan.Failure)
+        val message = (plan as VpnAppsPlan.Failure).message
+        assertTrue(
+            "причина — исключения пользователя: $message",
+            message.contains("исключили все установленные"),
+        )
+        assertFalse(
+            "и не советует править белый список: $message",
+            message.contains("добавьте приложения"),
+        )
+    }
+
+    @Test
+    fun `a whitelist emptied by the user fails with the user cause`() {
+        val plan = build(
+            isWhite = true,
+            rulePackages = emptySet(),
+            serverRulePackages = setOf("com.vpn"),
+            userExcluded = setOf("com.vpn"),
+        )
+
+        val message = (plan as VpnAppsPlan.Failure).message
+        assertTrue("причина названа: $message", message.contains("исключили все установленные"))
+        assertTrue("и действие: $message", message.contains("снимите исключения"))
+        assertFalse(
+            "и не советует править белый список: $message",
+            message.contains("добавьте приложения"),
+        )
+    }
+
+    @Test
+    fun `a user-excluded red rule app names the preset cause, not the exclusion`() {
+        val plan = build(
+            isWhite = true,
+            rulePackages = emptySet(),
+            serverRulePackages = setOf("com.bank"),
+            userExcluded = setOf("com.bank"),
+        )
+
+        val message = (plan as VpnAppsPlan.Failure).message
+        assertTrue("названа красная причина: $message", message.contains("всегда мимо туннеля"))
+        assertTrue(
+            "и серверный совет: $message",
+            message.contains("Поправьте правило на сервере"),
+        )
+        assertFalse(
+            "снятие исключения не вернёт туннель — вины пользователя нет: $message",
+            message.contains("снимите исключения"),
+        )
+    }
+
+    @Test
+    fun `a user-excluded orange rule app asks to restore the orange`() {
+        val plan = build(
+            isWhite = true,
+            rulePackages = emptySet(),
+            serverRulePackages = setOf("ru.sberbankmobile"),
+            userExcluded = setOf("ru.sberbankmobile"),
+        )
+
+        val message = (plan as VpnAppsPlan.Failure).message
+        assertTrue(
+            "названа оранжевая причина: $message",
+            message.contains("оранжевые приложения не разрешены пользователем"),
+        )
+        assertTrue(
+            "и совет вернуть оранжевый: $message",
+            message.contains("Верните оранжевые приложения в туннель"),
+        )
+        assertFalse(
+            "снятие исключения не вернёт туннель — вины пользователя нет: $message",
+            message.contains("снимите исключения"),
+        )
+    }
+
+    @Test
+    fun `user exclusions never expand VPN coverage`() {
+        val rawRule = setOf("com.vpn", "com.example.notinstalled")
+        val before = build(
+            isWhite = true,
+            rulePackages = rawRule,
+            serverRulePackages = rawRule,
+        )
+        val after = build(
+            isWhite = true,
+            rulePackages = setOf("com.example.notinstalled"),
+            serverRulePackages = rawRule,
+            userExcluded = setOf("com.vpn"),
+        )
+
+        assertTrue("до исключения — обычный allow-план", before is VpnAppsPlan.Allow)
+        assertTrue("после — отказ, а не device-wide", after is VpnAppsPlan.Failure)
+    }
+
+    @Test
+    fun `a restored orange keeps the tunnel when the user emptied the rule`() {
+        val plan = build(
+            isWhite = true,
+            rulePackages = emptySet(),
+            serverRulePackages = setOf("com.vpn"),
+            userExcluded = setOf("com.vpn"),
+            orangeEnabled = setOf("ru.sberbankmobile"),
+        ) as VpnAppsPlan.Allow
+
+        assertEquals(
+            "оранжевый один держит туннель, отказа нет",
+            listOf("ru.sberbankmobile"),
+            plan.packages,
         )
     }
 }

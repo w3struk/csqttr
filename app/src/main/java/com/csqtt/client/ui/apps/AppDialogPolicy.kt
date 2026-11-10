@@ -12,7 +12,41 @@ internal data class AppDialogSection<T>(
     val total: Int,
 )
 
+/** Чекбокс и доступность строки под активным правилом сервера. */
+internal data class AppRowState(val checked: Boolean, val enabled: Boolean)
+
 internal object AppDialogPolicy {
+
+    /**
+     * Состояние строки под правилом: отмечено = «мимо туннеля».
+     *
+     * Красный пресет — всегда мимо и заперт. Приложения правила под чёрным
+     * правилом уже мимо и заперты, под белым — кликабельны и вычитаются из
+     * туннеля. Оранжевые переключаются в обе стороны прежним механизмом.
+     * Обычные приложения под чёрным правилом добавляются в чёрный список; под
+     * белым они уже мимо и заперты — вернуть их в туннель нельзя. Под подменой
+     * «на все приложения» обычные приложения фактически идут через туннель,
+     * поэтому строка показывает реальный маршрут и остаётся кликабельной:
+     * исключение пользователя действует и в плане «на все приложения».
+     */
+    fun rowState(
+        source: AppSectionSource,
+        isWhitelist: Boolean,
+        packageName: String,
+        userBlack: Set<String>,
+        orangeTunnelEnabled: Set<String>,
+        substituted: Boolean = false,
+    ): AppRowState = when (source) {
+        AppSectionSource.RED -> AppRowState(checked = true, enabled = false)
+        AppSectionSource.SERVER ->
+            if (isWhitelist) AppRowState(checked = packageName in userBlack, enabled = true)
+            else AppRowState(checked = true, enabled = false)
+        AppSectionSource.ORANGE ->
+            AppRowState(checked = packageName !in orangeTunnelEnabled, enabled = true)
+        AppSectionSource.USER ->
+            if (isWhitelist && !substituted) AppRowState(checked = true, enabled = false)
+            else AppRowState(checked = packageName in userBlack, enabled = true)
+    }
 
     /**
      * Подмена «правило на все приложения» для подписи диалога.
@@ -21,9 +55,10 @@ internal object AppDialogPolicy {
      * отфильтрованный поиском список: выводить из него установленность нельзя —
      * любое расхождение фильтра с пакетами правила превращало бы видимый набор
      * в «невидимый» и подпись врала бы. [installedPackages] — авторитетный
-     * набор из `PackageManager` (включая транспорт и сам CSQTT), [rulePackages]
-     * вместе с [activeSelection] — эффективный набор правила и локального
-     * списка того же режима.
+     * набор из `PackageManager` (включая транспорт и сам CSQTT), [rulePackages] —
+     * СЫРОЕ правило, до вычитания чёрного списка пользователя: исключение
+     * последнего видимого пакета не должно превращать видимое правило в
+     * подмену.
      *
      * Пустой [installedPackages] — это первый кадр или неудачная первичная
      * загрузка, а не «ничего не установлено»: в этом состоянии карточка честно
@@ -35,11 +70,10 @@ internal object AppDialogPolicy {
         serverLocked: Boolean,
         isWhite: Boolean,
         rulePackages: Set<String>,
-        activeSelection: Set<String>,
         installedPackages: Set<String>,
     ): Boolean = installedPackages.isNotEmpty() && serverLocked && AppRoutingPolicy.isServerWhitelistInvisible(
         isWhite = isWhite,
-        rulePackages = rulePackages + activeSelection,
+        rulePackages = rulePackages,
         isInstalled = { it in installedPackages },
     )
 

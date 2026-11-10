@@ -5,8 +5,10 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * Объединение серверного правила с локальным списком приложений: режим задаёт
- * оператор, поэтому список противоположного режима не читается.
+ * Слияние серверного правила с локальным списком приложений: режим задаёт
+ * оператор, а единственный пользовательский слой — чёрный список. Под чёрным
+ * правилом он дополняет правило, под белым — вычитается из него; локальный
+ * белый список под правилом не читается.
  */
 class MergedRoutingPolicyTest {
 
@@ -14,12 +16,10 @@ class MergedRoutingPolicyTest {
         ruleIsWhite: Boolean,
         rulePackages: Set<String>,
         localBlack: Set<String> = emptySet(),
-        localWhite: Set<String> = emptySet(),
     ): Set<String> = MergedRoutingPolicy.effectivePackages(
         ruleIsWhite = ruleIsWhite,
         rulePackages = rulePackages,
         localBlack = localBlack,
-        localWhite = localWhite,
     )
 
     @Test
@@ -27,39 +27,25 @@ class MergedRoutingPolicyTest {
         assertEquals(
             "чёрное правило читает локальный чёрный список",
             setOf("a", "b"),
-            effective(false, setOf("a"), localBlack = setOf("b"), localWhite = setOf("w")),
+            effective(false, setOf("a"), localBlack = setOf("b")),
         )
     }
 
     @Test
-    fun `white rule merges the local white list`() {
+    fun `white rule subtracts the local black list`() {
         assertEquals(
-            "белое правило читает локальный белый список",
-            setOf("a", "w"),
-            effective(true, setOf("a"), localBlack = setOf("b"), localWhite = setOf("w")),
-        )
-    }
-
-    @Test
-    fun `the local list of the opposite mode is never read`() {
-        assertEquals(
-            "в чёрном режиме локальный белый список игнорируется",
+            "белое правило вычитает чёрный список пользователя",
             setOf("a"),
-            effective(false, setOf("a"), localWhite = setOf("w")),
-        )
-        assertEquals(
-            "в белом режиме локальный чёрный список игнорируется",
-            setOf("a"),
-            effective(true, setOf("a"), localBlack = setOf("b")),
+            effective(true, setOf("a", "b"), localBlack = setOf("b")),
         )
     }
 
     @Test
-    fun `an empty white rule plus a local white list yields the local white list`() {
+    fun `a white rule emptied by the black list means nobody`() {
         assertEquals(
-            "пустое правило не игнорирует локальный белый список",
-            setOf("w"),
-            effective(true, emptySet(), localWhite = setOf("w")),
+            "исключённое пользователем правило не пускает никого",
+            emptySet<String>(),
+            effective(true, setOf("a"), localBlack = setOf("a")),
         )
     }
 
@@ -73,7 +59,7 @@ class MergedRoutingPolicyTest {
     }
 
     @Test
-    fun `a package present in both the rule and the local list appears once`() {
+    fun `a package present in both the rule and the black list appears once`() {
         assertEquals(
             "пакет из правила и локального списка не дублируется",
             setOf("a", "b"),
@@ -103,13 +89,11 @@ class MergedRoutingPolicyTest {
         ruleIsWhite: Boolean,
         rulePackages: Set<String>,
         localBlack: Set<String> = emptySet(),
-        localWhite: Set<String> = emptySet(),
         userEnabled: Set<String> = emptySet(),
     ): MergedCardCounts = MergedRoutingPolicy.cardCounts(
         ruleIsWhite = ruleIsWhite,
         rulePackages = rulePackages,
         localBlack = localBlack,
-        localWhite = localWhite,
         preset = preset,
         userEnabled = userEnabled,
         installedPackages = installed,
@@ -151,13 +135,21 @@ class MergedRoutingPolicyTest {
     }
 
     @Test
-    fun `white mode counts the in-tunnel set and splits it`() {
-        val counts = counts(true, setOf("a"), localWhite = setOf("b"))
+    fun `white mode subtracts the user list and counts it as yours`() {
+        val counts = counts(true, setOf("a", "b"), localBlack = setOf("b"))
 
-        assertEquals("в туннель идут правило и локальный список", 2, counts.inTunnel)
-        assertEquals("пакет правила — от сервера", 1, counts.serverAttributed)
-        assertEquals("пакет локального списка — ваш", 1, counts.localAttributed)
-        assertEquals("остальные мимо тоннеля", 3, counts.excluded)
+        assertEquals("в туннель идёт только неисключённое правило", 1, counts.inTunnel)
+        assertEquals("вся атрибуция туннеля — от правила", 1, counts.serverAttributed)
+        assertEquals("исключённое пользователем — ваше", 1, counts.localAttributed)
+        assertEquals("остальные мимо тоннеля", 4, counts.excluded)
+    }
+
+    @Test
+    fun `orange enabled by the user beats the black list`() {
+        val counts = counts(true, setOf("o"), localBlack = setOf("o"), userEnabled = setOf("o"))
+
+        assertEquals("возвращённый оранжевый остаётся в туннеле", 1, counts.inTunnel)
+        assertEquals("и не атрибуируется пользователю", 0, counts.localAttributed)
     }
 
     @Test
@@ -176,13 +168,6 @@ class MergedRoutingPolicyTest {
         assertEquals("красный пресета исключён", 3, counts.excluded)
         assertEquals("и относится к серверу, а не к пользователю", 3, counts.serverAttributed)
         assertEquals("в локальном списке пресетных пакетов нет", 0, counts.localAttributed)
-    }
-
-    @Test
-    fun `the opposite-mode local list does not leak into the counts`() {
-        val counts = counts(false, setOf("a"), localWhite = setOf("w"))
-
-        assertEquals("белый список в чёрном режиме не читается", 0, counts.localAttributed)
     }
 
     @Test
@@ -238,7 +223,6 @@ class MergedRoutingPolicyTest {
             ruleIsWhite = false,
             rulePackages = setOf("a"),
             localBlack = setOf("b"),
-            localWhite = emptySet(),
             preset = preset,
             userEnabled = emptySet(),
             installedPackages = installedPackages,
@@ -276,7 +260,6 @@ class MergedRoutingPolicyTest {
             ruleIsWhite = true,
             rulePackages = setOf("t"),
             localBlack = emptySet(),
-            localWhite = emptySet(),
             preset = preset,
             userEnabled = emptySet(),
             installedPackages = fullInstalled,
@@ -299,23 +282,21 @@ class MergedRoutingPolicyTest {
             "b" in (blackPlan as VpnAppsPlan.Disallow).packages,
         )
 
-        val white = effective(true, setOf("a"), localWhite = setOf("b"))
-        assertEquals("белый режим объединяет набор", setOf("a", "b"), white)
+        val white = effective(true, setOf("a", "b"), localBlack = setOf("b"))
+        assertEquals("белый режим вычитает чёрный список", setOf("a"), white)
         val whitePlan = planFor(isWhite = true, packages = white)
         assertTrue("белый план разрешает приложения", whitePlan is VpnAppsPlan.Allow)
         assertEquals(
-            "локальный пакет доходит до allow-списка",
-            setOf("a", "b"),
+            "исключённый пакет не доходит до allow-списка",
+            setOf("a"),
             (whitePlan as VpnAppsPlan.Allow).packages.toSet(),
         )
 
-        val localOnly = effective(true, emptySet(), localWhite = setOf("b"))
-        assertEquals("пустое правило не теряет локальный белый список", setOf("b"), localOnly)
-        val localOnlyPlan = planFor(isWhite = true, packages = localOnly)
-        assertEquals(
-            "локальный белый список задаёт allow-план",
-            listOf("b"),
-            (localOnlyPlan as VpnAppsPlan.Allow).packages,
+        val emptied = effective(true, emptySet())
+        val emptiedPlan = planFor(isWhite = true, packages = emptied)
+        assertTrue(
+            "пустой белый набор — отказ, а не «все»",
+            emptiedPlan is VpnAppsPlan.Failure,
         )
     }
 
@@ -329,7 +310,6 @@ class MergedRoutingPolicyTest {
             ruleIsWhite = false,
             rulePackages = setOf("a"),
             localBlack = setOf("b"),
-            localWhite = emptySet(),
             preset = widePreset,
             userEnabled = emptySet(),
             installedPackages = installed,
@@ -349,7 +329,6 @@ class MergedRoutingPolicyTest {
             ruleIsWhite = false,
             rulePackages = setOf("a"),
             localBlack = setOf("b"),
-            localWhite = emptySet(),
             preset = bothPreset,
             userEnabled = setOf(overlap),
             installedPackages = installed + overlap,
@@ -389,10 +368,33 @@ class MergedRoutingPolicyTest {
     }
 
     @Test
+    fun `a substituted white rule keeps user exclusions out of the tunnel`() {
+        val counts = counts(true, setOf("inv1", "inv2"), localBlack = setOf("x"))
+
+        assertEquals("подмена не тащит исключённое в туннель", 2, counts.inTunnel)
+        assertEquals("исключение пользователя в подменённом плане действует", 1, counts.localAttributed)
+        assertEquals("вся атрибуция туннеля — от правила", 2, counts.serverAttributed)
+        assertEquals("мимо тоннеля пресет и исключение", 3, counts.excluded)
+    }
+
+    @Test
+    fun `a visible rule does not become substituted after excluding its installed app`() {
+        // Сырое правило {a, inv}; установлен a; пользователь исключил a.
+        // Эффективный набор {inv} не установлен, но подмена обязана остаться
+        // выключенной: иначе покрытие расширится с {a} до всех приложений.
+        val counts = counts(true, setOf("a", "inv"), localBlack = setOf("a"))
+
+        assertEquals("в туннеле никто", 0, counts.inTunnel)
+        assertEquals("атрибуции от правила нет", 0, counts.serverAttributed)
+        assertEquals("исключение пользователя — ваше", 1, counts.localAttributed)
+        assertEquals("мимо тоннеля всё установленное", 5, counts.excluded)
+    }
+
+    @Test
     fun `substitutedCountsMatchTheActualPlan`() {
         val planTransport = setOf("t", "self")
         val effective = MergedRoutingPolicy.effectivePackages(
-            true, setOf("inv1", "inv2"), emptySet(), emptySet(),
+            true, setOf("inv1", "inv2"), emptySet(),
         )
         val plan = VpnAppRouting.build(
             hasServerRule = true,
@@ -414,7 +416,6 @@ class MergedRoutingPolicyTest {
             ruleIsWhite = true,
             rulePackages = effective,
             localBlack = emptySet(),
-            localWhite = emptySet(),
             preset = preset,
             userEnabled = emptySet(),
             installedPackages = installed,
@@ -439,31 +440,35 @@ class MergedRoutingPolicyTest {
             setOf("a"),
             setOf("inv1", "b"),
         )
-        val localWhiteSets = listOf(emptySet(), setOf("b"), setOf("inv2"))
+        val blackSets = listOf(emptySet(), setOf("b"), setOf("inv2"))
         val userSets = listOf(emptySet(), setOf("o", overlap))
 
         for (isWhite in listOf(false, true)) {
             for (rulePackages in ruleSets) {
-                for (localWhite in localWhiteSets) {
+                for (localBlack in blackSets) {
                     for (userEnabled in userSets) {
                         val effective = MergedRoutingPolicy.effectivePackages(
-                            isWhite, rulePackages, emptySet(), localWhite,
+                            isWhite, rulePackages, localBlack,
                         )
                         val plan = VpnAppRouting.build(
                             hasServerRule = true,
                             isWhite = isWhite,
                             rulePackages = effective,
+                            serverRulePackages = rulePackages,
+                            userExcluded = localBlack,
                             preset = matrixPreset,
                             userEnabled = userEnabled,
                             transportPackages = matrixTransport,
                             selfPackage = "self",
                             isInstalled = { it in matrixInstalled },
                         )
+                        // Подмена оценивается по СЫРОМУ правилу, до вычитания:
+                        // исключение не может сделать видимое правило невидимым.
                         val expected = AppRoutingPolicy.isServerWhitelistInvisible(
                             isWhite,
-                            effective,
+                            rulePackages,
                         ) { it in matrixInstalled }
-                        val cell = "isWhite=$isWhite rule=$rulePackages localWhite=$localWhite " +
+                        val cell = "isWhite=$isWhite rule=$rulePackages localBlack=$localBlack " +
                             "user=$userEnabled"
                         if (expected) {
                             assertTrue(

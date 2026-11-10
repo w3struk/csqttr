@@ -287,10 +287,15 @@ fun ExceptionsTab(
         val modeChanged = dialogSnapshotIsWhitelist != null && dialogSnapshotIsWhitelist != currentIsWhite
         if (blackChanged || whiteChanged || modeChanged) {
             appPersistenceScope.launch {
-                settingsStore.saveAppRoutingLists(
-                    currentBlack.sorted().joinToString(","),
-                    currentWhite.sorted().joinToString(","),
-                )
+                if (blackChanged) {
+                    settingsStore.saveExcludedApps(currentBlack.sorted().joinToString(","))
+                }
+                if (whiteChanged) {
+                    settingsStore.saveWhitelistApps(currentWhite.sorted().joinToString(","))
+                }
+                if (modeChanged) {
+                    settingsStore.saveIsWhitelist(currentIsWhite)
+                }
                 TunnelManager.reloadVpn()
             }
         }
@@ -382,22 +387,20 @@ fun ExceptionsTab(
     val serverIsWhite = serverRule?.isWhite == true
 
     // Пользовательский слой, который диалог редактирует и который карточка
-    // атрибуирует «ваши»: под правилом — список режима правила, без него — режима профиля.
+    // атрибуирует «ваши»: под правилом — только чёрный список, без него —
+    // список режима профиля. Белый список под правилом не редактируется.
     val effectiveIsWhite = if (serverRuleActive) serverIsWhite else isWhitelist
-    val userEditableSelection = when {
-        serverRuleActive && serverIsWhite -> whitelistSelection
-        serverRuleActive -> blacklistSelection
-        else -> activeAppSelection
-    }
+    val userEditableSelection = if (serverRuleActive) blacklistSelection else activeAppSelection
 
     // Подмена «правило на все приложения» для подписи диалога считается один раз
-    // здесь — по нефильтрованному набору установленных. Диалог получает список,
-    // уже суженный поиском, поэтому выводить из него установленность нельзя.
+    // здесь — по нефильтрованному набору установленных и по СЫРОМУ правилу.
+    // Диалог получает список, уже суженный поиском, поэтому выводить из него
+    // установленность нельзя, а исключения пользователя не должны превращать
+    // видимое правило в подмену.
     val substitutionApplied = AppDialogPolicy.substitutionApplied(
         serverLocked = serverRuleActive,
         isWhite = effectiveIsWhite,
         rulePackages = rulePackages,
-        activeSelection = userEditableSelection,
         installedPackages = installedPackages,
     )
 
@@ -405,7 +408,7 @@ fun ExceptionsTab(
     // current mode stay visible for the whole session: unchecking a rule must
     // not make the row disappear under the finger that just tapped it.
     val pinnedForSession = remember(showAppsDialog, isWhitelist) {
-        if (showAppsDialog) activeAppSelection else emptySet()
+        if (showAppsDialog) userEditableSelection else emptySet()
     }
 
     val filteredApps = remember(
@@ -441,11 +444,12 @@ fun ExceptionsTab(
         }
     }
 
-    fun persistAppSelection(selection: Set<String>, forWhitelist: Boolean) {
-        if (forWhitelist) {
-            persistAppSelections(black = null, white = selection)
-        } else {
-            persistAppSelections(black = selection, white = null)
+    // Под правилом тап пишет только чёрный ключ: белый список не трогается и
+    // после остановки туннеля остаётся тем, каким был до правила.
+    fun persistUserBlacklist(selection: Set<String>, reload: Boolean) {
+        appPersistenceScope.launch {
+            settingsStore.saveExcludedApps(selection.sorted().joinToString(","))
+            if (reload) TunnelManager.reloadVpn()
         }
     }
 
@@ -483,10 +487,12 @@ fun ExceptionsTab(
             lastSavedBlacklist = pendingBlacklist
             lastSavedWhitelist = pendingWhitelist
             appPersistenceScope.launch {
-                settingsStore.saveAppRoutingLists(
-                    pendingBlacklist.sorted().joinToString(","),
-                    pendingWhitelist.sorted().joinToString(","),
-                )
+                if (blacklistChanged) {
+                    settingsStore.saveExcludedApps(pendingBlacklist.sorted().joinToString(","))
+                }
+                if (whitelistChanged) {
+                    settingsStore.saveWhitelistApps(pendingWhitelist.sorted().joinToString(","))
+                }
             }
         }
     }
@@ -516,7 +522,6 @@ fun ExceptionsTab(
                             ruleIsWhite = serverIsWhite,
                             rulePackages = rulePackages,
                             localBlack = blacklistSelection,
-                            localWhite = whitelistSelection,
                             preset = preset,
                             userEnabled = orangeTunnelEnabled,
                             installedPackages = installedPackages,
@@ -539,7 +544,7 @@ fun ExceptionsTab(
                             "Правило сервера: список приложений недоступен"
                         serverIsWhite -> with(requireNotNull(mergedCounts)) {
                             "Белый список: $inTunnel в туннель — $serverAttributed от правила сервера, " +
-                                "$localAttributed ваши\n($alwaysExcluded всегда мимо туннеля, " +
+                                "$localAttributed исключены вами\n($alwaysExcluded всегда мимо туннеля, " +
                                 "$optOut можно отключить)"
                         }
                         else -> with(requireNotNull(mergedCounts)) {
@@ -665,17 +670,26 @@ fun ExceptionsTab(
                     appPersistenceScope.launch { settingsStore.saveShowSystemApps(value) }
                 },
                 onToggleApp = { packageName ->
-                    val newSelection = if (packageName in userEditableSelection) {
-                        userEditableSelection - packageName
+                    val selection = userEditableSelection
+                    val newSelection = if (packageName in selection) {
+                        selection - packageName
                     } else {
-                        userEditableSelection + packageName
+                        selection + packageName
                     }
-                    if (effectiveIsWhite) {
+                    // Под правилом правка применяется к живому туннелю сразу и
+                    // снимок гасит повторное сохранение при закрытии. Локальный
+                    // режим сохраняет прежнее поведение: применяется при
+                    // закрытии диалога.
+                    val forWhitelist = !serverRuleActive && effectiveIsWhite
+                    if (forWhitelist) {
                         whitelistSelection = newSelection
-                        persistAppSelection(newSelection, forWhitelist = true)
+                        appPersistenceScope.launch {
+                            settingsStore.saveWhitelistApps(newSelection.sorted().joinToString(","))
+                        }
                     } else {
                         blacklistSelection = newSelection
-                        persistAppSelection(newSelection, forWhitelist = false)
+                        if (serverRuleActive) dialogSnapshotBlacklist = newSelection
+                        persistUserBlacklist(newSelection, reload = serverRuleActive)
                     }
                 },
                 onRefresh = { refreshApps() },

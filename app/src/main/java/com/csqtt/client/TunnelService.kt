@@ -958,35 +958,29 @@ class TunnelService : Service() {
         fun localSet(raw: String?) = raw?.split(",")?.filter { it.isNotEmpty() }?.toSet().orEmpty()
         val needsRebuild = if (rule != null) {
             val localBlack = localSet(SettingsStore.cachedExcludedApps)
-            val localWhite = localSet(SettingsStore.cachedWhitelistApps)
             val rulePackages = rule.packages.toSet()
-            // Тот же эффективный набор, что startVpn передаёт в build; предикат
-            // подмены — общий с планом, карточкой и подписью диалога.
-            val effective = MergedRoutingPolicy.effectivePackages(
-                ruleIsWhite = rule.isWhite,
-                rulePackages = rulePackages,
-                localBlack = localBlack,
-                localWhite = localWhite,
-            )
             fun isInstalledOnDevice(pkg: String) =
                 runCatching {
                     applicationContext.packageManager.getPackageInfo(pkg, 0)
                 }.isSuccess
+            // Предикат подмены — по СЫРОМУ правилу, общий с планом, карточкой
+            // и подписью диалога: исключение последнего видимого пакета не
+            // должно превращать видимое правило в device-wide подмену.
             val substituted = AppRoutingPolicy.isServerWhitelistInvisible(
                 rule.isWhite,
-                effective,
+                rulePackages,
                 ::isInstalledOnDevice,
             )
-            // Локальный список передаётся реальным: под подменой политика не
-            // считает его элементы частью плана, но ловит их удаление как
-            // переход «в подмену». Обнуление здесь скрыло бы этот переход.
-            val localPackages = if (rule.isWhite) localWhite else localBlack
+            // Пользовательский слой под правилом — всегда чёрный список: под
+            // чёрным он дополняет запрет, под белым вычитается из allow-набора.
+            // Переустановка исключённого пакета меняет покрытие, поэтому
+            // триггер получает тот же список, что и план.
             PackageChangePolicy.needsVpnRebuild(
                 rule,
                 changedPackage,
                 transportPackages,
                 orangeEnabled,
-                localPackages,
+                localBlack,
                 planSubstituted = substituted,
             )
         } else {

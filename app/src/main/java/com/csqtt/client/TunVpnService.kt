@@ -211,27 +211,33 @@ class TunVpnService : VpnService() {
         activeVpnStart = start
         try {
             val serverRule = snapshot.rule
-            // Оба локальных списка читаются всегда: под правилом нужен тот,
-            // что соответствует режиму оператора (правило чёрное — чёрный,
-            // белое — белый), в локальном режиме главный список профиля.
+            // Под правилом читается только чёрный список: он дополняет чёрное
+            // правило и вычитается из белого. Белый ключ нужен лишь локальному
+            // режиму профиля и под правилом не читается вовсе.
             val settingsStore = SettingsStore(applicationContext)
             fun localList(raw: String) = raw.split(",").filter { it.isNotEmpty() }.toSet()
             val localBlack = localList(settingsStore.excludedApps.first())
-            val localWhite = localList(settingsStore.whitelistApps.first())
+            val localWhite =
+                if (serverRule == null) localList(settingsStore.whitelistApps.first()) else emptySet()
+            val rawRulePackages = serverRule?.packages
+                ?.filter { it.isNotEmpty() }
+                ?.toSet()
+                .orEmpty()
             val isWhitelist: Boolean
             val userSelected: Set<String>
             if (serverRule != null) {
                 isWhitelist = serverRule.isWhite
                 // Правило сервера поверх локального списка, а не вместо него:
-                // режим задаёт оператор, дополнения — пользователь. Объединённый
-                // набор уходит в VpnAppRouting.build, который не знает о его
+                // режим задаёт оператор, а чёрный список пользователя дополняет
+                // чёрное правило и вычитается из белого. Эффективный набор
+                // уходит в VpnAppRouting.build, который не знает о его
                 // происхождении; подмену невидимого белого списка build решает
-                // тем же предикатом, что карточка и per-UID триггер.
+                // по СЫРОМУ правилу тем же предикатом, что карточка и per-UID
+                // триггер.
                 userSelected = MergedRoutingPolicy.effectivePackages(
                     ruleIsWhite = serverRule.isWhite,
-                    rulePackages = serverRule.packages.filter { it.isNotEmpty() }.toSet(),
+                    rulePackages = rawRulePackages,
                     localBlack = localBlack,
-                    localWhite = localWhite,
                 )
             } else {
                 isWhitelist = settingsStore.isWhitelist.first()
@@ -266,6 +272,8 @@ class TunVpnService : VpnService() {
                 transportPackages = transportPackages,
                 selfPackage = selfPackage,
                 isInstalled = ::isPackageInstalled,
+                serverRulePackages = rawRulePackages,
+                userExcluded = if (serverRule?.isWhite == true) localBlack else emptySet(),
             )
             if (appsPlan is VpnAppsPlan.Failure) {
                 failVpn(appsPlan.message, start)
@@ -400,7 +408,8 @@ class TunVpnService : VpnService() {
                         TunnelManager.updateLog(
                             "vpn_whitelist_fallback",
                             "[TUN] Белый список правила сервера не содержит установленных приложений: " +
-                                "правило применено ко всем приложениям, кроме пресета и транспорта",
+                                "правило применено ко всем приложениям, кроме пресета, транспорта " +
+                                "и ваших исключений",
                             30,
                         )
                     }

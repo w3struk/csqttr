@@ -198,57 +198,132 @@ class AppDialogPolicyTest {
         assertEquals(listOf("user"), user.rows.map { it.pkg })
     }
 
+    // --- Состояние строк диалога ---------------------------------------------
+
+    @Test
+    fun `red rows are checked bypass and locked in both rule modes`() {
+        for (isWhite in listOf(false, true)) {
+            val state = AppDialogPolicy.rowState(
+                source = AppSectionSource.RED,
+                isWhitelist = isWhite,
+                packageName = "red",
+                userBlack = emptySet(),
+                orangeTunnelEnabled = emptySet(),
+            )
+            assertTrue("isWhite=$isWhite", state.checked)
+            assertFalse("isWhite=$isWhite", state.enabled)
+        }
+    }
+
+    @Test
+    fun `server rows are editable subtractors only under a white rule`() {
+        val black = AppDialogPolicy.rowState(
+            AppSectionSource.SERVER, false, "server", setOf("server"), emptySet(),
+        )
+        assertTrue(black.checked)
+        assertFalse("под чёрным правилом снимать отметку нельзя", black.enabled)
+
+        val whiteFree = AppDialogPolicy.rowState(
+            AppSectionSource.SERVER, true, "server", emptySet(), emptySet(),
+        )
+        assertFalse(whiteFree.checked)
+        assertTrue(whiteFree.enabled)
+
+        val whiteSubtracted = AppDialogPolicy.rowState(
+            AppSectionSource.SERVER, true, "server", setOf("server"), emptySet(),
+        )
+        assertTrue(whiteSubtracted.checked)
+        assertTrue(whiteSubtracted.enabled)
+    }
+
+    @Test
+    fun `orange rows are checked while bypassing in both modes`() {
+        for (isWhite in listOf(false, true)) {
+            assertTrue(
+                AppDialogPolicy.rowState(
+                    AppSectionSource.ORANGE, isWhite, "orange", emptySet(), emptySet(),
+                ).checked,
+            )
+            val restored = AppDialogPolicy.rowState(
+                AppSectionSource.ORANGE, isWhite, "orange", emptySet(), setOf("orange"),
+            )
+            assertFalse("isWhite=$isWhite", restored.checked)
+            assertTrue(restored.enabled)
+        }
+    }
+
+    @Test
+    fun `user rows are locked bypass under a plain white rule`() {
+        val white = AppDialogPolicy.rowState(
+            AppSectionSource.USER, true, "user", emptySet(), emptySet(),
+        )
+        assertTrue(white.checked)
+        assertFalse("в туннель под белым правилом вернуть нельзя", white.enabled)
+    }
+
+    @Test
+    fun `user rows under substitution show the real route and stay editable`() {
+        val free = AppDialogPolicy.rowState(
+            AppSectionSource.USER, true, "user", emptySet(), emptySet(), substituted = true,
+        )
+        assertFalse("обычное приложение в device-wide плане идёт в туннеле", free.checked)
+        assertTrue("и его можно исключить", free.enabled)
+
+        val excluded = AppDialogPolicy.rowState(
+            AppSectionSource.USER, true, "user", setOf("user"), emptySet(), substituted = true,
+        )
+        assertTrue(excluded.checked)
+        assertTrue(excluded.enabled)
+    }
+
+    @Test
+    fun `user rows under a black rule are editable`() {
+        val black = AppDialogPolicy.rowState(
+            AppSectionSource.USER, false, "user", emptySet(), emptySet(),
+        )
+        assertFalse(black.checked)
+        assertTrue(black.enabled)
+    }
+
     // --- Подпись диалога о подмене -------------------------------------------
 
     @Test
-    fun `the substitution notice does not read the list the dialog presents`() {
-        // Непустой поиск не совпал ни с пакетом правила, ни с локальным списком —
-        // диалог получил бы пустой список. Установленность берётся из набора
-        // PackageManager, где пакет правила есть, поэтому видимый набор не должен
-        // превращаться в «невидимый». У функции намеренно нет входа «список на
-        // экране»: подпись не может зависеть от поискового фильтра.
-        val filtered = AppListPolicy.filterApps(
-            apps = listOf("com.vpn" to "VPN"),
-            query = "no-such-app",
-            showSystemApps = true,
-            activeSelection = emptySet(),
-            isSystem = { false },
-            packageName = { it.first },
-            name = { it.second },
-        )
-        assertTrue("поиск действительно отфильтровал всё", filtered.isEmpty())
-
+    fun `the substitution notice depends on the installed set, not the visible list`() {
+        // Видимый список диалога отфильтрован поиском и не должен влиять на
+        // подпись: установленность берётся из набора PackageManager.
         assertFalse(
-            "поиск не превращает видимый набор в невидимый",
+            "установленный пакет правила — не подмена",
             AppDialogPolicy.substitutionApplied(
                 serverLocked = true,
                 isWhite = true,
                 rulePackages = setOf("com.vpn"),
-                activeSelection = emptySet(),
                 installedPackages = setOf("com.vpn"),
             ),
         )
     }
 
     @Test
-    fun `a local addition is part of the effective set the notice checks`() {
-        assertFalse(
-            "установленный пакет локального белого списка уважается",
+    fun `an invisible rule is the substitution`() {
+        assertTrue(
+            "невидимый непустой набор — подмена",
             AppDialogPolicy.substitutionApplied(
                 serverLocked = true,
                 isWhite = true,
                 rulePackages = setOf("com.example.private"),
-                activeSelection = setOf("com.vpn"),
                 installedPackages = setOf("com.vpn"),
             ),
         )
-        assertTrue(
-            "непустой эффективный набор без установленных пакетов — подмена",
+    }
+
+    @Test
+    fun `a visible rule never becomes the substitution because of exclusions`() {
+        // Предикат считается по сырому правилу: исключение последнего видимого
+        // установленного пакета не делает правило «невидимым».
+        assertFalse(
             AppDialogPolicy.substitutionApplied(
                 serverLocked = true,
                 isWhite = true,
-                rulePackages = setOf("com.example.private"),
-                activeSelection = setOf("com.example.also.private"),
+                rulePackages = setOf("com.vpn", "com.example.private"),
                 installedPackages = setOf("com.vpn"),
             ),
         )
@@ -262,28 +337,7 @@ class AppDialogPolicyTest {
                 serverLocked = true,
                 isWhite = true,
                 rulePackages = setOf("com.example.private"),
-                activeSelection = emptySet(),
                 installedPackages = emptySet(),
-            ),
-        )
-        assertFalse(
-            "после неудачной загрузки подпись тоже молчит",
-            AppDialogPolicy.substitutionApplied(
-                serverLocked = true,
-                isWhite = true,
-                rulePackages = setOf("com.example.private"),
-                activeSelection = setOf("com.example.also.private"),
-                installedPackages = emptySet(),
-            ),
-        )
-        assertTrue(
-            "по загруженному списку подмена снова считается",
-            AppDialogPolicy.substitutionApplied(
-                serverLocked = true,
-                isWhite = true,
-                rulePackages = setOf("com.example.private"),
-                activeSelection = emptySet(),
-                installedPackages = setOf("com.vpn"),
             ),
         )
     }
@@ -296,7 +350,6 @@ class AppDialogPolicyTest {
                 serverLocked = true,
                 isWhite = true,
                 rulePackages = emptySet(),
-                activeSelection = emptySet(),
                 installedPackages = setOf("com.vpn"),
             ),
         )
@@ -306,7 +359,6 @@ class AppDialogPolicyTest {
                 serverLocked = false,
                 isWhite = true,
                 rulePackages = setOf("com.example.private"),
-                activeSelection = emptySet(),
                 installedPackages = setOf("com.vpn"),
             ),
         )
@@ -316,7 +368,6 @@ class AppDialogPolicyTest {
                 serverLocked = true,
                 isWhite = false,
                 rulePackages = setOf("com.example.private"),
-                activeSelection = emptySet(),
                 installedPackages = setOf("com.vpn"),
             ),
         )
