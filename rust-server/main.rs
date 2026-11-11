@@ -44,9 +44,8 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use dashmap::DashMap;
 use model::{
-    DEFAULT_AUTO_RESTART_INTERVAL_HOURS, Database, DatabasePersistence,
-    apply_legacy_initial_client_seed, consume_deploy_overrides, load_database, now,
-    random_password, read_schema_version, save_database,
+    DEFAULT_AUTO_RESTART_INTERVAL_HOURS, Database, DatabasePersistence, load_database, now,
+    random_password, save_database,
 };
 use protocol::Session;
 use std::{
@@ -77,15 +76,6 @@ struct Args {
 
     #[arg(long, default_value = "/etc/csqtt", help = "Каталог конфигурации")]
     config_dir: std::path::PathBuf,
-
-    #[arg(
-        long,
-        hide = true,
-        env = "CSQTT_MAIN_PASSWORD",
-        default_value = "",
-        help = "Устаревший основной пароль: только для первого клиента"
-    )]
-    password: String,
 
     #[arg(
         long,
@@ -162,13 +152,6 @@ struct Args {
         help = "Число последних DPI-записей"
     )]
     samples: usize,
-}
-
-#[derive(Debug, Default, serde::Deserialize)]
-struct DeployOverrides {
-    /// Retired field: accepted only as a first-client seed on a fresh install.
-    #[serde(default)]
-    main_password: String,
 }
 
 fn normalize_dns(value: &str) -> Result<String> {
@@ -1044,60 +1027,27 @@ async fn async_main() -> Result<()> {
         Err(_) => eprintln!("[PROXY] startup policy cleanup timed out"),
     }
 
-    let deploy_overrides_path = args.config_dir.join("deploy-overrides.json");
-    let deploy_overrides_present = deploy_overrides_path.exists();
-    let deploy_overrides = if deploy_overrides_present {
-        let text = std::fs::read_to_string(&deploy_overrides_path)
-            .with_context(|| format!("read {}", deploy_overrides_path.display()))?;
-        serde_json::from_str::<DeployOverrides>(&text)
-            .with_context(|| format!("parse {}", deploy_overrides_path.display()))?
-    } else {
-        DeployOverrides::default()
-    };
-
-    // Read the version before `load_database`: every save writes the current
-    // schema version, so a fresh install is indistinguishable from an upgraded
-    // one afterwards. An unreadable version is treated as already migrated so
-    // the downgrade guard fails closed: a broken read must not let an old APK
-    // seed the owner into a database we could not classify.
-    let schema_version_before_load = match read_schema_version(&args.config_dir) {
-        Ok(version) => version,
-        Err(error) => {
-            eprintln!(
-                "[INIT] read schema_version before load failed; legacy seed disabled: {error:#}"
-            );
-            Some(model::SCHEMA_VERSION)
-        }
-    };
+    // Support floor: the database is either absent (fresh install) or written
+    // by 2.5.2+ with schema_version=2. Refuse anything else before the writer
+    // connection, the TUN device, the certificate and the panel exist, so an
+    // old database is never half-read and user data stays untouched.
+    model::ensure_supported_database(&args.config_dir)?;
 
     let mut db = load_database(&args.config_dir)?;
     db.admin_id.clear();
     db.bot_token.clear();
     db.web_sessions.clear();
 
-    let legacy_password = if !args.password.is_empty() {
-        args.password.clone()
-    } else {
-        deploy_overrides.main_password.clone()
-    };
-    if apply_legacy_initial_client_seed(&mut db, schema_version_before_load, &legacy_password) {
-        println!(
-            "[INIT] legacy main_password seeds the first client; use the panel to create clients"
-        );
-    }
-
-    let runtime_dns = if let Some(configured) =
-        args.dns.as_deref().filter(|value| !value.trim().is_empty())
-    {
-        normalize_dns(configured)?
-    } else if let Some(known_dns) = web_panel::provider_dns_by_id(&db.dns_provider) {
-        known_dns
-    } else if (deploy_overrides_present && db.dns_provider != "custom") || !db.dns.trim().is_empty()
-    {
-        web_panel::deploy_dns_profile_or_yandex(&db.dns)
-    } else {
-        "77.88.8.8,77.88.8.1".to_owned()
-    };
+    let runtime_dns =
+        if let Some(configured) = args.dns.as_deref().filter(|value| !value.trim().is_empty()) {
+            normalize_dns(configured)?
+        } else if let Some(known_dns) = web_panel::provider_dns_by_id(&db.dns_provider) {
+            known_dns
+        } else if !db.dns.trim().is_empty() {
+            web_panel::deploy_dns_profile_or_yandex(&db.dns)
+        } else {
+            "77.88.8.8,77.88.8.1".to_owned()
+        };
     db.dns = runtime_dns.clone();
     db.dns_provider =
         if db.dns_provider == "custom" || web_panel::dns_provider_is_known(&db.dns_provider) {
@@ -1120,7 +1070,6 @@ async fn async_main() -> Result<()> {
     };
 
     save_database(&args.config_dir, &db)?;
-    consume_deploy_overrides(&args.config_dir)?;
 
     let web_sessions = DashMap::new();
 
@@ -1194,7 +1143,7 @@ async fn async_main() -> Result<()> {
         });
     }
 
-    log_event(&app, "INFO", "SYSTEM", " CSQTT Server 2.5.1");
+    log_event(&app, "INFO", "SYSTEM", " CSQTT Server 2.5.2");
     log_event(
         &app,
         "INFO",

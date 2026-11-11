@@ -129,6 +129,17 @@ assert_no_line "$NOTE" '^- csqtt-linux-arm64$' "arm64 server binary is not liste
 assert_no_line "$NOTE" '^- csqtt-linux-armv7$' "armv7 server binary is not listed"
 assert_line "$NOTE" '^Контрольные суммы: SHA256SUMS$' "checksums line"
 assert_line "$NOTE" '^Права после скачивания: chmod \+x csqtt-linux-amd64$' "chmod hint names only the amd64 server"
+assert_line "$NOTE" '^Установщик: bootstrap\.sh → install\.sh$' "one-liner starts from bootstrap.sh"
+assert_line "$NOTE" '^Установка:$' "install section header"
+assert_line "$NOTE" '^- sudo bash install\.sh ' "installer is run via bash, not ./install.sh"
+assert_line "$NOTE" '^- one-liner: sudo bash -c "\$\(curl -fsSL https://[^ ]+/releases/latest/download/bootstrap\.sh\)"$' \
+    "one-liner runs bootstrap.sh, not install.sh"
+assert_line "$NOTE" '^- root-shell без sudo: bash install\.sh$' "root-shell variant omits sudo"
+assert_no_line "$NOTE" '(^|[[:space:]])\./install\.sh' "installer is never invoked as ./install.sh"
+assert_line "$NOTE" '«Деплой»' "warning names the Deploy tab"
+assert_line "$NOTE" 'веб-панели' "clients are created in the web panel only"
+assert_line "$NOTE" 'базы данных' "downgrade is a database restore"
+assert_line "$NOTE" '^Внимание: это промежуточный релиз' "intermediate release warning"
 assert_line "$NOTE" "^Подпись: CN=Test Signer, SHA-256 ${FINGERPRINT}\$" "signature line"
 
 assert_eq "$(tail -n 1 "$NOTE")" '<!-- CSQTT-TECH-NOTES-END -->' \

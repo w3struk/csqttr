@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 #
 # Технический блок описания GitHub-релиза: версия, коммит, длительность
-# сборки, wire-ревизия, состав ассетов и отпечаток подписи.
+# сборки, wire-ревизия, состав ассетов, установка и отпечаток подписи.
 #
 # Версия и versionCode читаются из app/build.gradle.kts теми же регексами, что
 # и в scripts/build_apk.sh (apk_version()); wire-ревизия — из rust-server/main.rs
@@ -181,6 +181,12 @@ fi
 short_commit="${commit:0:7}"
 build_duration="$(printf '%dm %ds' "$((duration / 60))" "$((duration % 60))")"
 
+# Ссылка на install.sh в ассетах этого релиза. В CI GITHUB_REPOSITORY задан
+# всегда; локально подставляется явный плейсхолдер, чтобы note не врал.
+repo_slug="${GITHUB_REPOSITORY:-OWNER/REPO}"
+installer_url="https://github.com/$repo_slug/releases/download/$tag/install.sh"
+bootstrap_url="https://github.com/$repo_slug/releases/latest/download/bootstrap.sh"
+
 out_dir="$(dirname -- "$out")"
 [[ -d "$out_dir" ]] || die "cannot write the note, directory not found: $out_dir"
 
@@ -205,6 +211,24 @@ note="$(
         printf '\nКонтрольные суммы: SHA256SUMS\n\n'
         # GitHub не хранит режим файла в ассетах: без chmod бинарь не запустится.
         printf 'Права после скачивания: chmod +x csqtt-linux-amd64\n\n'
+
+        printf 'Установщик: bootstrap.sh → install.sh\n\n'
+        printf 'Установка:\n'
+        # bootstrap.sh — тонкий вход: сверяет SHA-256 install.sh и запускает его.
+        printf '%s\n' \
+            "- one-liner: sudo bash -c \"\$(curl -fsSL $bootstrap_url)\"" \
+            '- sudo bash install.sh (файл install.sh из ассетов релиза)' \
+            "- root-shell без sudo: bash install.sh"
+        printf '\n'
+        # Промежуточное состояние: панель (план 2) уже есть, серверного деплоя
+        # (план 3) ещё нет. Пользователь обязан узнать это из самого релиза.
+        printf '%s\n' \
+            'Внимание: это промежуточный релиз (панель без серверного деплоя —' \
+            'план 2 без плана 3). Вкладка «Деплой» в приложении нерабочая:' \
+            'клиентов создавайте в веб-панели, сервер ставится только через' \
+            'install.sh/csqttctl. Понижение версии — восстановление базы данных,' \
+            'откат APK сам данные не мигрирует.'
+        printf '\n'
         if [[ -n "$signer" && -n "$fingerprint" ]]; then
             printf 'Подпись: CN=%s, SHA-256 %s\n' "$signer" "$fingerprint"
         fi

@@ -20,7 +20,7 @@ Design Canon Constants (184-unit canvas, shared with wordmark ic_csqtt_logo.xml)
 
 Usage:
     python3 scripts/gen_version_lockup.py              # Updates assets based on app/build.gradle.kts
-    python3 scripts/gen_version_lockup.py 2.5.1        # Updates assets for specified version
+    python3 scripts/gen_version_lockup.py 2.5.2        # Updates assets for specified version
     python3 scripts/gen_version_lockup.py --check      # Verifies committed assets are in sync (exit 0 or 1)
 """
 

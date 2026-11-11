@@ -8,7 +8,7 @@ import org.junit.Test
 
 /**
  * Контракт телефонной части установки: отказ на частном адресе до SSH и проверка
- * домена до первой загрузки. Пути читаются так же, как в `DeployScriptPreflightTest`,
+ * домена до первой загрузки. Пути читаются так же, как в `InstallScriptContractTest`,
  * поэтому тест запускается только через Gradle.
  */
 class DeployDomainCheckContractTest {

@@ -3,7 +3,8 @@
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 #
 # Тест .github/scripts/collect-release-assets.sh на фейковом дереве сборки:
-# три APK, один серверный бинарь, SHA256SUMS и список путей для публикации.
+# три APK, один серверный бинарь, install.sh, bootstrap.sh, SHA256SUMS и
+# список путей для публикации.
 
 set -euo pipefail
 
@@ -20,19 +21,26 @@ APK_NAMES=(
     "CSQTT-$VERSION-armeabi-v7a.apk"
 )
 SERVER_NAMES=(csqtt-linux-amd64)
+INSTALLER_NAME=install.sh
+BOOTSTRAP_NAME=bootstrap.sh
 EXPECTED_FILES=(
     "CSQTT-$VERSION-universal.apk"
     "CSQTT-$VERSION-arm64-v8a.apk"
     "CSQTT-$VERSION-armeabi-v7a.apk"
     csqtt-linux-amd64
+    install.sh
+    bootstrap.sh
     SHA256SUMS
 )
 # Independently computed SHA-256s of the literal fixture payloads below.
-# Checksums keep the server first, followed by the three APKs in ABI order.
+# Checksums keep the server first, then the three APKs in ABI order, then
+# install.sh and bootstrap.sh.
 EXPECTED_SUMS="8be94b089e9915c9dfac367b435ccbc245fa888215220e0b087d324bce6d06be  csqtt-linux-amd64
 e00d98a5a52bc42b1d5fb81237c4fc3e7a3c0b7a14dc9683e7184e5f4d1f36e2  CSQTT-$VERSION-universal.apk
 bd8e1f1d79a8ad2c3d2e44b573615a147ce4ce76635b35b602d665059602c58f  CSQTT-$VERSION-arm64-v8a.apk
-63c676691e4cb64f74fb7344c49637ac228995a219070e155bdfe5fe74744de4  CSQTT-$VERSION-armeabi-v7a.apk"
+63c676691e4cb64f74fb7344c49637ac228995a219070e155bdfe5fe74744de4  CSQTT-$VERSION-armeabi-v7a.apk
+2ec21d5aaeda5bce18d844956d7256e3b75e8affda77b7c5c56f9f6a15b43e48  install.sh
+30278bb38770b92b0b968cd42eb1230fa665211692b692bcd06777d3ef1a89b1  bootstrap.sh"
 
 pass=0
 
@@ -66,10 +74,14 @@ assert_same_bytes() {
 make_tree() {
     local root="$1"
 
-    mkdir -p "$root/app/build/outputs/apk/release" "$root/app/build/generated/assets"
+    mkdir -p "$root/app/build/outputs/apk/release" "$root/app/build/generated/assets" \
+        "$root/scripts"
 
     printf 'android {\n    defaultConfig {\n        versionName = "%s"\n    }\n}\n' \
         "$VERSION" >"$root/app/build.gradle.kts"
+
+    printf 'installer-payload-v1\n' >"$root/scripts/$INSTALLER_NAME"
+    printf 'bootstrap-payload-v1\n' >"$root/scripts/$BOOTSTRAP_NAME"
 
     local abi
     for abi in universal arm64-v8a armeabi-v7a; do
@@ -112,11 +124,11 @@ expect_fail() {
 ROOT="$TMP/root"
 OUT="$TMP/out"
 # The list file is kept outside --out so that the output directory holds
-# exactly the five published assets.
+# exactly the seven published assets.
 LIST_FILE="$TMP/asset-paths.txt"
 make_tree "$ROOT"
-# Legacy inputs must not become published assets. They also let the old
-# collector reach the five-versus-seven assertion instead of a missing input.
+# Legacy inputs must not become published assets. They also let an old
+# collector reach the count assertion instead of a missing input.
 printf 'legacy-arm64-input\n' >"$ROOT/app/build/generated/assets/csqtt-linux-arm64"
 printf 'legacy-armv7-input\n' >"$ROOT/app/build/generated/assets/csqtt-linux-armv7"
 
@@ -132,10 +144,10 @@ bash "$SUT" --root "$ROOT" --out "$OUT" --list-file "$LIST_FILE" \
     }
 ok
 
-# Exactly the five expected files, nothing else (a stray or misnamed copy
+# Exactly the seven expected files, nothing else (a stray or misnamed copy
 # would show up here).
 mapfile -t out_files < <(find "$OUT" -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)
-assert_eq "${#out_files[@]}" "5" "output directory holds exactly five files"
+assert_eq "${#out_files[@]}" "7" "output directory holds exactly seven files"
 mapfile -t out_files_sorted < <(printf '%s\n' "${EXPECTED_FILES[@]}" | LC_ALL=C sort)
 assert_eq "${out_files[*]}" "${out_files_sorted[*]}" "output directory holds exactly the release assets"
 
@@ -147,23 +159,33 @@ ls_out="$TMP/ls.txt"
 ls "$OUT"/*.apk >"$ls_out"
 assert_eq "$(wc -l <"$ls_out" | tr -d ' ')" "3" "exactly three APKs in the output directory"
 
-# SHA256SUMS: four lines, each "<64 hex>  <bare name>", sha256sum -c clean.
-assert_eq "$(wc -l <"$OUT/SHA256SUMS" | tr -d ' ')" "4" "SHA256SUMS has four lines"
+# SHA256SUMS: six lines, each "<64 hex>  <bare name>", sha256sum -c clean.
+assert_eq "$(wc -l <"$OUT/SHA256SUMS" | tr -d ' ')" "6" "SHA256SUMS has six lines"
 while IFS= read -r line; do
     [[ "$line" =~ ^[0-9a-f]{64}\ \ [^/]+$ ]] ||
         fail "malformed SHA256SUMS line: '$line'"
 done <"$OUT/SHA256SUMS"
 ok
 
+# The installer must be checksummed under exactly its own name, not a lookalike.
+grep -Eq '^[0-9a-f]{64}  install\.sh$' "$OUT/SHA256SUMS" ||
+    fail "SHA256SUMS has no exact install.sh entry"
+ok
+
+# The bootstrap entry is what the documented one-liner fetches first.
+grep -Eq '^[0-9a-f]{64}  bootstrap\.sh$' "$OUT/SHA256SUMS" ||
+    fail "SHA256SUMS has no exact bootstrap.sh entry"
+ok
+
 assert_eq "$(<"$OUT/SHA256SUMS")" "$EXPECTED_SUMS" \
-    "SHA256SUMS has the four independent digests and bare names in order"
+    "SHA256SUMS has the six independent digests and bare names in order"
 
 verify_out="$TMP/verify.txt"
 if ! (cd "$OUT" && sha256sum -c SHA256SUMS) >"$verify_out" 2>&1; then
     sed 's/^/  | /' "$verify_out" >&2
     fail "sha256sum -c SHA256SUMS failed"
 fi
-assert_eq "$(grep -c ': OK$' "$verify_out" || true)" "4" "sha256sum -c reports four OK lines"
+assert_eq "$(grep -c ': OK$' "$verify_out" || true)" "6" "sha256sum -c reports six OK lines"
 printf 'sha256sum -c SHA256SUMS (clean out):\n%s\n' "$(<"$verify_out")"
 
 # Every published payload must be a byte-for-byte copy, not a regenerated file.
@@ -179,17 +201,25 @@ assert_same_bytes "$ROOT/app/build/outputs/apk/release/app-$VERSION-armeabi-v7a-
 assert_same_bytes "$ROOT/app/build/generated/assets/csqtt-linux-amd64" \
     "$OUT/csqtt-linux-amd64" \
     "amd64 server binary is a byte-for-byte copy"
+assert_same_bytes "$ROOT/scripts/$INSTALLER_NAME" \
+    "$OUT/install.sh" \
+    "install.sh is a byte-for-byte copy of the repository installer"
+assert_same_bytes "$ROOT/scripts/$BOOTSTRAP_NAME" \
+    "$OUT/bootstrap.sh" \
+    "bootstrap.sh is a byte-for-byte copy of the repository bootstrap"
 
-# stdout: the five absolute paths in order, SHA256SUMS last. The script also
+# stdout: the seven absolute paths in order, SHA256SUMS last. The script also
 # prints "[OK] <name> [N bytes]" progress lines (build_apk.sh style), so the
 # path lines are selected by their leading '$OUT/'.
 mapfile -t stdout_paths < <(grep -E "^${OUT//./\\.}/[^/]+$" "$stdout_file")
-assert_eq "${#stdout_paths[@]}" "5" "stdout lists five paths"
+assert_eq "${#stdout_paths[@]}" "7" "stdout lists seven paths"
 expected_paths=(
     "$OUT/CSQTT-$VERSION-universal.apk"
     "$OUT/CSQTT-$VERSION-arm64-v8a.apk"
     "$OUT/CSQTT-$VERSION-armeabi-v7a.apk"
     "$OUT/csqtt-linux-amd64"
+    "$OUT/install.sh"
+    "$OUT/bootstrap.sh"
     "$OUT/SHA256SUMS"
 )
 assert_eq "${stdout_paths[*]}" "${expected_paths[*]}" "stdout paths are absolute, in order"
@@ -197,13 +227,15 @@ for path in "${stdout_paths[@]}"; do
     [[ "$path" == /* ]] || fail "stdout path is not absolute: '$path'"
     assert_file "$path"
 done
-assert_eq "${stdout_paths[4]}" "$OUT/SHA256SUMS" "SHA256SUMS is the last stdout path"
+assert_eq "${stdout_paths[6]}" "$OUT/SHA256SUMS" "SHA256SUMS is the last stdout path"
+assert_eq "${stdout_paths[5]}" "$OUT/bootstrap.sh" "bootstrap.sh is the last published asset path"
+assert_eq "${stdout_paths[4]}" "$OUT/install.sh" "install.sh precedes bootstrap.sh"
 assert_eq "$(basename -- "${stdout_paths[0]}")" "${APK_NAMES[0]}" \
     "first stdout path is the universal APK"
 
-# List file: the same five absolute paths, SHA256SUMS last, no self-reference.
+# List file: the same seven absolute paths, SHA256SUMS last, no self-reference.
 assert_file "$LIST_FILE"
-assert_eq "$(wc -l <"$LIST_FILE" | tr -d ' ')" "5" "list file has five lines"
+assert_eq "$(wc -l <"$LIST_FILE" | tr -d ' ')" "7" "list file has seven lines"
 assert_eq "$(<"$LIST_FILE")" "$(printf '%s\n' "${expected_paths[@]}")" \
     "list file has exactly the independently expected paths in order"
 assert_eq "$(tail -n 1 "$LIST_FILE")" "$OUT/SHA256SUMS" "SHA256SUMS is the last list entry"
@@ -220,20 +252,22 @@ make_tree "$DEFAULT_ROOT"
     fail "collect-release-assets.sh failed with default paths"
 ok
 assert_file "$TMP/out-default/asset-paths.txt"
-assert_eq "$(wc -l <"$TMP/out-default/asset-paths.txt" | tr -d ' ')" "5" \
-    "default list file has five lines"
+assert_eq "$(wc -l <"$TMP/out-default/asset-paths.txt" | tr -d ' ')" "7" \
+    "default list file has seven lines"
 assert_eq "$(tail -n 1 "$TMP/out-default/asset-paths.txt")" "$TMP/out-default/SHA256SUMS" \
     "default list file ends with SHA256SUMS"
 mapfile -t default_files < <(find "$TMP/out-default" -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)
 mapfile -t expected_default_files < <(printf '%s\n' "${EXPECTED_FILES[@]}" asset-paths.txt | LC_ALL=C sort)
-assert_eq "${#default_files[@]}" "6" "default out has five assets and the service list file"
+assert_eq "${#default_files[@]}" "8" "default out has seven assets and the service list file"
 assert_eq "${default_files[*]}" "${expected_default_files[*]}" "default out has exactly the expected files"
 assert_eq "$(<"$TMP/out-default/asset-paths.txt")" "$(printf '%s\n' \
     "$TMP/out-default/CSQTT-$VERSION-universal.apk" \
     "$TMP/out-default/CSQTT-$VERSION-arm64-v8a.apk" \
     "$TMP/out-default/CSQTT-$VERSION-armeabi-v7a.apk" \
     "$TMP/out-default/csqtt-linux-amd64" \
-    "$TMP/out-default/SHA256SUMS")" "default list publishes only the five assets in order"
+    "$TMP/out-default/install.sh" \
+    "$TMP/out-default/bootstrap.sh" \
+    "$TMP/out-default/SHA256SUMS")" "default list publishes only the seven assets in order"
 
 # Reused out: remove only the two known stale ARM servers. Foreign files,
 # including an APK and an unknown server-like name, must retain their bytes.
@@ -271,21 +305,23 @@ expected_reused_paths=(
     "$REUSED_OUT/CSQTT-$VERSION-arm64-v8a.apk"
     "$REUSED_OUT/CSQTT-$VERSION-armeabi-v7a.apk"
     "$REUSED_OUT/csqtt-linux-amd64"
+    "$REUSED_OUT/install.sh"
+    "$REUSED_OUT/bootstrap.sh"
     "$REUSED_OUT/SHA256SUMS"
 )
 mapfile -t reused_stdout_paths < <(grep -E "^${REUSED_OUT//./\\.}/[^/]+$" "$TMP/reused-stdout.txt")
-assert_eq "${#reused_stdout_paths[@]}" "5" "reused out stdout lists five paths"
+assert_eq "${#reused_stdout_paths[@]}" "7" "reused out stdout lists seven paths"
 assert_eq "${reused_stdout_paths[*]}" "${expected_reused_paths[*]}" "reused out stdout lists exactly the release paths in order"
 assert_eq "$(<"$REUSED_LIST")" "$(printf '%s\n' "${expected_reused_paths[@]}")" \
     "reused out list excludes stale ARM and every foreign file"
-assert_eq "$(wc -l <"$REUSED_OUT/SHA256SUMS" | tr -d ' ')" "4" "reused out SHA256SUMS has four lines"
+assert_eq "$(wc -l <"$REUSED_OUT/SHA256SUMS" | tr -d ' ')" "6" "reused out SHA256SUMS has six lines"
 assert_eq "$(<"$REUSED_OUT/SHA256SUMS")" "$EXPECTED_SUMS" \
-    "reused out SHA256SUMS has only the four expected entries in order"
+    "reused out SHA256SUMS has only the six expected entries in order"
 if ! (cd "$REUSED_OUT" && sha256sum -c SHA256SUMS) >"$TMP/reused-verify.txt" 2>&1; then
     sed 's/^/  | /' "$TMP/reused-verify.txt" >&2
     fail "reused out sha256sum -c SHA256SUMS failed"
 fi
-assert_eq "$(grep -c ': OK$' "$TMP/reused-verify.txt" || true)" "4" "reused out sha256sum -c reports four OK lines"
+assert_eq "$(grep -c ': OK$' "$TMP/reused-verify.txt" || true)" "6" "reused out sha256sum -c reports six OK lines"
 printf 'sha256sum -c SHA256SUMS (reused out):\n%s\n' "$(<"$TMP/reused-verify.txt")"
 
 # --------------------------------------------------------------- negative runs
@@ -321,6 +357,22 @@ make_tree "$EMPTY_ROOT"
 expect_fail "empty csqtt-linux-amd64 must fail" \
     "$EMPTY_ROOT/app/build/generated/assets/csqtt-linux-amd64" \
     bash "$SUT" --root "$EMPTY_ROOT" --out "$TMP/out-empty-binary"
+
+# Missing install.sh: exit 1, stderr names the full path.
+MISSING_INSTALLER_ROOT="$TMP/missing-installer"
+make_tree "$MISSING_INSTALLER_ROOT"
+rm -f "$MISSING_INSTALLER_ROOT/scripts/install.sh"
+expect_fail "missing scripts/install.sh must fail" \
+    "$MISSING_INSTALLER_ROOT/scripts/install.sh" \
+    bash "$SUT" --root "$MISSING_INSTALLER_ROOT" --out "$TMP/out-missing-installer"
+
+# Missing bootstrap.sh: exit 1, stderr names the full path.
+MISSING_BOOTSTRAP_ROOT="$TMP/missing-bootstrap"
+make_tree "$MISSING_BOOTSTRAP_ROOT"
+rm -f "$MISSING_BOOTSTRAP_ROOT/scripts/bootstrap.sh"
+expect_fail "missing scripts/bootstrap.sh must fail" \
+    "$MISSING_BOOTSTRAP_ROOT/scripts/bootstrap.sh" \
+    bash "$SUT" --root "$MISSING_BOOTSTRAP_ROOT" --out "$TMP/out-missing-bootstrap"
 
 # Aborted runs must not leave a half-built SHA256SUMS behind.
 if [[ -f "$TMP/out-empty-binary/SHA256SUMS" ]]; then

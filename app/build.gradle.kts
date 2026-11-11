@@ -144,14 +144,14 @@ android {
         applicationId = "csqtt.quic.amurcanov"
         minSdk = 26
         targetSdk = 37
-        versionCode = 231
+        versionCode = 232
         // The release version plus an optional suffix supplied by CI: the beta
         // workflow passes -Pcsqtt.versionSuffix=-beta.<short-sha>. The literal
         // stays first: the sed/regex parsers in scripts/build_apk.sh,
         // scripts/install_apk.sh, .github/scripts/collect-release-assets.sh,
         // .github/scripts/release-note.sh, the "Verify APK identity" step and
         // scripts/gen_version_lockup.py all read versionName from this line.
-        versionName = "2.5.1" +
+        versionName = "2.5.2" +
             (providers.gradleProperty("csqtt.versionSuffix").orNull ?: "")
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -243,8 +243,8 @@ android {
 // The app version as it appears in the APK file names.
 //
 // It is the defaultConfig versionName without the build-type suffix: the
-// variant name in the file name already says debug or release, so
-// "2.5.1-arm64-v8a-debug.apk" reads better than "2.5.1-debug-arm64-v8a-debug.apk".
+// variant name in the file name already says debug or release, so the suffix
+// is not repeated there and the version stays the same in every variant.
 val apkVersionName: String = requireNotNull(android.defaultConfig.versionName) {
     "defaultConfig.versionName is not set, the APK file names are built from it"
 }
@@ -344,6 +344,7 @@ dependencies {
 val rustGeneratedDir: File = layout.buildDirectory.dir("generated").get().asFile
 val rustAssetsDir: File = rustGeneratedDir.resolve("assets")
 val rustProvenanceDir: File = rustGeneratedDir.resolve("provenance")
+val installerAssetsDir: File = layout.buildDirectory.dir("generated/installer-assets").get().asFile
 
 fun jniLibsDir(variant: String): File = rustGeneratedDir.resolve("jniLibs/$variant")
 fun clientManifest(variant: String): File = rustProvenanceDir.resolve("libclient.$variant.json")
@@ -537,9 +538,19 @@ val verifyNativeServer = tasks.register<Exec>("verifyNativeServer") {
     }
 }
 
+// Temporary bridge: the installer is now scripts/install.sh, but DeployOperations
+// still opens the "deploy.sh" asset. This task only packages the file and does
+// not promise that the old DeployTab keeps working after plan 3.
+val syncInstallerAsset = tasks.register<Copy>("syncInstallerAsset") {
+    from(rootProject.file("scripts/install.sh"))
+    into(installerAssetsDir)
+    rename { "deploy.sh" }
+}
+
 // Generated native payload joins the variant that actually packages it.
 android.sourceSets.getByName("main") {
     assets.directories.add(rustAssetsDir.absolutePath)
+    assets.directories.add(installerAssetsDir.absolutePath)
 }
 android.sourceSets.getByName("debug") {
     jniLibs.directories.add(jniLibsDir("debug").absolutePath)
@@ -552,7 +563,7 @@ tasks.configureEach {
     when (name) {
         "mergeDebugJniLibFolders" -> dependsOn(verifyNativeClientDebug)
         "mergeReleaseJniLibFolders" -> dependsOn(verifyNativeClientRelease)
-        "mergeDebugAssets", "mergeReleaseAssets" -> dependsOn(verifyNativeServer)
+        "mergeDebugAssets", "mergeReleaseAssets" -> dependsOn(verifyNativeServer, syncInstallerAsset)
     }
 }
 

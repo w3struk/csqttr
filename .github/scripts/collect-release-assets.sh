@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: 2026 amurcanov
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 #
-# Собирает пять ассетов релиза: три APK из Gradle, один серверный бинарь и
-# SHA256SUMS с четырьмя записями. Имена входов жёсткие — никаких глобов.
+# Собирает релизные файлы: три APK из Gradle, серверный бинарь, install.sh,
+# bootstrap.sh и SHA256SUMS с шестью записями — шесть ассетов, семь файлов.
+# Имена входов жёсткие — никаких глобов.
 #
 # Usage:
 #   collect-release-assets.sh --root DIR [--apk-dir DIR] [--assets-dir DIR]
@@ -16,9 +17,10 @@ usage() {
 Usage: collect-release-assets.sh --root DIR [--apk-dir DIR] [--assets-dir DIR]
                                  --out DIR [--list-file FILE] [--version V]
 
-Copies the three release APKs and the amd64 server binary into --out,
-renames the APKs to CSQTT-<version>-<abi>.apk and writes four SHA256SUMS entries.
-Prints the five absolute paths (SHA256SUMS last) to stdout and to the
+Copies the three release APKs, the amd64 server binary, scripts/install.sh and
+scripts/bootstrap.sh into --out, renames the APKs to CSQTT-<version>-<abi>.apk
+and writes six SHA256SUMS entries (six assets, seven files).
+Prints the seven absolute paths (SHA256SUMS last) to stdout and to the
 list file.
 The default list file is --out/asset-paths.txt (not a release asset).
 EOF
@@ -128,6 +130,8 @@ fi
 
 abis=(universal arm64-v8a armeabi-v7a)
 server_binaries=(csqtt-linux-amd64)
+installer_script="scripts/install.sh"
+bootstrap_script="scripts/bootstrap.sh"
 
 require_input() {
     local path="$1"
@@ -152,6 +156,22 @@ for binary in "${server_binaries[@]}"; do
     copied+=("$dst")
 done
 
+# install.sh ships as a release asset, so the executable bit is lost: callers
+# must run `bash install.sh`, never rely on `./install.sh`.
+src="$root/$installer_script"
+require_input "$src"
+dst="$out/install.sh"
+cp -f "$src" "$dst" || die "cannot copy $src"
+copied+=("$dst")
+
+# bootstrap.sh is the documented one-liner entry: it downloads and verifies
+# install.sh, so it must be published next to it.
+src="$root/$bootstrap_script"
+require_input "$src"
+dst="$out/bootstrap.sh"
+cp -f "$src" "$dst" || die "cannot copy $src"
+copied+=("$dst")
+
 # Reused publication directories may contain obsolete ARM servers. Remove
 # only these known names; foreign files must survive and remain unpublished.
 rm -f -- "$out/csqtt-linux-arm64" "$out/csqtt-linux-armv7"
@@ -162,7 +182,9 @@ rm -f -- "$out/csqtt-linux-arm64" "$out/csqtt-linux-armv7"
         "csqtt-linux-amd64" \
         "CSQTT-$version-universal.apk" \
         "CSQTT-$version-arm64-v8a.apk" \
-        "CSQTT-$version-armeabi-v7a.apk" >SHA256SUMS
+        "CSQTT-$version-armeabi-v7a.apk" \
+        "install.sh" \
+        "bootstrap.sh" >SHA256SUMS
 ) || die "cannot compute SHA256SUMS in $out"
 
 for path in "${copied[@]}"; do

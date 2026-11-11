@@ -179,6 +179,11 @@ jobs:
             printf 'CSQTT Beta\n\n'
             printf 'Version: %s (%s)\n' "$VERSION" "$VERSION_CODE"
             printf 'APK: %s\n\n' "$(basename -- "$dst")"
+            # Промежуточный APK: панель уже есть, серверного деплоя ещё нет.
+            # Тестер обязан узнать это из сообщения, а не из отчёта об ошибке.
+            printf 'Внимание: промежуточная сборка — вкладка «Деплой» нерабочая.\n'
+            printf 'Клиенты создаются в веб-панели, сервер ставится через install.sh/csqttctl.\n'
+            printf 'Понижение версии — восстановление БД.\n\n'
             printf 'Commit: <a href="%s/%s/commit/%s">%s</a>\n' \
               "$server_url" "$GITHUB_REPOSITORY" "$COMMIT" "$commit_short"
             printf '%s\n' "$(escape_html "$subject")"

@@ -245,6 +245,19 @@ jobs:
           set -euo pipefail
           python3 scripts/gen_version_lockup.py --check
 
+      - name: 'Gate: version consistency'
+        run: |
+          set -euo pipefail
+          bash scripts/check_versions.sh --root .
+
+      # install.sh публикуется ассетом, поэтому его поведение обязано быть
+      # зелёным до Kotlin/Rust-сборки. Гейт живёт только здесь: beta и release
+      # вызывают shared build.yml, дублировать шаг в них нельзя.
+      - name: 'Gate: installer shell tests'
+        run: |
+          set -euo pipefail
+          bash scripts/deploy_shell_tests.sh
+
       # Нативную часть не собирает: гейт висит на merge*JniLibFolders/merge*Assets.
       - name: 'Gate: Kotlin unit tests'
         run: |
