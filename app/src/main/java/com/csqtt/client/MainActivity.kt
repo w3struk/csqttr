@@ -9,7 +9,7 @@ import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
-import android.provider.Settings
+import android.provider.Settings as AndroidSettings
 import android.util.Log
 import android.view.HapticFeedbackConstants
 import android.widget.Toast
@@ -30,15 +30,13 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import kotlinx.coroutines.launch
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Cloud
-import androidx.compose.material.icons.filled.FilterList
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.PowerSettingsNew
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.filled.VpnKey
-import androidx.compose.material.icons.outlined.Cloud
-import androidx.compose.material.icons.outlined.FilterList
 import androidx.compose.material.icons.outlined.Info
+import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.Terminal
 import androidx.compose.material.icons.outlined.VpnKey
 import androidx.compose.material3.*
@@ -68,12 +66,11 @@ import androidx.compose.ui.semantics.isTraversalGroup
 import androidx.compose.ui.semantics.semantics
 import com.csqtt.client.ui.AppUpdateDialog
 import com.csqtt.client.ui.ConnectionTab
-import com.csqtt.client.ui.ExceptionsTab
 import com.csqtt.client.ui.FloatingToolbar
+import com.csqtt.client.ui.GeneralSettingsTab
 import com.csqtt.client.ui.LogsTab
 import com.csqtt.client.ui.SettingsTab
 import com.csqtt.client.CsqttConstants
-import com.csqtt.client.ui.DeployTab
 import com.csqtt.client.ui.components.LocalCsqttHeaderActions
 import com.csqtt.client.ui.design.CsqttMotion
 import com.csqtt.client.ui.design.CsqttShapes
@@ -212,15 +209,13 @@ class MainActivity : ComponentActivity() {
             .setMessage("Хост: ${link.host}\nПорт: ${link.port}\n\nЗаменить текущую конфигурацию?")
             .setPositiveButton("Импортировать") { _, _ ->
                 lifecycleScope.launch {
-                    // Роль читаем до записи: сохранение ссылки участником переводит её
-                    // в «Участника», и тост должен говорить об этом только при смене.
-                    // Чтение внутри try: битое хранилище не должно ронять процесс.
+                    // Ссылка — единственный способ задать подключение; роль всегда участник,
+                    // поэтому сообщение говорит только о факте записи.
                     val outcome = try {
-                        val roleBeforeParticipant = appSettingsStore.csqttLinkMode.first()
                         appSettingsStore.saveCsqttParticipantLink(raw)
-                        LinkSaveNotice.outcomeForParticipantLink(roleBeforeParticipant, saved = true)
+                        LinkSaveNotice.outcomeForParticipantLink(saved = true)
                     } catch (_: IOException) {
-                        LinkSaveNotice.outcomeForParticipantLink(roleBeforeParticipant = false, saved = false)
+                        LinkSaveNotice.outcomeForParticipantLink(saved = false)
                     }
                     showRaisedToast(LinkSaveNotice.configToast(outcome), Toast.LENGTH_SHORT)
                 }
@@ -261,7 +256,7 @@ class MainActivity : ComponentActivity() {
             val launched = runCatching {
                 batteryLauncher.launch(
                     Intent(
-                        Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                        AndroidSettings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
                         "package:$packageName".toUri(),
                     ),
                 )
@@ -282,12 +277,13 @@ private data class NavItem(
     val unselectedIcon: ImageVector,
 )
 
+private const val LOGS_TAB_ID = 2
+
 private val navItems = listOf(
     NavItem(0, R.string.nav_connection, Icons.Filled.PowerSettingsNew, Icons.Filled.PowerSettingsNew),
     NavItem(1, R.string.nav_tunnel, Icons.Filled.VpnKey, Icons.Outlined.VpnKey),
-    NavItem(2, R.string.nav_deploy, Icons.Filled.Cloud, Icons.Outlined.Cloud),
-    NavItem(3, R.string.nav_logs, Icons.Filled.Terminal, Icons.Outlined.Terminal),
-    NavItem(4, R.string.nav_exceptions, Icons.Filled.FilterList, Icons.Outlined.FilterList),
+    NavItem(LOGS_TAB_ID, R.string.nav_logs, Icons.Filled.Terminal, Icons.Outlined.Terminal),
+    NavItem(3, R.string.nav_settings, Icons.Filled.Settings, Icons.Outlined.Settings),
 )
 
 internal fun navigationSwipeProgress(totalDrag: Float, containerWidth: Int): Float =
@@ -295,16 +291,8 @@ internal fun navigationSwipeProgress(totalDrag: Float, containerWidth: Int): Flo
 
 internal fun shouldCommitNavigationSwipe(progress: Float): Boolean = progress > 0.4f
 
-internal fun resolveActiveNavIds(csqttLinkMode: Boolean, participantShowLogs: Boolean): List<Int> {
-    val allIds = listOf(0, 1, 2, 3, 4)
-    return allIds.filter { id ->
-        if (csqttLinkMode) {
-            if (id == 2) return@filter false
-            if (id == 3 && !participantShowLogs) return@filter false
-        }
-        true
-    }
-}
+internal fun resolveActiveNavIds(participantShowLogs: Boolean): List<Int> =
+    if (participantShowLogs) listOf(0, 1, LOGS_TAB_ID, 3) else listOf(0, 1, 3)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -324,13 +312,9 @@ fun MainScreen(
     val density = LocalDensity.current
     val scope = rememberCoroutineScope()
     val activeProfile by settingsStore.activeProfile.collectAsStateWithLifecycle(initialValue = 0)
-    val deploySettings by settingsStore.deploySettingsSnapshot.collectAsStateWithLifecycle(
-        initialValue = DeploySettingsSnapshot()
-    )
     val tunnelAuthSettings by settingsStore.tunnelAuthSnapshot.collectAsStateWithLifecycle(
         initialValue = TunnelAuthSnapshot()
     )
-    val csqttLinkMode = tunnelAuthSettings.csqttLinkMode
     val participantShowLogs by settingsStore.participantShowLogs.collectAsStateWithLifecycle(initialValue = false)
     val autoPauseOnWifi by settingsStore.autoPauseOnWifi.collectAsStateWithLifecycle(initialValue = false)
     val excludedApps by settingsStore.excludedApps.collectAsStateWithLifecycle(
@@ -364,22 +348,13 @@ fun MainScreen(
 
     val serverRoutingActive by TunnelManager.serverRoutingActive.collectAsStateWithLifecycle()
 
-    val activeNavItems = remember(csqttLinkMode, participantShowLogs) {
-        val allowedIds = resolveActiveNavIds(csqttLinkMode, participantShowLogs)
+    val activeNavItems = remember(participantShowLogs) {
+        val allowedIds = resolveActiveNavIds(participantShowLogs)
         navItems.filter { it.id in allowedIds }
     }
     val tabStateHolder = rememberSaveableStateHolder()
-    LaunchedEffect(csqttLinkMode, participantShowLogs) {
-        if (csqttLinkMode) {
-            if (selectedTab == 2 || (selectedTab == 3 && !participantShowLogs)) {
-                selectedTab = 0
-            }
-        }
-    }
     LaunchedEffect(activeNavItems) {
-        if (activeNavItems.none { it.id == selectedTab }) {
-            selectedTab = 0
-        }
+        selectedTab = resolveSelectedTab(selectedTab, activeNavItems.map { it.id })
     }
 
     LaunchedEffect(tunnelRunning, tunnelAutoPausedForWifi) {
@@ -390,7 +365,7 @@ fun MainScreen(
     }
 
     LaunchedEffect(selectedTab) {
-        if (selectedTab == 3) TunnelManager.clearUnreadErrors()
+        if (selectedTab == LOGS_TAB_ID) TunnelManager.clearUnreadErrors()
     }
 
     LaunchedEffect(updateCheckIntervalHours) {
@@ -448,22 +423,7 @@ fun MainScreen(
 
         CompositionLocalProvider(
             LocalCsqttHeaderActions provides {
-                FloatingToolbar(
-                    settingsStore = settingsStore,
-                    csqttLinkMode = csqttLinkMode,
-                    activeProfile = activeProfile,
-                    onActiveProfileChange = { profile ->
-                        scope.launch { settingsStore.saveActiveProfile(profile) }
-                    },
-                    currentTheme = themeMode,
-                    onThemeChange = onThemeChange,
-                    activeFingerprint = activeFingerprint,
-                    onFingerprintChange = onFingerprintChange,
-                    autoPauseOnWifi = autoPauseOnWifi,
-                    onAutoPauseOnWifiChange = { enabled ->
-                        scope.launch { settingsStore.saveAutoPauseOnWifi(enabled) }
-                    },
-                )
+                FloatingToolbar(settingsStore = settingsStore)
             },
         ) {
             Scaffold(
@@ -475,7 +435,7 @@ fun MainScreen(
                         .fillMaxSize()
                         .padding(padding)
                         .consumeWindowInsets(padding)
-                        .pointerInput(selectedTab, csqttLinkMode, participantShowLogs) {
+                        .pointerInput(selectedTab, participantShowLogs) {
                         var totalDrag = 0f
                         detectHorizontalDragGestures(
                             onDragStart = {
@@ -490,7 +450,7 @@ fun MainScreen(
                             onDragEnd = {
                                 if (dragTargetIndex.intValue in activeNavItems.indices && shouldCommitNavigationSwipe(dragProgress.floatValue)) {
                                     selectedTab = activeNavItems[dragTargetIndex.intValue].id
-                                    if (selectedTab == 3) TunnelManager.clearUnreadErrors()
+                                    if (selectedTab == LOGS_TAB_ID) TunnelManager.clearUnreadErrors()
                                 }
                                 dragTargetIndex.intValue = -1
                                 dragProgress.floatValue = 0f
@@ -527,7 +487,6 @@ fun MainScreen(
                             val tabStateKey: Any = when (tab) {
                                 0 -> "connection:${tunnelAuthSettings.profile}"
                                 1 -> "tunnel:${tunnelAuthSettings.profile}"
-                                2 -> "deploy:${deploySettings.profile}"
                                 else -> tab
                             }
                             tabStateHolder.SaveableStateProvider(tabStateKey) {
@@ -554,18 +513,25 @@ fun MainScreen(
                                 } else {
                                     Spacer(modifier = Modifier.fillMaxSize())
                                 }
-                                2 -> if (!csqttLinkMode) {
-                                    DeployTab(settingsStore, deploySettings)
-                                } else {
-                                    Spacer(modifier = Modifier.fillMaxSize())
-                                }
-                                3 -> if (!csqttLinkMode || participantShowLogs) {
-                                    LogsTab(settingsStore)
-                                } else {
-                                    Spacer(modifier = Modifier.fillMaxSize())
-                                }
-                                4 -> ExceptionsTab(
+                                2 -> LogsTab()
+                                3 -> GeneralSettingsTab(
                                     settingsStore = settingsStore,
+                                    activeProfile = activeProfile,
+                                    onActiveProfileChange = { profile ->
+                                        scope.launch { settingsStore.saveActiveProfile(profile) }
+                                    },
+                                    currentTheme = themeMode,
+                                    onThemeChange = onThemeChange,
+                                    activeFingerprint = activeFingerprint,
+                                    onFingerprintChange = onFingerprintChange,
+                                    autoPauseOnWifi = autoPauseOnWifi,
+                                    onAutoPauseOnWifiChange = { enabled ->
+                                        scope.launch { settingsStore.saveAutoPauseOnWifi(enabled) }
+                                    },
+                                    participantShowLogs = participantShowLogs,
+                                    onParticipantShowLogsChange = { enabled ->
+                                        scope.launch { settingsStore.saveParticipantShowLogs(enabled) }
+                                    },
                                     savedExcluded = excludedApps,
                                     savedWhitelist = whitelistApps,
                                     showSystemApps = showSystemApps,
@@ -589,7 +555,7 @@ fun MainScreen(
                             if (selectedTab != index) {
                                 view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
                                 selectedTab = index
-                                if (index == 3) TunnelManager.clearUnreadErrors()
+                                if (index == LOGS_TAB_ID) TunnelManager.clearUnreadErrors()
                             }
                             dragTargetIndex.intValue = -1
                             dragProgress.floatValue = 0f
@@ -753,7 +719,7 @@ private fun ProxyNavigationBar(
                                     modifier = Modifier.size(22.dp),
                                     tint = iconColor
                                 )
-                                if (item.id == 3 && unreadErrors > 0) {
+                                if (item.id == LOGS_TAB_ID && unreadErrors > 0) {
                                     Badge(
                                         containerColor = if (tunnelRunning) colors.primary else CSQTTColors.warning,
                                         contentColor = colors.onPrimary,

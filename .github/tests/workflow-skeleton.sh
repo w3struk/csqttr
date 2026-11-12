@@ -918,7 +918,6 @@ TOOLCHAIN = [
     "Install cargo-ndk and cargo-zigbuild",
 ]
 GATES = [
-    "Gate: version lockup",
     "Gate: Kotlin unit tests",
     "Gate: Rust client",
     "Gate: Rust server (musl via zig wrappers)",

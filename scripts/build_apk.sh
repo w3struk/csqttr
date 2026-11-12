@@ -6,9 +6,10 @@
 #
 # Usage: scripts/build_apk.sh [--verify-native-only]
 #
-# Verifies the provenance of the native server asset and the Rust JNI
-# libraries, builds the release APKs with Gradle and copies the split APKs
-# into app/release/ with the app version in the name.
+# Verifies the provenance of the Rust client libraries, builds the release APKs
+# with Gradle and copies the split APKs into app/release/ with the app version
+# in the name. The server binary is a separate release asset and is not part of
+# the APK, so no server provenance check happens here.
 
 set -euo pipefail
 
@@ -55,7 +56,7 @@ echo "=== CSQTT APK Build Script ==="
 echo "=== Output: 4 APKs (universal, arm64-v8a, armeabi-v7a, x86_64) ==="
 echo
 
-for helper in scripts/server_asset_provenance.sh scripts/native_client_provenance.sh; do
+for helper in scripts/native_client_provenance.sh; do
     if [[ ! -f "$ROOT/$helper" ]]; then
         echo "ERROR: missing $helper" >&2
         exit 1
@@ -63,13 +64,6 @@ for helper in scripts/server_asset_provenance.sh scripts/native_client_provenanc
 done
 
 verify_native() {
-    if ! bash "$ROOT/scripts/server_asset_provenance.sh" verify; then
-        echo >&2
-        echo "ERROR: server asset provenance verification failed." >&2
-        echo "       Rebuild the verified server asset with: bash rust-server/build_linux.sh --no-tests" >&2
-        return 1
-    fi
-
     if ! bash "$ROOT/scripts/native_client_provenance.sh" verify; then
         echo >&2
         echo "ERROR: native client provenance verification failed." >&2

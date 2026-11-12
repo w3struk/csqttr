@@ -148,7 +148,7 @@ class TunnelService : Service() {
                     try {
                         val store = SettingsStore(applicationContext)
                         autoPauseOnWifiEnabled = store.autoPauseOnWifi.first()
-                        TunnelManager.isLoggingEnabled = store.loggingEnabled.first()
+                        TunnelManager.isLoggingEnabled = store.participantShowLogs.first()
                         if (reconcileWifiAutoPause()) {
                             TunnelManager.starting.value = false
                             return@launch
@@ -183,7 +183,7 @@ class TunnelService : Service() {
                         val accountAutoJs = vkAuthMode == CsqttConstants.VkAuth.MODE_AUTO_JS
                         val maxWorkers = CsqttConstants.Tunnel.MAX_WORKERS
                         val workersPerHash = WorkerCountPolicy.normalize(requestedWorkers, maximum = maxWorkers)
-                        TunnelManager.isLoggingEnabled = store.loggingEnabled.first()
+                        TunnelManager.isLoggingEnabled = store.participantShowLogs.first()
                         if (accountAutoJs) {
                             store.saveVkAuthMode(CsqttConstants.VkAuth.MODE_AUTO_JS)
                         } else if (hashesFromLink && requestedVkAuthMode == CsqttConstants.VkAuth.MODE_AUTO_JS) {
@@ -229,7 +229,7 @@ class TunnelService : Service() {
                             workersPerHash = workersPerHash,
                             port = intent.getIntExtra("port", 0),
                             sni = intent.getStringExtra("sni") ?: "",
-                            connectionPassword = intent.getStringExtra("connection_password") ?: "",
+                            password = intent.getStringExtra("connection_password") ?: "",
                             protocol = intent.getStringExtra("protocol") ?: "udp",
                             vkAuthMode = vkAuthMode,
                             captchaMode = sanitizeCaptchaMode(intent.getStringExtra("captcha_mode")),
@@ -278,48 +278,6 @@ class TunnelService : Service() {
                     intent.getStringExtra(CsqttConstants.General.EXTRA_UNAVAILABLE_VK_HASH).orEmpty(),
                 )
             }
-            "DEPLOY_START" -> {
-                try {
-                    isStopping = false
-                    resourcesReleased = false
-                    val notification = createNotification("Установка на сервер...", "DEPLOY_CANCEL", "Отменить")
-                    startPersistentForeground(notification)
-                    prepareForDeploy()
-                    acquireWakeLock()
-                } catch (e: Exception) {
-                    DeployManager.writeError(
-                        "Deploy foreground service error (${e.javaClass.simpleName}): ${e.message}\n" +
-                            e.stackTraceToString().take(1200)
-                    )
-                    TunnelManager.addDeployErrorLog(
-                        "Не удалось запустить сервис установки: ${e.message?.take(120) ?: e.javaClass.simpleName}"
-                    )
-                    DeployManager.stopDeploy("Не удалось запустить сервис установки: ${e.message?.take(120)}")
-                    runCatching { releaseTunnelResources() }
-                    runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
-                    foregroundStarted = false
-                    stopSelf()
-                    return START_NOT_STICKY
-                }
-            }
-            "DEPLOY_CANCEL" -> {
-                com.csqtt.client.DeployManager.writeError("✗ Установка отменена пользователем")
-                com.csqtt.client.DeployManager.stopDeploy("error: Отменена пользователем")
-                if (TunnelManager.running.value) {
-                    lastNotificationText = null
-                    lastNotificationPostElapsedMs = 0L
-                    updateNotification(buildTunnelNotificationText())
-                } else {
-                    stopTunnel()
-                }
-            }
-            "DEPLOY_STOP" -> {
-                if (!TunnelManager.running.value) {
-                    stopTunnel()
-                } else {
-                    updateNotification("Туннель активен")
-                }
-            }
             "RESTORE_NOTIFICATION" -> {
                 if (foregroundStarted && !isStopping) {
                     lastNotificationText = null
@@ -358,29 +316,14 @@ class TunnelService : Service() {
                 }
                 autoPauseRequested = true
                 autoPauseOnWifiEnabled = store.autoPauseOnWifi.first()
-                TunnelManager.isLoggingEnabled = store.loggingEnabled.first()
+                TunnelManager.isLoggingEnabled = store.participantShowLogs.first()
                 if (reconcileWifiAutoPause()) return@launch
 
                 val source = resolveConnectionSource(store)
                 if (source == null) {
                     TunnelManager.updateLog(
                         "connection_source_error",
-                        "[ПОДКЛЮЧЕНИЕ] Не удалось разобрать сохранённую ссылку или найти адрес сервера. Откройте настройки подключения.",
-                        99,
-                        true,
-                    )
-                    launch(Dispatchers.Main) {
-                        if (isCurrentStart(requestGeneration)) stopTunnel(finishVkCalls = true)
-                    }
-                    return@launch
-                }
-                if (
-                    !store.csqttLinkMode.first() &&
-                    store.connectionPasswordState.first().state == StoredSecretState.Unreadable
-                ) {
-                    TunnelManager.updateLog(
-                        "connection_secret_unreadable",
-                        "[ПОДКЛЮЧЕНИЕ] Не удалось прочитать сохранённый пароль подключения. Откройте настройки и введите его заново.",
+                        "[ПОДКЛЮЧЕНИЕ] Не удалось разобрать сохранённую ссылку CSQTT. Откройте настройки подключения.",
                         99,
                         true,
                     )
@@ -393,7 +336,7 @@ class TunnelService : Service() {
                 val salt = newTunnelSessionId()
                 val requestedVkAuthMode = sanitizeVkAuthMode(store.vkAuthMode.first())
                 val workersPerHash = WorkerCountPolicy.normalize(store.workersPerHash.first())
-                TunnelManager.isLoggingEnabled = store.loggingEnabled.first()
+                TunnelManager.isLoggingEnabled = store.participantShowLogs.first()
                 val configuredHashMode = store.vkHashMode.first()
                 val vkAuthMode = when {
                     source.hashesFromLink && requestedVkAuthMode == CsqttConstants.VkAuth.MODE_AUTO_JS -> CsqttConstants.VkAuth.MODE_CALLS
@@ -434,7 +377,7 @@ class TunnelService : Service() {
                     workersPerHash = workersPerHash,
                     port = 0,
                     sni = store.sni.first(),
-                    connectionPassword = source.password,
+                    password = source.password,
                     obfsMode = store.obfsMode.first(),
                     turnTransport = store.turnTransport.first(),
                     srtpMode = sanitizeSrtpMode(store.srtpMode.first()),
@@ -584,7 +527,7 @@ class TunnelService : Service() {
                     peer = source.peer,
                     vkHashes = resolved.value,
                     workersPerHash = workers,
-                    connectionPassword = source.password,
+                    password = source.password,
                     vkAuthMode = if (accountAutoJs) CsqttConstants.VkAuth.MODE_AUTO_JS else previous.vkAuthMode,
                     generationId = nextGeneration,
                     sessionSalt = newTunnelSessionId(),
@@ -1056,14 +999,6 @@ class TunnelService : Service() {
                 stopSelf()
             }
         }
-    }
-
-    private fun prepareForDeploy() {
-        updateJob?.cancel()
-        updateJob = null
-        CaptchaWebViewManager.onTunnelStop()
-        TunnelManager.stop(notifyController = false)
-        releaseWifiLock()
     }
 
     private fun releaseTunnelResources(finishVkCalls: Boolean = false) {

@@ -240,11 +240,6 @@ jobs:
             --expected-commit "${INPUT_REF:-}"
 
       # Гейты fail-closed: всё проверяемое отсекается до keystore и сборки.
-      - name: 'Gate: version lockup'
-        run: |
-          set -euo pipefail
-          python3 scripts/gen_version_lockup.py --check
-
       - name: 'Gate: version consistency'
         run: |
           set -euo pipefail
@@ -258,11 +253,32 @@ jobs:
           set -euo pipefail
           bash scripts/deploy_shell_tests.sh
 
-      # Нативную часть не собирает: гейт висит на merge*JniLibFolders/merge*Assets.
+      # Нативную часть не собирает: гейт висит на merge*JniLibFolders.
       - name: 'Gate: Kotlin unit tests'
         run: |
           set -euo pipefail
           ./gradlew :app:testDebugUnitTest
+
+      # APK — только клиент: серверный бинарник и deploy.sh больше не упаковываются.
+      # Гейт по графу зависимостей ловит случайно вернувшийся SSH/BC-клиент.
+      # Вывод Gradle сначала сохраняется: `gradle | grep` в `if` глушил бы падение
+      # Gradle (pipe + проверка условия), а пустой вывод давал бы ложно-зелёный гейт.
+      - name: 'Gate: APK runtime dependencies'
+        run: |
+          set -euo pipefail
+          deps_file="$RUNNER_TEMP/release-runtime-classpath.txt"
+          if ! ./gradlew :app:dependencies --configuration releaseRuntimeClasspath -q > "$deps_file"; then
+            echo "Gradle не построил граф releaseRuntimeClasspath" >&2
+            exit 1
+          fi
+          if [[ ! -s "$deps_file" ]]; then
+            echo "Граф releaseRuntimeClasspath пуст — проверять нечего, гейт не пройден" >&2
+            exit 1
+          fi
+          if grep -Ei 'sshj|bouncycastle|bcprov|bcpkix|bcutil' "$deps_file"; then
+            echo "releaseRuntimeClasspath must not contain SSH or BouncyCastle artifacts" >&2
+            exit 1
+          fi
 
       - name: 'Gate: Rust client'
         working-directory: rust-client
@@ -310,6 +326,16 @@ jobs:
             --storepass-env ANDROID_KEYSTORE_PASSWORD \
             --alias "$ANDROID_KEY_ALIAS" \
             --expected-fingerprint "$ANDROID_KEYSTORE_FINGERPRINT"
+
+      # Серверный бинарник упаковывался в APK только пока приложение умело
+      # разворачивать сервер. Теперь он публикуется отдельным ассетом, поэтому
+      # CI собирает его здесь: collect-release-assets.sh у вызывающего читает
+      # app/build/generated/assets/csqtt-linux-amd64. --no-tests: fmt/clippy/test
+      # уже прогнаны гейтом Rust server выше.
+      - name: Build server binary
+        run: |
+          set -euo pipefail
+          bash rust-server/build_linux.sh --no-tests
 
       # Имена env — ровно те, что читает verifyReleaseSigning в
       # app/build.gradle.kts. Gradle зовёт нативные скрипты с --no-tests,
@@ -359,6 +385,27 @@ jobs:
             exit 1
           }
           echo "dir=$STAGE" >> "$GITHUB_OUTPUT"
+
+      # APK обязан оставаться клиентским: серверный бинарник и deploy.sh
+      # публикуются отдельно. Проверяем каждый release-APK, а не только universal:
+      # сплиты собираются разными пакетными задачами.
+      - name: 'Guard: APK carries no server payload'
+        run: |
+          set -euo pipefail
+          STAGE="${{ steps.stage.outputs.dir }}"
+          status=0
+          for f in "$STAGE"/apk/*.apk; do
+            [[ -f $f ]] || continue
+            if unzip -l "$f" | grep -E 'assets/(csqtt-linux-amd64|deploy\.sh)'; then
+              echo "unexpected server payload in $f" >&2
+              status=1
+            fi
+            unzip -l "$f" | grep -q 'lib/.*/libclient\.so' || {
+              echo "missing libclient.so in $f" >&2
+              status=1
+            }
+          done
+          exit "$status"
 
       # Аргументы собираются циклом по файлам, а не глобом: `--apk DIR/*.apk`
       # развернулся бы в позиционные аргументы (в --apk попал бы только

@@ -2,41 +2,26 @@ package com.csqtt.client
 
 internal enum class ConnectionStartBlocker(val message: String) {
     Link("нужна корректная ссылка CSQTT"),
-    Server("не указан корректный адрес сервера"),
-    Port("указан некорректный порт сервера"),
-    Password("не указан пароль подключения"),
-    StoredSecret("не удалось прочитать сохранённый пароль подключения; введите его заново"),
     Hashes("нет действующих VK хешей или VK токена"),
 }
 
 internal object ConnectionStartPolicy {
     fun hasReadyVkCredentials(
-        linkMode: Boolean,
         linkHashCount: Int,
         linkTokenPresent: Boolean,
         autoHashMode: Boolean,
         storedTokenPresent: Boolean,
         manualHashCount: Int,
-    ): Boolean = when {
-        linkMode -> linkHashCount > 0 || linkTokenPresent || manualHashCount > 0 ||
-            (autoHashMode && storedTokenPresent)
-        autoHashMode -> storedTokenPresent
-        else -> manualHashCount > 0
-    }
+    ): Boolean = linkHashCount > 0 || linkTokenPresent || manualHashCount > 0 ||
+        (autoHashMode && storedTokenPresent)
 
     fun blocker(
-        linkMode: Boolean,
         linkValid: Boolean,
-        peerValid: Boolean,
-        peerPortValid: Boolean,
-        connectionPasswordSet: Boolean,
-        connectionPasswordReadable: Boolean = true,
         hashesReady: Boolean,
     ): ConnectionStartBlocker? {
-        if (!hashesReady) return ConnectionStartBlocker.Hashes
-        if (linkMode) return if (linkValid) null else ConnectionStartBlocker.Link
-        if (!peerValid) return ConnectionStartBlocker.Server
-        if (!peerPortValid) return ConnectionStartBlocker.Port
-        return null
+        // Ссылка — первая причина: без неё сообщение про хеши сбивало бы с толку,
+        // ведь хеши берутся в том числе из ссылки.
+        if (!linkValid) return ConnectionStartBlocker.Link
+        return if (hashesReady) null else ConnectionStartBlocker.Hashes
     }
 }

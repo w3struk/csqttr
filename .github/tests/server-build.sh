@@ -313,9 +313,10 @@ test_failed_or_missing_cargo_output() {
     done
 }
 
-# Narrow source contracts complement (not replace) the assigned Gradle dry-run
-# and the parent's real incremental stale-injection APK gate.
-test_gradle_server_contract() {
+# Narrow source contract complement (not a replacement) to the parent's real
+# Gradle-graph and APK packaging gates: the APK ships the Rust client only, and
+# the server is built by rust-server/build_linux.sh outside Gradle.
+test_gradle_client_only_contract() {
     python3 - "$REPO_ROOT/app/build.gradle.kts" <<'PY'
 import re
 import sys
@@ -332,35 +333,47 @@ def block(text, marker):
         end += 1
     return text[start + 1:end - 1]
 
-artifacts = source[source.index('fun serverCargoArtifacts()'):source.index('fun capitalised(')]
-pairs = re.findall(r'"(csqtt-linux-[^"]+)"\s+to\s+"([^"]+)"', artifacts)
-assert pairs == [('csqtt-linux-amd64', 'x86_64-unknown-linux-musl')], pairs
-assert 'rootBuildDir.resolve("csqtt-uring-linux-$asset/$target/release/csqtt")' in artifacts, artifacts
-build = block(source, 'val buildNativeServer =')
-predicate_start = build.index('outputs.upToDateWhen')
-configuration = build[:predicate_start]
-predicate = block(build, 'outputs.upToDateWhen')
-assert re.search(r'val\s+cargoArtifacts\s*=\s*serverCargoArtifacts\(\)', configuration), configuration
-assert re.search(r'cargoArtifacts\.all\s*\{\s*it\.isFile\s*\}', predicate), predicate
-stale = re.search(r'(\w+)\.none\s*\{\s*it\.exists\(\)\s*\|\|\s*(?:java\.nio\.file\.)?Files\.isSymbolicLink\(it\.toPath\(\)\)\s*\}', predicate)
-assert stale, 'up-to-date predicate must reject existing/dangling stale ARM outputs'
-assert 'java.nio.file.Files.isSymbolicLink' in predicate or 'import java.nio.file.Files' in source, 'Files must resolve to the JDK type'
-files = re.search(r'val\s+' + re.escape(stale[1]) + r'\s*=\s*listOf\((.*?)\n\s*\)', configuration, re.S)
-assert files, 'resolve the narrow File list before the upToDateWhen lambda'
-assert re.findall(r'rustAssetsDir\.resolve\("([^"]+)"\)', files[1]) == ['csqtt-linux-arm64', 'csqtt-linux-armv7'], files[1]
-assert re.findall(r'rootProject\.layout\.projectDirectory\.file\("([^"]+)"\)\.asFile', files[1]) == ['rust-server/dist/csqtt-linux-arm64', 'rust-server/dist/csqtt-linux-armv7'], files[1]
-assert len(re.findall(r'"([^"]+)"', files[1])) == 4, files[1]
-assert 'serverCargoArtifacts' not in predicate and 'rustAssetsDir' not in predicate and 'rootProject' not in predicate, predicate
-verify = block(source, 'val verifyNativeServer =')
-assert 'dependsOn(buildNativeServer)' in verify, verify
-assert '"scripts/server_asset_provenance.sh", "verify"' in verify, verify
-assert re.search(r'"mergeDebugAssets",\s*"mergeReleaseAssets"\s*->\s*dependsOn\(verifyNativeServer\)', source), 'asset merge verification dependency lost'
+for banned in (
+    'buildNativeServer',
+    'verifyNativeServer',
+    'rustAssetsDir',
+    'serverNativeInputs',
+    'serverCargoArtifacts',
+    'syncInstallerAsset',
+    'installerAssetsDir',
+    'server_asset_provenance.sh',
+):
+    assert banned not in source, f'{banned} must be gone: the APK no longer packages the server'
+assert 'assets.directories.add' not in source, 'the APK must not add generated assets'
+
+assert re.search(
+    r'tasks\.register<Exec>\("buildNativeClient\$\{capitalised\(variant\)\}"\)', source
+), 'client build task lost'
+assert re.search(
+    r'tasks\.register<Exec>\("verifyNativeClient\$\{capitalised\(variant\)\}"\)', source
+), 'client verify task lost'
+assert re.search(
+    r'"mergeDebugJniLibFolders"\s*->\s*dependsOn\(verifyNativeClientDebug\)', source
+), 'debug client merge verification dependency lost'
+assert re.search(
+    r'"mergeReleaseJniLibFolders"\s*->\s*dependsOn\(verifyNativeClientRelease\)', source
+), 'release client merge verification dependency lost'
+
+install = block(source, 'tasks.register<Exec>("installCsqtt$capitalisedVariant")')
+assert 'assemble$capitalisedVariant' in install, install
+assert 'verifyNativeClientRelease' in install and 'verifyNativeClientDebug' in install, install
+assert 'verifyNativeServer' not in install, install
+
+aggregate = block(source, 'tasks.register("verifyNativeArtifacts")')
+assert re.search(
+    r'dependsOn\(verifyNativeClientDebug,\s*verifyNativeClientRelease\)', aggregate
+), aggregate
 PY
 }
 
 failed=0
 for test_case in test_amd64_only_build test_incremental_cleanup_preserves_foreign_files_and_caches \
-    test_legacy_cli_and_features test_failed_or_missing_cargo_output test_gradle_server_contract; do
+    test_legacy_cli_and_features test_failed_or_missing_cargo_output test_gradle_client_only_contract; do
     set +e
     ( trap - EXIT; set -e; "$test_case" )
     status=$?

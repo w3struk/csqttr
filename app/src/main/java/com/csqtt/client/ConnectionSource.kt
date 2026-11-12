@@ -13,44 +13,43 @@ data class ConnectionSource(
     val tokenFromLink: Boolean,
 )
 
-suspend fun resolveConnectionSource(store: SettingsStore): ConnectionSource? {
-    val invalidHashes = VkHashValidationCodec.decode(store.vkHashCheckResults.first())
+/**
+ * Единственный источник подключения — ссылка `csqtt://`. Выходного профиля больше нет:
+ * адрес, порт и пароль приходят только из ссылки, а `hashes` — сохранённые в профиле
+ * VK-хеши, которые используются, если ссылка их не несёт.
+ *
+ * Функция чистая и не читает `SettingsStore`, поэтому её можно проверить на JVM.
+ */
+internal fun resolveConnectionSourceFrom(
+    link: String?,
+    hashes: String?,
+    invalidHashes: Map<String, VkHashValidationStatus> = emptyMap(),
+): ConnectionSource? {
+    val parsed = link?.let(::parseCsqttLink) ?: return null
+    val tokenFromLink = parsed.vkAccessToken.isNotEmpty()
     fun activeHashes(raw: String): String {
-        val rawList = raw.split(Regex("[,\\s\\n]+")).map(String::trim).filter { it.length >= 16 }.distinct()
+        val rawList = raw
+            .split(Regex("[,\\s\\n]+"))
+            .map(String::trim)
+            .filter { it.length >= 16 }
+            .distinct()
         val filtered = VkHashValidationCodec.active(rawList, invalidHashes)
         return (if (filtered.isNotEmpty()) filtered else rawList).joinToString(",")
     }
-
-    if (store.csqttLinkMode.first()) {
-        val link = parseCsqttLink(store.csqttLink.first()) ?: return null
-        val linkHashes = activeHashes(link.hashes.joinToString(","))
-        val tokenFromLink = link.vkAccessToken.isNotEmpty()
-        return ConnectionSource(
-            peer = link.peerAddress(),
-            password = link.password,
-            hashes = if (tokenFromLink) "" else linkHashes.ifEmpty { activeHashes(store.vkHashes.first()) },
-            hashesFromLink = linkHashes.isNotEmpty(),
-            vkAccessToken = link.vkAccessToken,
-            tokenFromLink = tokenFromLink,
-        )
-    }
-
-    val basePeer = store.peer.first()
-    val passwordState = store.connectionPasswordState.first()
-    val password = passwordState.value
-    if (basePeer.isBlank()) return null
-    val serverPeerPort = if (store.manualPortsEnabled.first()) {
-        store.serverPeerPort.first()
-    } else {
-        CsqttConstants.Network.DEFAULT_SERVER_PEER_PORT
-    }
-    val peer = if (basePeer.contains(':')) basePeer else "$basePeer:$serverPeerPort"
+    val linkHashes = activeHashes(parsed.hashes.joinToString(","))
     return ConnectionSource(
-        peer = peer,
-        password = password,
-        hashes = activeHashes(store.vkHashes.first()),
-        hashesFromLink = false,
-        vkAccessToken = "",
-        tokenFromLink = false,
+        peer = parsed.peerAddress(),
+        password = parsed.password,
+        hashes = if (tokenFromLink) "" else linkHashes.ifEmpty { activeHashes(hashes.orEmpty()) },
+        hashesFromLink = linkHashes.isNotEmpty(),
+        vkAccessToken = parsed.vkAccessToken,
+        tokenFromLink = tokenFromLink,
     )
 }
+
+suspend fun resolveConnectionSource(store: SettingsStore): ConnectionSource? =
+    resolveConnectionSourceFrom(
+        link = store.csqttLink.first(),
+        hashes = store.vkHashes.first(),
+        invalidHashes = VkHashValidationCodec.decode(store.vkHashCheckResults.first()),
+    )

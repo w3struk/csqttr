@@ -6,20 +6,18 @@
     <string name="app_name">CSQTT</string>
     <string name="widget_disconnected">Отключено</string>
     <string name="widget_toggle_vpn">Переключить VPN</string>
-    <string name="nav_connection">Подкл.</string>
+    <string name="nav_connection">Подключение</string>
     <string name="nav_tunnel">Туннель</string>
-    <string name="nav_deploy">Деплой</string>
-    <string name="nav_exceptions">Маршрут</string>
+    <string name="nav_settings">Настройки</string>
     <string name="nav_logs">Логи</string>
 
     <string name="action_clear">Очистить</string>
-    <string name="action_copy">Копировать</string>
-    <string name="action_close">Закрыть</string>
-    <string name="quick_settings">Быстрые настройки</string>
+    <string name="action_copy_report">Копировать отчёт и логи</string>
+    <string name="action_copy_report_only">Копировать отчёт о системе</string>
 
-    <string name="logs_enabled">Активное логирование</string>
     <string name="logs_empty_title">Событий пока нет</string>
-    <string name="logs_copied">Логи скопированы</string>
+    <string name="logs_report_copied">Отчёт и логи скопированы</string>
+    <string name="report_copied">Отчёт скопирован</string>
 
     <string name="exceptions_search_label">Поиск приложений</string>
     <string name="exceptions_search_placeholder">Название или package name</string>

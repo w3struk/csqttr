@@ -12,7 +12,7 @@ import org.junit.Test
  *
  * Проверка структурная: `SettingsStore` работает с `DataStore` и `Context`, которые на JVM
  * недоступны, поэтому объявления и форма обращений к ключу проверяются по исходнику — так же,
- * как в [SettingsStoreInitOrderTest] и [SettingsStoreExportImportProfileTest].
+ * как в [SettingsStoreInitOrderTest].
  */
 class SettingsStoreOrangeTunnelTest {
 
@@ -32,10 +32,6 @@ class SettingsStoreOrangeTunnelTest {
 
     private val getProfileKeyBody: String
         get() = bodyOf({ it.contains("private fun <T> getProfileKey(") }, "функции getProfileKey")
-    private val exportBody: String
-        get() = bodyOf({ it.contains("suspend fun exportConfigJson(") }, "функции exportConfigJson")
-    private val importBody: String
-        get() = bodyOf({ it.contains("suspend fun importConfigJson(") }, "функции importConfigJson")
 
     @Test
     fun `the orange tunnel key is global and stored as a comma string`() {
@@ -81,18 +77,6 @@ class SettingsStoreOrangeTunnelTest {
         assertTrue(
             "cachedOrangeTunnelEnabled объявлен после блока init, который его собирает (null при сборе)",
             declaredAt < init,
-        )
-    }
-
-    @Test
-    fun `the orange tunnel key is not exported with the profile settings`() {
-        assertFalse(
-            "экспорт не должен уносить глобальный список оранжевых приложений",
-            exportBody.contains("ORANGE_TUNNEL_ENABLED"),
-        )
-        assertFalse(
-            "импорт не должен перезаписывать глобальный список оранжевых приложений",
-            importBody.contains("ORANGE_TUNNEL_ENABLED"),
         )
     }
 }

@@ -1041,48 +1041,6 @@ object TunnelManager {
         }
     }
 
-    private val deploySessionCounter = AtomicLong()
-    private val deployLineCounter = AtomicLong()
-    @Volatile
-    private var deploySessionId = 0L
-
-    fun beginDeployLog(message: String) {
-        deploySessionId = deploySessionCounter.incrementAndGet()
-        deployLineCounter.set(0L)
-        addDeployInfoLog(message)
-    }
-
-    fun addDeployInfoLog(message: String) = addDeployLog(message, LogLevel.LOG)
-
-    fun addDeploySuccessLog(message: String) {
-        addDeployLog(message, LogLevel.OK)
-    }
-
-    fun addDeployWarningLog(message: String) {
-        addDeployLog("Предупреждение: $message", LogLevel.LOG)
-    }
-
-    fun addDeployErrorLog(message: String) {
-        addDeployLog(message, LogLevel.ERR)
-    }
-
-    private fun addDeployLog(message: String, level: LogLevel) {
-        val clean = message.trim().take(500)
-        if (clean.isEmpty()) return
-        if (deploySessionId == 0L) {
-            deploySessionId = deploySessionCounter.incrementAndGet()
-            deployLineCounter.set(0L)
-        }
-        val sequence = deployLineCounter.incrementAndGet().toString().padStart(5, '0')
-        updateLog(
-            key = "deploy_${deploySessionId}_$sequence",
-            message = "[ДЕПЛОЙ] $clean",
-            priority = 7,
-            isError = level == LogLevel.ERR,
-            level = level,
-        )
-    }
-
     internal fun updateLog(
         key: String,
         message: String,
@@ -1453,8 +1411,8 @@ object TunnelManager {
         pb.environment()["LD_LIBRARY_PATH"] = context.applicationInfo.nativeLibraryDir
         pb.environment()[CsqttConstants.Tunnel.PROCESS_ENV_EVENTS] = "1"
         pb.environment()["RAYON_NUM_THREADS"] = "2"
-        if (params.connectionPassword.isNotEmpty()) {
-            pb.environment()["CSQTT_PASSWORD"] = params.connectionPassword
+        if (params.password.isNotEmpty()) {
+            pb.environment()["CSQTT_PASSWORD"] = params.password
         }
 
         val ticket = lifecycleState.reserveProcess(epoch, process == null)
@@ -2705,7 +2663,7 @@ data class TunnelParams(
     val workersPerHash: Int,
     val port: Int,
     val sni: String = "",
-    val connectionPassword: String = "",
+    val password: String = "",
     val protocol: String = "udp",
     val vkAuthMode: String = "vkcalls",
     val captchaMode: String = "auto",

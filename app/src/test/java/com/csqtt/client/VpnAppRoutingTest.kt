@@ -189,7 +189,7 @@ class VpnAppRoutingTest {
         )
         assertTrue(
             "и совет снять исключения есть: $message",
-            message.contains("Снимите исключения в списке приложений"),
+            message.contains("Снимите исключения: «Настройки» → «Список приложений»"),
         )
     }
 

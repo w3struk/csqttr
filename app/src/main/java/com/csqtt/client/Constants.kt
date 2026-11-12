@@ -88,17 +88,17 @@ object CsqttConstants {
         const val ACTION_UPDATE = "update"
 
         const val GITHUB_RELEASES_URL =
-            "https://api.github.com/repos/amurcanov/csqtt/releases?per_page=30"
+            "https://api.github.com/repos/w3struk/csqttr/releases?per_page=30"
         const val GITHUB_LATEST_RELEASE_URL =
-            "https://api.github.com/repos/amurcanov/csqtt/releases/latest"
+            "https://api.github.com/repos/w3struk/csqttr/releases/latest"
         const val GITHUB_LATEST_RELEASE_WEB_URL =
-            "https://github.com/amurcanov/csqtt/releases/latest"
+            "https://github.com/w3struk/csqttr/releases/latest"
         const val GITHUB_RELEASE_TAG_URL_PREFIX =
-            "https://github.com/amurcanov/csqtt/releases/tag/"
+            "https://github.com/w3struk/csqttr/releases/tag/"
         const val GITHUB_TAGS_URL =
-            "https://api.github.com/repos/amurcanov/csqtt/tags?per_page=100"
+            "https://api.github.com/repos/w3struk/csqttr/tags?per_page=100"
         const val GITHUB_TAG_TREE_URL_PREFIX =
-            "https://github.com/amurcanov/csqtt/tree/"
+            "https://github.com/w3struk/csqttr/tree/"
     }
 
     object Notifications {
@@ -177,7 +177,7 @@ object CsqttConstants {
     }
 
     object Links {
-        const val RELEASES = "https://github.com/amurcanov/csqtt/releases"
+        const val RELEASES = "https://github.com/w3struk/csqttr/releases"
     }
 
     object Patterns {

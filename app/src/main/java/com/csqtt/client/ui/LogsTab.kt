@@ -3,7 +3,6 @@ package com.csqtt.client.ui
 import com.csqtt.client.showRaisedToast
 import android.content.ClipData
 import android.content.ClipboardManager
-import android.content.Context
 import android.widget.Toast
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -31,7 +30,6 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
@@ -42,45 +40,22 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.csqtt.client.DeployManager
 import com.csqtt.client.LogEntry
 import com.csqtt.client.LogTimestampPolicy
 import com.csqtt.client.R
-import com.csqtt.client.SettingsStore
 import com.csqtt.client.TunnelManager
 import com.csqtt.client.ui.components.CsqttEmptyState
 import com.csqtt.client.ui.components.CsqttScreen
-import com.csqtt.client.ui.components.CsqttSettingRow
 import com.csqtt.client.ui.design.CsqttShapes
+import com.csqtt.client.ui.design.CsqttSizes
 import com.csqtt.client.ui.design.CsqttSpacing
 import com.csqtt.client.ui.design.CsqttTheme
-import kotlinx.coroutines.launch
 
 import androidx.compose.foundation.BorderStroke
 
 @Composable
-fun LogsTab(settingsStore: SettingsStore) {
-    val loggingEnabled by settingsStore.loggingEnabled.collectAsStateWithLifecycle(initialValue = true)
-    val scope = rememberCoroutineScope()
-
+fun LogsTab() {
     CsqttScreen {
-        AppSectionCard(
-            contentPadding = PaddingValues(horizontal = CsqttSpacing.Md, vertical = CsqttSpacing.Xs),
-            verticalArrangement = Arrangement.spacedBy(CsqttSpacing.None),
-        ) {
-            CsqttSettingRow(
-                title = stringResource(R.string.logs_enabled),
-                checked = loggingEnabled,
-                onCheckedChange = { enabled ->
-                    TunnelManager.isLoggingEnabled = enabled
-                    scope.launch {
-                        settingsStore.saveLoggingEnabled(enabled)
-                    }
-                },
-            )
-        }
-
         Surface(
             modifier = Modifier
                 .fillMaxWidth()
@@ -99,8 +74,10 @@ private fun LogsTerminal() {
     val context = LocalContext.current
     val currentLogs = TunnelManager.logs
     val listState = rememberLazyListState()
-    val copiedMessage = stringResource(R.string.logs_copied)
-    val isDeploying by DeployManager.isDeploying.collectAsStateWithLifecycle()
+    val logsReportCopiedMessage = stringResource(R.string.logs_report_copied)
+    val reportCopiedMessage = stringResource(R.string.report_copied)
+    val copyReportWithLogsDescription = stringResource(R.string.action_copy_report)
+    val copyReportOnlyDescription = stringResource(R.string.action_copy_report_only)
 
     var isAtBottom by remember { mutableStateOf(true) }
 
@@ -123,15 +100,8 @@ private fun LogsTerminal() {
     }
 
     LaunchedEffect(currentLogs.lastOrNull()?.id) {
-        if (!isDeploying && currentLogs.isNotEmpty() && isAtBottom) {
+        if (currentLogs.isNotEmpty() && isAtBottom) {
             listState.scrollToItem(currentLogs.lastIndex)
-        }
-    }
-
-    LaunchedEffect(currentLogs.size, isDeploying) {
-        if (isDeploying) {
-            val latestDeployIndex = currentLogs.indexOfLast { it.key.startsWith("deploy_") }
-            if (latestDeployIndex >= 0) listState.animateScrollToItem(latestDeployIndex)
         }
     }
 
@@ -172,30 +142,42 @@ private fun LogsTerminal() {
         ) {
             IconButton(
                 onClick = {
-                    val text = currentLogs.joinToString("\n") { LogTimestampPolicy.copyLine(it) }
-                    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                    clipboard.setPrimaryClip(ClipData.newPlainText("CSQTT Logs", text))
-                    context.showRaisedToast(copiedMessage, Toast.LENGTH_SHORT)
+                    val text = buildReportCopyText(
+                        buildSupportReport(),
+                        currentLogs.map { LogTimestampPolicy.copyLine(it) },
+                    )
+                    val clipboard = context.getSystemService(ClipboardManager::class.java)
+                    clipboard?.setPrimaryClip(ClipData.newPlainText("CSQTT Report", text))
+                    if (clipboard != null) {
+                        context.showRaisedToast(
+                            if (currentLogs.isEmpty()) reportCopiedMessage else logsReportCopiedMessage,
+                            Toast.LENGTH_SHORT,
+                        )
+                    }
                 },
-                enabled = currentLogs.isNotEmpty(),
-                modifier = Modifier.size(40.dp)
+                modifier = Modifier.size(CsqttSizes.MinimumTouchTarget)
             ) {
                 Icon(
                     imageVector = Icons.Outlined.ContentCopy,
-                    contentDescription = stringResource(R.string.action_copy),
-                    tint = if (currentLogs.isNotEmpty()) Color.White else Color.White.copy(alpha = 0.4f),
+                    contentDescription = if (currentLogs.isEmpty()) {
+                        copyReportOnlyDescription
+                    } else {
+                        copyReportWithLogsDescription
+                    },
+                    tint = Color.White,
                     modifier = Modifier.size(22.dp)
                 )
             }
 
             IconButton(
                 onClick = TunnelManager::clearLogs,
-                modifier = Modifier.size(40.dp)
+                enabled = currentLogs.isNotEmpty(),
+                modifier = Modifier.size(CsqttSizes.MinimumTouchTarget)
             ) {
                 Icon(
                     imageVector = Icons.Outlined.Delete,
                     contentDescription = stringResource(R.string.action_clear),
-                    tint = Color.White,
+                    tint = if (currentLogs.isNotEmpty()) Color.White else Color.White.copy(alpha = 0.4f),
                     modifier = Modifier.size(22.dp)
                 )
             }

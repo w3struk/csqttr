@@ -1,8 +1,5 @@
 package com.csqtt.client.ui
 
-import android.content.ClipData
-import android.content.ClipboardManager
-import android.os.Build
 import android.widget.Toast
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -14,7 +11,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
-import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.Update
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
@@ -50,51 +46,6 @@ import com.csqtt.client.ui.design.CsqttSizes
 import com.csqtt.client.ui.utils.openUrlInBrowser
 import kotlinx.coroutines.launch
 
-internal fun buildSupportReport(): String {
-    val androidVersion = Build.VERSION.RELEASE ?: "?"
-    val sdkInt = Build.VERSION.SDK_INT
-    val primaryAbi = Build.SUPPORTED_ABIS.firstOrNull().orEmpty().ifBlank { "unknown" }
-    val supportedAbis = Build.SUPPORTED_ABIS.joinToString().ifBlank { "unknown" }
-    val manufacturer = Build.MANUFACTURER.orEmpty().ifBlank { "unknown" }
-    val brand = Build.BRAND.orEmpty().ifBlank { "unknown" }
-    val model = Build.MODEL.orEmpty().ifBlank { "unknown" }
-    val device = Build.DEVICE.orEmpty().ifBlank { "unknown" }
-    val product = Build.PRODUCT.orEmpty().ifBlank { "unknown" }
-    val hardware = Build.HARDWARE.orEmpty().ifBlank { "unknown" }
-    val board = Build.BOARD.orEmpty().ifBlank { "unknown" }
-    val romDisplay = Build.DISPLAY.orEmpty().ifBlank { "unknown" }
-    val buildId = Build.ID.orEmpty().ifBlank { "unknown" }
-    val buildFingerprint = Build.FINGERPRINT.orEmpty().ifBlank { "unknown" }
-    val buildType = Build.TYPE.orEmpty().ifBlank { "unknown" }
-    val socManufacturer = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-        Build.SOC_MANUFACTURER.orEmpty().ifBlank { "unknown" }
-    } else {
-        "n/a"
-    }
-    val socModel = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-        Build.SOC_MODEL.orEmpty().ifBlank { "unknown" }
-    } else {
-        "n/a"
-    }
-
-    return buildString {
-        appendLine("Версия приложения: ${BuildConfig.VERSION_NAME}")
-        appendLine("Андроид: $androidVersion (SDK $sdkInt)")
-        appendLine("Устройство: $manufacturer / $brand / $model")
-        appendLine("Код устройства: $device")
-        appendLine("Продукт: $product")
-        appendLine("ABI: $primaryAbi")
-        appendLine("Все ABI: $supportedAbis")
-        appendLine("SoC: $socManufacturer / $socModel")
-        appendLine("Hardware: $hardware")
-        appendLine("Board: $board")
-        appendLine("ROM: $romDisplay")
-        appendLine("Build ID: $buildId")
-        appendLine("Build type: $buildType")
-        appendLine("Fingerprint: $buildFingerprint")
-    }.trim()
-}
-
 @Composable
 fun CsqttActionsCard(
     settingsStore: SettingsStore,
@@ -128,7 +79,7 @@ fun CsqttActionsCard(
         )
 
         Text(
-            text = "Действия",
+            text = "Обновление",
             style = MaterialTheme.typography.labelMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             fontWeight = FontWeight.SemiBold,
@@ -136,22 +87,6 @@ fun CsqttActionsCard(
             maxLines = 1,
             softWrap = false,
             overflow = TextOverflow.Ellipsis,
-        )
-
-        ActionRowItem(
-            title = "Собрать отчёт",
-            subtitle = "Android, ABI, версия, устройство",
-            onClick = {
-                val clipboard = context.getSystemService(ClipboardManager::class.java)
-                clipboard?.setPrimaryClip(ClipData.newPlainText("CSQTT Report", buildSupportReport()))
-                context.showRaisedToast("Отчёт сформирован и скопирован", Toast.LENGTH_SHORT)
-            },
-            iconVector = Icons.Outlined.ContentCopy,
-        )
-
-        HorizontalDivider(
-            modifier = Modifier.padding(vertical = 2.dp),
-            color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f),
         )
 
         ActionRowItem(

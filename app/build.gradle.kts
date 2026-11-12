@@ -1,6 +1,5 @@
 import com.android.build.api.variant.FilterConfiguration
 import java.io.File
-import java.nio.file.Files
 import java.util.Properties
 import org.gradle.process.CommandLineArgumentProvider
 
@@ -278,14 +277,6 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.11.0")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.11.0")
     implementation("androidx.datastore:datastore-preferences:1.2.1")
-    implementation("com.hierynomus:sshj:0.38.0") {
-        exclude(group = "org.bouncycastle", module = "bcprov-jdk18on")
-        exclude(group = "org.bouncycastle", module = "bcpkix-jdk18on")
-        exclude(group = "org.bouncycastle", module = "bcutil-jdk18on")
-    }
-    implementation("org.bouncycastle:bcprov-jdk18on:1.85")
-    implementation("org.bouncycastle:bcpkix-jdk18on:1.85")
-    implementation("org.bouncycastle:bcutil-jdk18on:1.85")
     implementation("androidx.camera:camera-camera2:1.4.1")
     implementation("androidx.camera:camera-lifecycle:1.4.1")
     implementation("androidx.camera:camera-view:1.4.1")
@@ -306,20 +297,22 @@ dependencies {
 // ---------------------------------------------------------------------------
 // Native payload: per-variant build + provenance verification
 //
-// Everything the Rust crates produce is generated into app/build/generated/:
+// Everything the Rust client produces is generated into app/build/generated/:
 // nothing is written into app/src, and `./gradlew clean` removes the lot.
 //
 //   build/generated/jniLibs/debug/<abi>/libclient.so    Cargo "dev" profile
 //   build/generated/jniLibs/release/<abi>/libclient.so Cargo "release" profile
-//   build/generated/assets/csqtt-linux-amd64           server binary (release)
 //   build/generated/provenance/*.json                  provenance manifests
+//
+// The APK carries the client only: the server binary and the installer script
+// are release assets produced by rust-server/build_linux.sh and shipped
+// separately, never packaged into the app.
 //
 // Debug and release clients are built from separate Cargo target directories, so
 // switching build types can never mix artifacts, and each variant is wired to the
-// merge task that actually packages it (merge<Variant>JniLibFolders / merge*Assets)
-// rather than to preBuild - preBuild is shared by every variant and by the unit
-// test tasks, which used to drag three Android ABIs and three musl server
-// binaries into `./gradlew :app:test`.
+// merge task that actually packages it (merge<Variant>JniLibFolders) rather than
+// to preBuild - preBuild is shared by every variant and by the unit test tasks,
+// which used to drag three Android ABIs into `./gradlew :app:test`.
 //
 // Each build task declares its real inputs and outputs, so Gradle skips Cargo when
 // nothing Rust-related changed; the verify tasks stay unconditional, so a payload
@@ -334,7 +327,6 @@ dependencies {
 //   -Pcsqtt.cargoJobs=N                  cargo jobs per ABI (client)
 //   -Pcsqtt.nativeTests=true             run fmt/clippy/test before building
 //   -Pcsqtt.buildNativeClient=false      verify the client instead of rebuilding it
-//   -Pcsqtt.buildNativeServer=false      verify the server assets instead of rebuilding them
 //   -Pcsqtt.skipNativeVerification=true  skip both building and verification
 // ---------------------------------------------------------------------------
 
@@ -342,9 +334,7 @@ dependencies {
 // SourceSet API because it cannot tell generated (read-only) from static
 // directories, and the merge tasks are wired explicitly below anyway.
 val rustGeneratedDir: File = layout.buildDirectory.dir("generated").get().asFile
-val rustAssetsDir: File = rustGeneratedDir.resolve("assets")
 val rustProvenanceDir: File = rustGeneratedDir.resolve("provenance")
-val installerAssetsDir: File = layout.buildDirectory.dir("generated/installer-assets").get().asFile
 
 fun jniLibsDir(variant: String): File = rustGeneratedDir.resolve("jniLibs/$variant")
 fun clientManifest(variant: String): File = rustProvenanceDir.resolve("libclient.$variant.json")
@@ -366,11 +356,6 @@ fun clientCargoArtifacts(variant: String): List<File> = buildList {
     }
 }
 
-fun serverCargoArtifacts(): List<File> = listOf(
-    "csqtt-linux-amd64" to "x86_64-unknown-linux-musl",
-).map { (asset, target) ->
-    rootBuildDir.resolve("csqtt-uring-linux-$asset/$target/release/csqtt")
-}
 fun capitalised(variant: String) = variant.replaceFirstChar { it.uppercaseChar() }
 
 // Conservative superset of what the provenance scripts hash: a missed file here
@@ -393,24 +378,6 @@ val clientNativeInputs = fileTree(rootProject.projectDir) {
         "rust-client/.cargo/**",
         "scripts/android_env.sh",
         "scripts/native_client_provenance.sh",
-    )
-}
-
-val serverNativeInputs = fileTree(rootProject.projectDir) {
-    include(
-        "rust-server/*.rs",
-        "rust-server/*.sh",
-        "rust-server/*.json",
-        // Selects the default target and the link flags, so a change here changes
-        // the binary while every other declared input stays the same.
-        ".cargo/config.toml",
-        "rust-server/.cargo/**",
-        "rust-server/Cargo.toml",
-        "rust-server/Cargo.lock",
-        "rust-server/rust-toolchain.toml",
-        "rust-server/data/*.txt",
-        "shared/*.rs",
-        "scripts/server_asset_provenance.sh",
     )
 }
 
@@ -487,71 +454,7 @@ val buildNativeClientRelease = registerNativeClientBuild("release")
 val verifyNativeClientDebug = registerNativeClientVerify("debug", buildNativeClientDebug)
 val verifyNativeClientRelease = registerNativeClientVerify("release", buildNativeClientRelease)
 
-val buildNativeServer = tasks.register<Exec>("buildNativeServer") {
-    val skip = (providers.gradleProperty("csqtt.skipNativeVerification").orNull ?: "false").toBoolean()
-    val enabled = !skip && (providers.gradleProperty("csqtt.buildNativeServer").orNull ?: "true").toBoolean()
-    val tests = (providers.gradleProperty("csqtt.nativeTests").orNull ?: "false").toBoolean()
-
-    group = "build"
-    description = "Builds the amd64 Rust server binary (static musl, release) into build/generated/assets."
-    workingDir = rootProject.layout.projectDirectory.asFile
-    commandLine("bash", "rust-server/build_linux.sh", if (tests) "--tests" else "--no-tests")
-
-    inputs.files(serverNativeInputs)
-    inputs.property("nativeTests", tests)
-    outputs.dir(rustAssetsDir)
-    outputs.file(rustProvenanceDir.resolve("csqtt-server.json"))
-    val cargoArtifacts = serverCargoArtifacts()
-    // Resolve plain Files before the predicate to keep configuration-cache safety.
-    // Dist is outside outputs.dir, so stale ARM payloads there must also force a build.
-    val staleServerOutputs = listOf(
-        rustAssetsDir.resolve("csqtt-linux-arm64"),
-        rustAssetsDir.resolve("csqtt-linux-armv7"),
-        rootProject.layout.projectDirectory.file("rust-server/dist/csqtt-linux-arm64").asFile,
-        rootProject.layout.projectDirectory.file("rust-server/dist/csqtt-linux-armv7").asFile,
-    )
-    outputs.upToDateWhen {
-        cargoArtifacts.all { it.isFile } &&
-            staleServerOutputs.none { it.exists() || Files.isSymbolicLink(it.toPath()) }
-    }
-
-    onlyIf("the Rust server build is disabled") { enabled }
-}
-
-val verifyNativeServer = tasks.register<Exec>("verifyNativeServer") {
-    val skip = (providers.gradleProperty("csqtt.skipNativeVerification").orNull ?: "false").toBoolean()
-
-    group = "verification"
-    description = "Verifies assets/csqtt-linux-amd64 against build/generated/provenance/csqtt-server.json."
-    workingDir = rootProject.layout.projectDirectory.asFile
-    commandLine("bash", "scripts/server_asset_provenance.sh", "verify")
-    onlyIf("native verification is not skipped") { !skip }
-    dependsOn(buildNativeServer)
-    isIgnoreExitValue = true
-    doLast {
-        if (executionResult.get().exitValue != 0) {
-            throw GradleException(
-                "Native server asset is missing or stale. Gradle builds it with rust-server/build_linux.sh; " +
-                    "see the buildNativeServer output above or run it manually with --no-tests."
-            )
-        }
-    }
-}
-
-// Temporary bridge: the installer is now scripts/install.sh, but DeployOperations
-// still opens the "deploy.sh" asset. This task only packages the file and does
-// not promise that the old DeployTab keeps working after plan 3.
-val syncInstallerAsset = tasks.register<Copy>("syncInstallerAsset") {
-    from(rootProject.file("scripts/install.sh"))
-    into(installerAssetsDir)
-    rename { "deploy.sh" }
-}
-
 // Generated native payload joins the variant that actually packages it.
-android.sourceSets.getByName("main") {
-    assets.directories.add(rustAssetsDir.absolutePath)
-    assets.directories.add(installerAssetsDir.absolutePath)
-}
 android.sourceSets.getByName("debug") {
     jniLibs.directories.add(jniLibsDir("debug").absolutePath)
 }
@@ -563,7 +466,6 @@ tasks.configureEach {
     when (name) {
         "mergeDebugJniLibFolders" -> dependsOn(verifyNativeClientDebug)
         "mergeReleaseJniLibFolders" -> dependsOn(verifyNativeClientRelease)
-        "mergeDebugAssets", "mergeReleaseAssets" -> dependsOn(verifyNativeServer, syncInstallerAsset)
     }
 }
 
@@ -573,7 +475,6 @@ tasks.configureEach {
 tasks.configureEach {
     val taskName = name
     if (taskName.startsWith("lint") || taskName.contains("Lint", ignoreCase = true)) {
-        dependsOn(verifyNativeServer)
         when {
             taskName.contains("Debug", ignoreCase = true) -> dependsOn(verifyNativeClientDebug)
             taskName.contains("Release", ignoreCase = true) -> dependsOn(verifyNativeClientRelease)
@@ -621,7 +522,6 @@ androidComponents {
             description = "Builds the $variantName variant and installs it on the connected device with adb."
             dependsOn(
                 "assemble$capitalisedVariant",
-                verifyNativeServer,
                 if (variantName == "release") verifyNativeClientRelease else verifyNativeClientDebug,
             )
             workingDir = rootProject.layout.projectDirectory.asFile
@@ -637,10 +537,10 @@ androidComponents {
     }
 }
 
-// Manual aggregate: verify both variants plus the server without packaging.
+// Manual aggregate: verify both client variants without packaging.
 // Nothing depends on it, so Kotlin-only work never triggers a native build.
 tasks.register("verifyNativeArtifacts") {
     group = "verification"
-    description = "Verifies the debug and release client payloads plus the server assets."
-    dependsOn(verifyNativeClientDebug, verifyNativeClientRelease, verifyNativeServer)
+    description = "Verifies the debug and release client payloads."
+    dependsOn(verifyNativeClientDebug, verifyNativeClientRelease)
 }

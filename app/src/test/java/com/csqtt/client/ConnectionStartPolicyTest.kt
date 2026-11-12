@@ -6,11 +6,10 @@ import org.junit.Test
 
 class ConnectionStartPolicyTest {
     @Test
-    fun tokenFromParticipantLinkIsReadyWithoutStoredOwnerToken() {
+    fun tokenFromParticipantLinkIsReadyWithoutStoredToken() {
         assertEquals(
             true,
             ConnectionStartPolicy.hasReadyVkCredentials(
-                linkMode = true,
                 linkHashCount = 0,
                 linkTokenPresent = true,
                 autoHashMode = true,
@@ -25,7 +24,6 @@ class ConnectionStartPolicyTest {
         assertEquals(
             true,
             ConnectionStartPolicy.hasReadyVkCredentials(
-                linkMode = true,
                 linkHashCount = 0,
                 linkTokenPresent = false,
                 autoHashMode = false,
@@ -40,7 +38,6 @@ class ConnectionStartPolicyTest {
         assertEquals(
             false,
             ConnectionStartPolicy.hasReadyVkCredentials(
-                linkMode = true,
                 linkHashCount = 0,
                 linkTokenPresent = false,
                 autoHashMode = false,
@@ -51,85 +48,46 @@ class ConnectionStartPolicyTest {
     }
 
     @Test
-    fun `participant may connect through a valid link with manually saved hashes`() {
+    fun `valid link with ready hashes has no blocker`() {
         assertNull(
             ConnectionStartPolicy.blocker(
-                linkMode = true,
                 linkValid = true,
-                peerValid = false,
-                peerPortValid = false,
-                connectionPasswordSet = false,
                 hashesReady = true,
             ),
         )
     }
 
     @Test
-    fun `missing manual participant hashes is reported before attempting native startup`() {
+    fun `missing hashes is reported after the link`() {
         assertEquals(
             ConnectionStartBlocker.Hashes,
             ConnectionStartPolicy.blocker(
-                linkMode = true,
                 linkValid = true,
-                peerValid = false,
-                peerPortValid = false,
-                connectionPasswordSet = false,
                 hashesReady = false,
             ),
         )
     }
 
     @Test
-    fun `owner validation identifies the first missing setting`() {
+    fun `invalid link is the only remaining configuration blocker`() {
         assertEquals(
-            ConnectionStartBlocker.Server,
+            ConnectionStartBlocker.Link,
             ConnectionStartPolicy.blocker(
-                linkMode = false,
                 linkValid = false,
-                peerValid = false,
-                peerPortValid = true,
-                connectionPasswordSet = true,
-                hashesReady = true,
-            ),
-        )
-        assertNull(
-            ConnectionStartPolicy.blocker(
-                linkMode = false,
-                linkValid = false,
-                peerValid = true,
-                peerPortValid = true,
-                connectionPasswordSet = false,
                 hashesReady = true,
             ),
         )
     }
 
     @Test
-    fun `unreadable stored secret does not block passwordless connection`() {
-        assertNull(
+    fun `the link is checked before the hashes`() {
+        // Хеши приходят в том числе из ссылки: без ссылки сообщение про хеши
+        // отправляло бы пользователя не туда.
+        assertEquals(
+            ConnectionStartBlocker.Link,
             ConnectionStartPolicy.blocker(
-                linkMode = false,
                 linkValid = false,
-                peerValid = true,
-                peerPortValid = true,
-                connectionPasswordSet = false,
-                connectionPasswordReadable = false,
-                hashesReady = true,
-            ),
-        )
-    }
-
-    @Test
-    fun `link mode does not depend on the local encrypted password`() {
-        assertNull(
-            ConnectionStartPolicy.blocker(
-                linkMode = true,
-                linkValid = true,
-                peerValid = false,
-                peerPortValid = false,
-                connectionPasswordSet = false,
-                connectionPasswordReadable = false,
-                hashesReady = true,
+                hashesReady = false,
             ),
         )
     }

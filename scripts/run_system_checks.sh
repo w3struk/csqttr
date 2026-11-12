@@ -102,10 +102,17 @@ echo "CSQTT Linux Environment Diagnostics: $OS_PRETTY"
 echo "============================================================"
 
 if [[ ! -x "$SERVER_BIN" ]]; then
-    echo "ERROR: server binary not found or not executable: $SERVER_BIN" >&2
-    echo "       Rebuild it with: bash rust-server/build_linux.sh --no-tests" >&2
-    echo "       (or let Gradle build it: ./gradlew :app:assembleDebug)" >&2
-    exit 1
+    echo "Server binary not found at $SERVER_BIN; building it with rust-server/build_linux.sh --no-tests." >&2
+    if ! bash rust-server/build_linux.sh --no-tests; then
+        echo "ERROR: server build failed." >&2
+        echo "       Build it manually with: bash rust-server/build_linux.sh --no-tests" >&2
+        exit 1
+    fi
+    if [[ ! -x "$SERVER_BIN" ]]; then
+        echo "ERROR: server binary not found or not executable: $SERVER_BIN" >&2
+        echo "       Rebuild it with: bash rust-server/build_linux.sh --no-tests" >&2
+        exit 1
+    fi
 fi
 
 for tool in ip curl; do

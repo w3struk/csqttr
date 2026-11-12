@@ -143,7 +143,7 @@ internal fun TurnSubnetsDialog(
                         modifier = Modifier.size(22.dp),
                     )
                     Text(
-                        text = "Выбор TURN подсетей",
+                        text = "Выбор TURN-подсетей",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold,
                         maxLines = 1,

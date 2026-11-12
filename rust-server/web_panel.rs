@@ -2357,19 +2357,14 @@ struct ServerExportData {
     clients: Vec<ExportClientEntry>,
 }
 
-/// Accepted import payload, v1 and v2 alike. Version 1 kept the owner password
-/// in `main_password` instead of `clients`; `version` is absent there, and
+/// Accepted import payload, v2. The owner is an ordinary `clients` entry;
 /// unknown or future fields are ignored rather than rejected.
 #[derive(Deserialize)]
 struct ServerImportConfig {
-    #[serde(default)]
-    version: u32,
     // Not used by the importer, but keeps the payload shape of a real export:
     // a body without it is rejected instead of importing an empty config.
     #[allow(dead_code)]
     exported_at: i64,
-    #[serde(default)]
-    main_password: String,
     #[serde(default)]
     dns: String,
     #[serde(default)]
@@ -2473,40 +2468,6 @@ struct ServerImportPayload {
     direct_config: serde_json::Map<String, serde_json::Value>,
 }
 
-/// Version 1 exports keep the owner password outside `clients`; importing it
-/// creates a regular client named «Владелец». Version 2 already lists the owner
-/// in `clients`, so a stray `main_password` is ignored there.
-fn import_legacy_owner_client(
-    db: &mut model::Database,
-    export: &ServerImportConfig,
-    owner_vk_hashes: &str,
-) -> bool {
-    if export.version >= 2
-        || export.main_password.trim().is_empty()
-        || db.passwords.contains_key(&export.main_password)
-    {
-        return false;
-    }
-    let ip = model::import_ip(db, model::LEGACY_OWNER_IP);
-    let existing_names = model::existing_client_names_in_scope(db, "", None);
-    let name = if model::is_client_name_taken(existing_names.clone(), "Владелец") {
-        model::generate_unique_client_name(existing_names)
-    } else {
-        "Владелец".to_owned()
-    };
-    db.passwords.insert(
-        export.main_password.clone(),
-        PasswordEntry {
-            ip,
-            name,
-            vk_hashes: owner_vk_hashes.to_owned(),
-            sub_uuid: model::random_uuid_v4(),
-            ..Default::default()
-        },
-    );
-    true
-}
-
 async fn api_import_post(
     State(state): State<WebState>,
     Json(payload): Json<ServerImportPayload>,
@@ -2540,19 +2501,6 @@ async fn api_import_post(
         {
             let mut db = state.app.db.write().await;
             if do_clients {
-                // A v1 export carries VK hashes only at the global level. Mirror
-                // the retired `make_main_link` fallback: use the imported global
-                // value when settings are applied, otherwise the target's own.
-                let owner_vk_hashes = if do_settings && !export.vk_hashes.is_empty() {
-                    export.vk_hashes.clone()
-                } else {
-                    db.vk_hashes.clone()
-                };
-                added_clients += usize::from(import_legacy_owner_client(
-                    &mut db,
-                    &export,
-                    &owner_vk_hashes,
-                ));
                 for c in export.clients {
                     if !db.passwords.contains_key(&c.password) {
                         let sub_uuid = if c.sub_uuid.trim().is_empty() {
@@ -8255,7 +8203,7 @@ const PANEL_HTML_TEMPLATE: &str = r##"
         * { box-sizing: border-box; margin: 0; padding: 0; font-family: system-ui, -apple-system, 'Segoe UI', Roboto, Arial, sans-serif; }
         body { background-color: var(--bg-color); color: var(--text-main); min-height: 100vh; display: flex; flex-direction: column; overflow-x: hidden; width: 100%; }
 
-        body, header, .header-container, .brand, .brand-logo, .version-logo, .header-actions, .btn, main, .glass-panel,
+        body, header, .header-container, .brand, .brand-logo, .header-actions, .btn, main, .glass-panel,
         .stat-card, .stat-icon, .stat-value, .stat-sub, .progress-bar, .progress-fill,
         .section-header, .section-title, .table-wrapper, table, th, td, tr,
         .client-name, .client-pw, .client-hash, .traffic-flex, .badge, .actions,
@@ -8271,7 +8219,6 @@ const PANEL_HTML_TEMPLATE: &str = r##"
         .header-container { max-width: 1300px; width: 100%; margin: 0 auto; padding: 0 24px; height: 100%; display: flex; align-items: center; justify-content: space-between; }
         .brand { display: flex; align-items: center; gap: 8px; flex: 0 1 auto; min-width: 0; }
         .brand-logo { display: block; width: 165px; height: auto; }
-        .version-logo { display: block; width: 67px; height: auto; flex: 0 1 auto; }
 
         .header-actions { display: flex; gap: 16px; align-items: center; }
 
@@ -9154,7 +9101,6 @@ const PANEL_HTML_TEMPLATE: &str = r##"
             .header-container { padding: 0 10px !important; }
             .brand-logo { width: 92px !important; }
             .header-actions { gap: 6px !important; }
-            .version-logo { width: 37px !important; }
             .header-actions .btn:not(.btn-icon) { padding: 6px 8px !important; font-size: 12px !important; white-space: nowrap !important; }
             .header-actions .btn-icon { padding: 6px !important; }
 
@@ -9166,7 +9112,6 @@ const PANEL_HTML_TEMPLATE: &str = r##"
             header { height: 64px; }
             .header-container { padding: 0 16px; }
             .brand-logo { width: 128px; }
-            .version-logo { width: 52px; }
             main { padding: 20px 12px 80px; gap: 20px; }
 
             .tabs-container { width: 100%; margin-bottom: 4px; }
@@ -9457,10 +9402,6 @@ const PANEL_HTML_TEMPLATE: &str = r##"
                         </linearGradient>
                     </defs>
                     <path fill="url(#csqttLogoGradient)" fill-rule="evenodd" d="M79,11 L66,15 L48,25 L40,32 L27,49 L21,62 L17,78 L17,98 L19,108 L22,117 L33,136 L40,144 L56,156 L66,161 L84,166 L108,166 L118,164 L127,161 L143,152 L157,139 L160,135 L160,133 L137,116 L135,116 L123,128 L113,133 L106,135 L100,135 L99,136 L87,135 L73,130 L67,126 L57,116 L51,105 L48,93 L48,83 L51,71 L58,59 L67,50 L83,42 L105,41 L115,44 L129,53 L136,61 L160,44 L160,42 L155,35 L144,25 L135,19 L124,14 L108,10 Z M219,13 L208,18 L201,23 L191,35 L186,49 L186,66 L188,73 L193,82 L200,89 L208,94 L219,98 L248,103 L264,108 L270,113 L272,117 L272,125 L267,132 L260,136 L255,137 L234,137 L220,133 L212,129 L199,119 L181,141 L199,155 L212,161 L222,164 L232,165 L233,166 L257,166 L276,161 L285,156 L292,150 L298,142 L302,132 L303,112 L297,97 L287,87 L276,81 L258,76 L234,72 L224,68 L218,63 L216,58 L217,50 L222,44 L228,41 L237,39 L248,39 L258,41 L268,45 L279,53 L281,53 L299,32 L285,21 L270,14 L259,11 L233,10 Z M354,25 L344,34 L333,49 L328,60 L324,74 L324,79 L323,80 L324,103 L329,119 L336,132 L349,147 L360,155 L372,161 L391,166 L414,166 L430,162 L442,156 L460,174 L478,156 L462,140 L469,131 L474,122 L479,109 L481,99 L481,77 L479,68 L474,54 L466,41 L453,27 L441,19 L430,14 L414,10 L385,11 L372,15 Z M389,42 L411,41 L427,47 L442,61 L449,76 L450,96 L447,106 L444,112 L439,118 L421,100 L404,116 L405,119 L418,132 L416,134 L399,136 L385,133 L377,129 L363,116 L355,99 L354,83 L357,71 L361,63 L373,50 L379,46 Z M496,13 L496,44 L536,44 L537,45 L537,163 L568,163 L568,45 L569,44 L609,44 L610,43 L610,13 Z M628,13 L627,14 L627,37 L628,38 L627,43 L628,44 L666,44 L667,45 L667,163 L698,163 L699,162 L699,45 L700,44 L738,44 L738,13 Z"></path>
-                </svg>
-                <svg class="version-logo" viewBox="0 0 309 184" role="img" aria-label="Версия 2.5.2" fill="none" stroke="url(#versionLogoGradient)" stroke-width="13" stroke-linecap="round" stroke-linejoin="round">
-                    <defs><linearGradient id="versionLogoGradient" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="68" y2="340"><stop offset="0" stop-color="#1E88FE"></stop><stop offset="0.26" stop-color="#1576FD"></stop><stop offset="0.48" stop-color="#0B5FFC"></stop><stop offset="1" stop-color="#0A5CFC"></stop></linearGradient></defs>
-                    <path d="M 16,110.5 L 36,157.5 L 56,110.5 M 77,104 Q 77,90.5 99,90.5 Q 121,90.5 121,105 Q 121,120 109,130 L 77,157.5 H 121 M 142,157.5 L 142.01,157.5 M 207,90.5 H 163 V 118 H 185 Q 207,118 207,138 Q 207,157.5 185,157.5 Q 163,157.5 163,145 M 228,157.5 L 228.01,157.5 M 249,104 Q 249,90.5 271,90.5 Q 293,90.5 293,105 Q 293,120 281,130 L 249,157.5 H 293"></path>
                 </svg>
             </div>
             <div class="header-actions">
@@ -14626,22 +14567,6 @@ mod tests {
             }
         }
 
-        /// Export payload as written by a v1 server: owner password outside `clients`.
-        fn v1_export_payload(main_password: &str) -> Value {
-            json!({
-                "exported_at": 1_700_000_000,
-                "main_password": main_password,
-                "dns": "9.9.9.9,149.112.112.112",
-                "dns_provider": "custom",
-                "auto_restart_interval_hours": 24,
-                "vk_access_token": "",
-                "vk_hashes": "",
-                "groups": {},
-                "routing_rules": {},
-                "clients": [],
-            })
-        }
-
         #[tokio::test]
         async fn export_v2_has_owner_in_clients_and_no_main_password() {
             const OWNER: &str = "OwnerMainPass123";
@@ -14675,163 +14600,6 @@ mod tests {
             assert_eq!(owner["routing_rule_id"], "owner-rule");
             assert_eq!(owner["sub_uuid"], "owner-sub-uuid");
             assert_eq!(owner["workers"], 5);
-        }
-
-        #[tokio::test]
-        async fn import_v1_main_password_creates_owner_client_when_free() {
-            const OWNER: &str = "LegacyOwnerPass1";
-            // (import_clients, import_settings, owner expected)
-            for (import_clients, import_settings, expect_owner) in [
-                (false, false, false),
-                (false, true, false),
-                (true, false, true),
-                (true, true, true),
-            ] {
-                let target = Fixture::new(Database {
-                    dns: "77.88.8.8,77.88.8.1".to_owned(),
-                    dns_provider: "yandex".to_owned(),
-                    ..Default::default()
-                })
-                .await;
-                let mut export = v1_export_payload(OWNER);
-                // A v1 export may omit `version` entirely; an explicit `version: 1`
-                // is the same format.
-                if import_clients {
-                    export["version"] = json!(1);
-                }
-                let body = serde_json::to_vec(&json!({
-                    "import_clients": import_clients,
-                    "import_settings": import_settings,
-                    "config": export,
-                }))
-                .unwrap();
-
-                let response = target.request("POST", "/api/import", body).await;
-                assert_eq!(response.status(), StatusCode::OK);
-                let answer: Value = serde_json::from_slice(
-                    &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
-                )
-                .unwrap();
-                assert_eq!(
-                    answer["added_clients"],
-                    if expect_owner { 1 } else { 0 },
-                    "import_clients={import_clients} import_settings={import_settings}"
-                );
-
-                let db = target.app.db.read().await;
-                if expect_owner {
-                    let owner = db
-                        .passwords
-                        .get(OWNER)
-                        .expect("v1 main_password becomes an owner client");
-                    assert_eq!(owner.name, "Владелец");
-                    assert_eq!(owner.ip, "10.66.67.2");
-                    assert!(!owner.sub_uuid.is_empty());
-                    assert_eq!(owner.expires_at, 0);
-                } else {
-                    assert!(
-                        !db.passwords.contains_key(OWNER),
-                        "import_clients=false must not create the owner"
-                    );
-                }
-                if import_settings {
-                    assert_eq!(db.dns, "9.9.9.9,149.112.112.112");
-                    assert_eq!(db.dns_provider, "custom");
-                } else {
-                    assert_eq!(db.dns, "77.88.8.8,77.88.8.1");
-                    assert_eq!(db.dns_provider, "yandex");
-                }
-            }
-        }
-
-        #[tokio::test]
-        async fn import_v1_owner_inherits_global_vk_hashes_and_unique_name() {
-            const OWNER: &str = "LegacyOwnerVk1";
-            let mut db = Database {
-                vk_hashes: "target-global-hash".to_owned(),
-                ..Default::default()
-            };
-            db.passwords.insert(
-                "existing-owner-name".to_owned(),
-                PasswordEntry {
-                    name: "Владелец".to_owned(),
-                    ..Default::default()
-                },
-            );
-            let fixture = Fixture::new(db).await;
-            let mut export = v1_export_payload(OWNER);
-            export["vk_hashes"] = json!("export-global-hash");
-            let body = serde_json::to_vec(&json!({
-                "import_clients": true,
-                "import_settings": true,
-                "config": export,
-            }))
-            .unwrap();
-            let response = fixture.request("POST", "/api/import", body).await;
-            assert!(response.status().is_success());
-            let db = fixture.app.db.read().await;
-            let owner = db.passwords.get(OWNER).expect("owner client");
-            assert_eq!(owner.vk_hashes, "export-global-hash");
-            assert_ne!(owner.name, "Владелец");
-        }
-
-        #[tokio::test]
-        async fn import_v1_owner_uses_target_hashes_without_settings() {
-            const OWNER: &str = "LegacyOwnerVk2";
-            let db = Database {
-                vk_hashes: "target-global-hash".to_owned(),
-                ..Default::default()
-            };
-            let fixture = Fixture::new(db).await;
-            let mut export = v1_export_payload(OWNER);
-            export["vk_hashes"] = json!("export-global-hash");
-            let body = serde_json::to_vec(&json!({
-                "import_clients": true,
-                "import_settings": false,
-                "config": export,
-            }))
-            .unwrap();
-            let response = fixture.request("POST", "/api/import", body).await;
-            assert!(response.status().is_success());
-            let db = fixture.app.db.read().await;
-            let owner = db.passwords.get(OWNER).expect("owner client");
-            assert_eq!(owner.vk_hashes, "target-global-hash");
-        }
-
-        #[tokio::test]
-        async fn import_v1_does_not_overwrite_existing_client_with_same_password() {
-            const OWNER: &str = "LegacyOwnerPass1";
-            let mut db = Database::default();
-            db.passwords.insert(
-                OWNER.to_owned(),
-                PasswordEntry {
-                    ip: "10.66.67.7".to_owned(),
-                    name: "Existing client".to_owned(),
-                    up_bytes: 42,
-                    ..Default::default()
-                },
-            );
-            let target = Fixture::new(db).await;
-            let body = serde_json::to_vec(&json!({
-                "import_clients": true,
-                "import_settings": false,
-                "config": v1_export_payload(OWNER),
-            }))
-            .unwrap();
-
-            let response = target.request("POST", "/api/import", body).await;
-            assert_eq!(response.status(), StatusCode::OK);
-            let answer: Value =
-                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
-                    .unwrap();
-            assert_eq!(answer["added_clients"], 0);
-
-            let db = target.app.db.read().await;
-            assert_eq!(db.passwords.len(), 1);
-            let existing = &db.passwords[OWNER];
-            assert_eq!(existing.name, "Existing client");
-            assert_eq!(existing.ip, "10.66.67.7");
-            assert_eq!(existing.up_bytes, 42);
         }
 
         #[tokio::test]

@@ -7,16 +7,12 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.ui.graphics.Color
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Tag
 import androidx.compose.material.icons.filled.Phone
-import androidx.compose.material.icons.filled.Key
-import androidx.compose.material.icons.filled.Dns
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.automirrored.filled.Login
@@ -27,11 +23,11 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -51,7 +47,6 @@ import com.csqtt.client.ui.components.CsqttSettingRow
 import com.csqtt.client.ui.design.CsqttShapes
 import com.csqtt.client.ui.design.CsqttSizes
 import com.csqtt.client.ui.dialogs.HashesDialog
-import com.csqtt.client.ui.dialogs.SecretsDialog
 import com.csqtt.client.ui.dialogs.VkTokenRevokeDialog
 import com.csqtt.client.ui.tunnel.WorkersInfoDialog
 import com.csqtt.client.ui.utils.parseCsqttLink
@@ -105,14 +100,7 @@ internal fun SettingsTabContent(
         .collectAsStateWithLifecycle(initialValue = SettingsStore.cachedWorkersPerHash)
 
     val activeProfile = tunnelAuthSettings.profile
-    val csqttLinkMode = tunnelAuthSettings.csqttLinkMode
     val csqttLink = tunnelAuthSettings.csqttLink
-    val manualPortsEnabled by settingsStore.manualPortsEnabled.collectAsStateWithLifecycle(
-        initialValue = SettingsStore.cachedManualPortsEnabled ?: false,
-    )
-    val savedServerPeerPort by settingsStore.serverPeerPort.collectAsStateWithLifecycle(
-        initialValue = SettingsStore.cachedServerPeerPort ?: CsqttConstants.Network.DEFAULT_SERVER_PEER_PORT,
-    )
 
     val activeFingerprint by settingsStore.selectedFingerprint.collectAsStateWithLifecycle(initialValue = CsqttConstants.Tunnel.DEFAULT_FINGERPRINT)
     val activeClientIds by settingsStore.activeClientIds.collectAsStateWithLifecycle(initialValue = CsqttConstants.Tunnel.DEFAULT_CLIENT_IDS)
@@ -122,8 +110,6 @@ internal fun SettingsTabContent(
     }
     val savedHashMode by settingsStore.vkHashMode.collectAsStateWithLifecycle(initialValue = SettingsStore.cachedVkHashMode)
     val savedVkAccessToken by settingsStore.vkAccessToken.collectAsStateWithLifecycle(initialValue = SettingsStore.cachedVkAccessToken)
-    val connectionPassword by settingsStore.connectionPassword.collectAsStateWithLifecycle(initialValue = "")
-    var showSecretsDialog by rememberSaveable { mutableStateOf(false) }
 
     val tunnelRunning by TunnelManager.running.collectAsStateWithLifecycle()
     var showHashModeGeneralDialog by rememberSaveable { mutableStateOf(false) }
@@ -171,15 +157,6 @@ internal fun SettingsTabContent(
     }
 
     val hashSettingsLoaded = savedHashMode != null && savedVkAccessToken != null
-    var peerInput by rememberSaveable { mutableStateOf("") }
-    var peerPortInput by rememberSaveable(activeProfile) {
-        val initialPort = if (SettingsStore.cachedManualPortsEnabled == true) {
-            (SettingsStore.cachedServerPeerPort ?: CsqttConstants.Network.DEFAULT_SERVER_PEER_PORT).toString()
-        } else {
-            CsqttConstants.Network.DEFAULT_SERVER_PEER_PORT.toString()
-        }
-        mutableStateOf(initialPort)
-    }
     var vkHash1 by rememberSaveable { mutableStateOf("") }
     var vkHash2 by rememberSaveable { mutableStateOf("") }
     var vkHash3 by rememberSaveable { mutableStateOf("") }
@@ -192,12 +169,9 @@ internal fun SettingsTabContent(
     var isManualMode by rememberSaveable { mutableStateOf(true) }
     var wbvManualMode by rememberSaveable { mutableStateOf(true) }
     var saveJob by remember { mutableStateOf<Job?>(null) }
-    var peerPortSaveJob by remember { mutableStateOf<Job?>(null) }
-    var peerPortEdited by rememberSaveable(activeProfile) { mutableStateOf(false) }
     var linkSaveJob by remember { mutableStateOf<Job?>(null) }
     var linkText by remember(activeProfile, csqttLink) { mutableStateOf(csqttLink) }
     var initialized by rememberSaveable(activeProfile) { mutableStateOf(false) }
-    val participantMode = csqttLinkMode
 
     val allHashes = remember(vkHash1, vkHash2, vkHash3, vkHash4, vkHash5, vkHash6) {
         listOf(vkHash1, vkHash2, vkHash3, vkHash4, vkHash5, vkHash6)
@@ -210,9 +184,9 @@ internal fun SettingsTabContent(
     val linkVkAccessToken = parsedCsqttLink?.vkAccessToken.orEmpty()
     val serverWorkers by TunnelManager.serverAssignedWorkers.collectAsState()
     val effectiveServerWorkers = serverWorkers.takeIf { tunnelRunning && it in 3..100 }
-    val linkTokenActive = participantMode && linkVkAccessToken.isNotEmpty()
+    val linkTokenActive = linkVkAccessToken.isNotEmpty()
     val effectiveVkAuthMode = if (
-        participantMode && linkHashes.isNotEmpty() && vkAuthMode == CsqttConstants.VkAuth.MODE_AUTO_JS
+        linkHashes.isNotEmpty() && vkAuthMode == CsqttConstants.VkAuth.MODE_AUTO_JS
     ) {
         CsqttConstants.VkAuth.MODE_CALLS
     } else {
@@ -236,8 +210,6 @@ internal fun SettingsTabContent(
         allHashes.filter { it.isNotBlank() && it.length >= 16 }.distinct().joinToString(",")
     }
     val selectableMaxWorkers = CsqttConstants.Tunnel.MAX_WORKERS.toFloat()
-    var sniInput by rememberSaveable { mutableStateOf("") }
-
     val currentWorkers = roundToGroup(
         (savedWorkersPerHash ?: WORKERS_PER_GROUP).toFloat()
             .coerceIn(5f, selectableMaxWorkers),
@@ -280,93 +252,34 @@ internal fun SettingsTabContent(
     LaunchedEffect(activeProfile) {
         saveJob?.cancel()
         linkSaveJob?.cancel()
-        peerPortSaveJob?.cancel()
-        val peer = settingsStore.peer.first()
         val hashes = settingsStore.vkHashes.first()
         val loadedVkAuthMode = settingsStore.vkAuthMode.first()
         val captchaMode = settingsStore.captchaMode.first()
         val captchaMethod = settingsStore.captchaSolveMethod.first()
         val wbvCaptchaMethod = settingsStore.captchaWbvSolveMethod.first()
-        
-        peerInput = peer
-        val port = settingsStore.serverPeerPort.first()
-        val manual = settingsStore.manualPortsEnabled.first()
-        if (!peerPortEdited) {
-            val targetPort = if (manual) port.toString() else CsqttConstants.Network.DEFAULT_SERVER_PEER_PORT.toString()
-            if (peerPortInput != targetPort) {
-                peerPortInput = targetPort
-            }
-        }
+
         parseHashes(hashes)
         vkAuthMode = loadedVkAuthMode
-        sniInput = settingsStore.sni.first()
         autoCaptchaEnabled = captchaMode == "auto"
         useWVCaptcha = captchaMode != "rjs"
         wbvManualMode = wbvCaptchaMethod != "auto"
         isManualMode = if (captchaMode == "wv") wbvManualMode else captchaMethod != "auto"
-        
+
         initialized = true
-    }
-
-    LaunchedEffect(activeProfile, manualPortsEnabled, savedServerPeerPort) {
-        if (!peerPortEdited) {
-            val targetPort = if (manualPortsEnabled) {
-                savedServerPeerPort.toString()
-            } else {
-                CsqttConstants.Network.DEFAULT_SERVER_PEER_PORT.toString()
-            }
-            if (peerPortInput != targetPort) {
-                peerPortInput = targetPort
-            }
-        }
-    }
-
-    LaunchedEffect(activeProfile, manualPortsEnabled) {
-        if (!manualPortsEnabled) {
-            peerPortSaveJob?.cancel()
-            val defaultPort = CsqttConstants.Network.DEFAULT_SERVER_PEER_PORT.toString()
-            if (peerPortInput != defaultPort) {
-                peerPortInput = defaultPort
-            }
-            peerPortEdited = false
-        }
     }
 
     DisposableEffect(Unit) {
         onDispose {
             saveJob?.cancel()
             linkSaveJob?.cancel()
-            peerPortSaveJob?.cancel()
         }
     }
 
     fun saveTunnelSettingsNow(hashes: String = combinedHashes, onSaved: (() -> Unit)? = null) {
         saveJob?.cancel()
         scope.launch {
-            if (participantMode) {
-                settingsStore.saveParticipantTunnelSettings(hashes, currentWorkers.toInt())
-            } else {
-                settingsStore.save(
-                    peerInput, hashes, "",
-                    currentWorkers.toInt(), "udp", 0, sniInput, false
-                )
-            }
+            settingsStore.saveParticipantTunnelSettings(hashes, currentWorkers.toInt())
             onSaved?.invoke()
-        }
-    }
-
-    fun scheduleSave() {
-        saveJob?.cancel()
-        saveJob = scope.launch {
-            delay(300)
-            if (participantMode) {
-                settingsStore.saveParticipantTunnelSettings(combinedHashes, currentWorkers.toInt())
-            } else {
-                settingsStore.save(
-                    peerInput, combinedHashes, "",
-                    currentWorkers.toInt(), "udp", 0, sniInput, false
-                )
-            }
         }
     }
 
@@ -404,8 +317,8 @@ internal fun SettingsTabContent(
         }
     }
 
-    LaunchedEffect(initialized, participantMode, linkHashes, linkTokenActive, vkAuthMode, savedHashMode) {
-        if (!initialized || !participantMode) return@LaunchedEffect
+    LaunchedEffect(initialized, linkHashes, linkTokenActive, vkAuthMode, savedHashMode) {
+        if (!initialized) return@LaunchedEffect
         when {
             linkHashes.isNotEmpty() && vkAuthMode == CsqttConstants.VkAuth.MODE_AUTO_JS -> {
                 applyWorkMode(CsqttConstants.VkAuth.MODE_CALLS)
@@ -425,19 +338,14 @@ internal fun SettingsTabContent(
 
     val scrollState = rememberScrollState()
 
-    val isPeerValid = peerInput.isNotBlank() && !peerInput.contains(":")
-    val isPeerPortValid = peerPortInput.toIntOrNull() in 1..65535
     val hashesReadyForTunnel = when {
-        participantMode && linkHashes.isNotEmpty() -> true
-        participantMode && linkTokenActive -> true
+        linkHashes.isNotEmpty() -> true
+        linkTokenActive -> true
         autoHashMode -> effectiveVkTokenActive
         else -> filledHashCount > 0
     }
-    val peerRequiredError = showRequiredFieldErrors && !participantMode && !isPeerValid
-    val peerPortRequiredError = showRequiredFieldErrors && !participantMode && manualPortsEnabled && !isPeerPortValid
-    val linkRequiredError = showRequiredFieldErrors && participantMode && parsedCsqttLink == null
+    val linkRequiredError = showRequiredFieldErrors && parsedCsqttLink == null
     val hashesRequiredError = showRequiredFieldErrors && !hashesReadyForTunnel
-    val passwordRequiredError = showRequiredFieldErrors && !participantMode && connectionPassword.isBlank()
     if (showHashesDialog) {
         HashesDialog(
             hash1 = vkHash1,
@@ -533,182 +441,58 @@ internal fun SettingsTabContent(
                 contentPadding = PaddingValues(16.dp),
                 verticalArrangement = Arrangement.spacedBy(0.dp)
             ) {
-                if (participantMode) {
-                    OutlinedTextField(
-                        value = linkText,
-                        onValueChange = { value ->
-                            linkText = value.filterNot(Char::isWhitespace)
-                            linkSaveJob?.cancel()
-                            linkSaveJob = scope.launch {
-                                delay(300)
-                                settingsStore.saveCsqttParticipantLink(linkText)
-                            }
-                        },
-                        label = { Text("Ссылка csqtt://", maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis) },
-                        placeholder = { Text("csqtt://connect?v=2&host=ip&peer=порт&password=пароль", maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis) },
-                        singleLine = true,
-                        isError = linkRequiredError || (linkText.isNotBlank() && parsedCsqttLink == null),
-                        modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
-                        shape = CsqttShapes.Control,
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = MaterialTheme.colorScheme.primary,
-                            unfocusedBorderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f),
-                        )
+                OutlinedTextField(
+                    value = linkText,
+                    onValueChange = { value ->
+                        linkText = value.filterNot(Char::isWhitespace)
+                        linkSaveJob?.cancel()
+                        linkSaveJob = scope.launch {
+                            delay(300)
+                            settingsStore.saveCsqttParticipantLink(linkText)
+                        }
+                    },
+                    label = { Text("Ссылка csqtt://", maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis) },
+                    placeholder = { Text("csqtt://connect?v=2&host=ip&peer=порт&password=пароль", maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis) },
+                    singleLine = true,
+                    isError = linkRequiredError || (linkText.isNotBlank() && parsedCsqttLink == null),
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
+                    shape = CsqttShapes.Control,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = MaterialTheme.colorScheme.primary,
+                        unfocusedBorderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f),
                     )
+                )
 
-                    if (linkText.isNotBlank() && parsedCsqttLink == null) {
-                        Text(
-                            text = "Неверная ссылка CSQTT v2",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.error,
-                            modifier = Modifier.padding(bottom = 12.dp),
-                        )
-                    }
+                if (linkRequiredError || (linkText.isNotBlank() && parsedCsqttLink == null)) {
+                    Text(
+                        text = if (linkText.isBlank()) {
+                            "Вставьте ссылку csqtt:// из панели"
+                        } else {
+                            "Неверная ссылка CSQTT v2"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.padding(bottom = 12.dp),
+                    )
+                }
 
-                    if (linkHashes.isNotEmpty()) {
+                if (linkHashes.isNotEmpty()) {
+                    Text(
+                        text = "VK хеши из ссылки: ${linkHashes.size}",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                } else {
+                    if (linkTokenActive) {
                         Text(
-                            text = "VK хеши из ссылки: ${linkHashes.size}",
+                            text = "VK токен из ссылки",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.primary,
                             fontWeight = FontWeight.SemiBold,
-                        )
-                    } else {
-                        if (linkTokenActive) {
-                            Text(
-                                text = "VK токен из ссылки",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.primary,
-                                fontWeight = FontWeight.SemiBold,
-                                modifier = Modifier.padding(bottom = 12.dp),
-                            )
-                        }
-                        VkHashModeControls(
-                            hashSettingsLoaded = hashSettingsLoaded,
-                            autoHashMode = autoHashMode,
-                            savedHashMode = effectiveHashMode,
-                            vkTokenActive = effectiveVkTokenActive,
-                            tunnelRunning = tunnelRunning,
-                            filledHashCount = filledHashCount,
-                            hasInputHashErrors = hasInputHashErrors || hashesRequiredError,
-                            hashErrorTexts = hashErrors.filter { !it.contains("короткий") },
-                            onOpenHashes = { showHashesDialog = true },
-                            onTitleInfo = { showHashModeGeneralDialog = true },
-                            onInfo = { mode -> showHashModeDetailDialog = mode },
-                            onSelected = ::requestHashMode,
-                            onLogin = onVkAuthRequested,
-                            onRevokeToken = { showVkRevokeDialog = true },
-                            authorizationRequiredError = hashesRequiredError && autoHashMode,
-                            manualAllowed = !linkTokenActive,
-                            tokenFromLink = linkTokenActive,
+                            modifier = Modifier.padding(bottom = 12.dp),
                         )
                     }
-                } else {
-                    Text(
-                        "Сервер и Хеши",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.SemiBold,
-                        maxLines = 1,
-                        softWrap = false,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.padding(bottom = 12.dp),
-                    )
-                    if (manualPortsEnabled) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
-                            horizontalArrangement = Arrangement.spacedBy(10.dp),
-                        ) {
-                            OutlinedTextField(
-                                value = peerInput,
-                                onValueChange = {
-                                    peerInput = it.filter { c -> !c.isWhitespace() }
-                                    scheduleSave()
-                                },
-                                label = {
-                                    Text(
-                                        "IP сервера или домен",
-                                        maxLines = 1,
-                                        softWrap = false,
-                                        overflow = TextOverflow.Ellipsis,
-                                    )
-                                },
-                                placeholder = { Text("1.2.3.4", maxLines = 1) },
-                                singleLine = true,
-                                isError = peerRequiredError || (!isPeerValid && peerInput.isNotEmpty()),
-                                modifier = Modifier.weight(1f),
-                                shape = CsqttShapes.Control,
-                                colors = OutlinedTextFieldDefaults.colors(
-                                    focusedBorderColor = MaterialTheme.colorScheme.primary,
-                                    unfocusedBorderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f),
-                                ),
-                            )
-                            OutlinedTextField(
-                                value = peerPortInput,
-                                onValueChange = { value ->
-                                    val nextValue = value.filter(Char::isDigit).take(5)
-                                    peerPortInput = nextValue
-                                    peerPortEdited = true
-                                    peerPortSaveJob?.cancel()
-                                    peerPortSaveJob = scope.launch {
-                                        delay(300)
-                                        val port = nextValue.toIntOrNull()
-                                        if (port != null && port in 1..65535) {
-                                            settingsStore.saveServerPeerPort(port)
-                                            peerPortEdited = false
-                                        }
-                                    }
-                                },
-                                label = { Text("Порт PEER", maxLines = 1, softWrap = false) },
-                                placeholder = {
-                                    Text(
-                                        CsqttConstants.Network.DEFAULT_SERVER_PEER_PORT.toString(),
-                                        maxLines = 1,
-                                    )
-                                },
-                                singleLine = true,
-                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                                isError = peerPortRequiredError || (peerPortInput.isNotEmpty() && !isPeerPortValid),
-                                modifier = Modifier.weight(1f),
-                                shape = CsqttShapes.Control,
-                                colors = OutlinedTextFieldDefaults.colors(
-                                    focusedBorderColor = MaterialTheme.colorScheme.primary,
-                                    unfocusedBorderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f),
-                                ),
-                            )
-                        }
-                    } else {
-                        OutlinedTextField(
-                            value = peerInput,
-                            onValueChange = {
-                                peerInput = it.filter { c -> !c.isWhitespace() }
-                                scheduleSave()
-                            },
-                            label = {
-                                Text(
-                                    "IP сервера или домен (без порта)",
-                                    maxLines = 1,
-                                    softWrap = false,
-                                    overflow = TextOverflow.Ellipsis,
-                                )
-                            },
-                            placeholder = {
-                                Text(
-                                    "1.2.3.4 (или test.com)",
-                                    maxLines = 1,
-                                    softWrap = false,
-                                    overflow = TextOverflow.Ellipsis,
-                                )
-                            },
-                            singleLine = true,
-                            isError = peerRequiredError || (!isPeerValid && peerInput.isNotEmpty()),
-                            modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
-                            shape = CsqttShapes.Control,
-                            colors = OutlinedTextFieldDefaults.colors(
-                                focusedBorderColor = MaterialTheme.colorScheme.primary,
-                                unfocusedBorderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f),
-                            ),
-                        )
-                    }
-
                     VkHashModeControls(
                         hashSettingsLoaded = hashSettingsLoaded,
                         autoHashMode = autoHashMode,
@@ -725,6 +509,8 @@ internal fun SettingsTabContent(
                         onLogin = onVkAuthRequested,
                         onRevokeToken = { showVkRevokeDialog = true },
                         authorizationRequiredError = hashesRequiredError && autoHashMode,
+                        manualAllowed = !linkTokenActive,
+                        tokenFromLink = linkTokenActive,
                     )
                 }
 
@@ -737,7 +523,7 @@ internal fun SettingsTabContent(
                         CsqttConstants.VkAuth.MODE_CALLS to "Авто",
                         CsqttConstants.VkAuth.MODE_AUTO_JS to "Авто ВК",
                     ).filterNot { (mode, _) ->
-                        participantMode && linkHashes.isNotEmpty() && mode == CsqttConstants.VkAuth.MODE_AUTO_JS
+                        linkHashes.isNotEmpty() && mode == CsqttConstants.VkAuth.MODE_AUTO_JS
                     },
                     enabled = true,
                     indicatorProvider = { mode ->
@@ -953,32 +739,6 @@ internal fun SettingsTabContent(
 
             }
 
-            if (!participantMode) {
-                OutlinedButton(
-                    onClick = { showSecretsDialog = true },
-                    modifier = Modifier.fillMaxWidth().height(48.dp),
-                    shape = CsqttShapes.Pill,
-                    colors = ButtonDefaults.outlinedButtonColors(
-                        containerColor = Color.Transparent,
-                        contentColor = MaterialTheme.colorScheme.onSurface,
-                    ),
-                    border = BorderStroke(
-                        1.dp,
-                        if (passwordRequiredError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.outline.copy(alpha = 0.4f),
-                    ),
-                    contentPadding = PaddingValues(horizontal = 8.dp),
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Key,
-                        contentDescription = null,
-                        modifier = Modifier.size(18.dp),
-                        tint = Color.Black,
-                    )
-                    Spacer(Modifier.width(8.dp))
-                    Text("Авторизация", fontWeight = FontWeight.Bold, maxLines = 1)
-                }
-            }
-
             if (showHashModeGeneralDialog) {
                 HashModeInfoDialog(mode = null, onDismiss = { showHashModeGeneralDialog = false })
             }
@@ -1030,14 +790,6 @@ internal fun SettingsTabContent(
                         pendingTcpTransportSelection?.invoke()
                         pendingTcpTransportSelection = null
                     },
-                )
-            }
-            if (showSecretsDialog) {
-                SecretsDialog(
-                    settingsStore = settingsStore,
-                    initialPassword = connectionPassword,
-                    onSaved = { showSecretsDialog = false },
-                    onDismiss = { showSecretsDialog = false },
                 )
             }
         }

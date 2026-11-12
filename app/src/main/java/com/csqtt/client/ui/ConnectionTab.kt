@@ -48,7 +48,6 @@ import com.csqtt.client.ConnectionStartPolicy
 import com.csqtt.client.CsqttConstants
 import com.csqtt.client.R
 import com.csqtt.client.SettingsStore
-import com.csqtt.client.StoredSecretState
 import com.csqtt.client.TunnelAuthSnapshot
 import com.csqtt.client.TunnelManager
 import com.csqtt.client.TunnelService
@@ -71,16 +70,13 @@ internal fun ConnectionTab(
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current.applicationContext
     val scope = rememberCoroutineScope()
-    val connectionPassword = tunnelAuthSettings.connectionPassword
     val tunnelRunning by TunnelManager.running.collectAsStateWithLifecycle()
     val tunnelStarting by TunnelManager.starting.collectAsStateWithLifecycle()
     val tunnelStopping by TunnelManager.stopping.collectAsStateWithLifecycle()
     val autoPausedForWifi by TunnelManager.autoPausedForWifi.collectAsStateWithLifecycle()
     val cooldownActive by TunnelManager.cooldownActive.collectAsStateWithLifecycle()
 
-    val csqttLinkMode = tunnelAuthSettings.csqttLinkMode
     val csqttLink = tunnelAuthSettings.csqttLink
-    val peer by settingsStore.peer.collectAsStateWithLifecycle(initialValue = "")
     val vkHashes by settingsStore.vkHashes.collectAsStateWithLifecycle(initialValue = "")
     val vkHashCheckResultsJson by settingsStore.vkHashCheckResults.collectAsStateWithLifecycle(initialValue = "{}")
     val workersPerHash by settingsStore.workersPerHash.collectAsStateWithLifecycle(initialValue = 18)
@@ -88,10 +84,6 @@ internal fun ConnectionTab(
     val turnTransport by settingsStore.turnTransport.collectAsStateWithLifecycle(initialValue = CsqttConstants.Tunnel.DEFAULT_TURN_TRANSPORT)
     val srtpMode by settingsStore.srtpMode.collectAsStateWithLifecycle(initialValue = SettingsStore.cachedSrtpMode ?: CsqttConstants.SrtpMode.DEFAULT)
     val customTurnIps by settingsStore.customTurnIps.collectAsStateWithLifecycle(initialValue = "")
-    val manualPortsEnabled by settingsStore.manualPortsEnabled.collectAsStateWithLifecycle(initialValue = false)
-    val serverPeerPort by settingsStore.serverPeerPort.collectAsStateWithLifecycle(
-        initialValue = CsqttConstants.Network.DEFAULT_SERVER_PEER_PORT,
-    )
     val vkAuthMode by settingsStore.vkAuthMode.collectAsStateWithLifecycle(initialValue = CsqttConstants.VkAuth.MODE_CALLS)
     val captchaMode by settingsStore.captchaMode.collectAsStateWithLifecycle(initialValue = "auto")
     val captchaSolveMethod by settingsStore.captchaSolveMethod.collectAsStateWithLifecycle(initialValue = "auto")
@@ -104,7 +96,7 @@ internal fun ConnectionTab(
 
     val parsedLink = remember(csqttLink) { parseCsqttLink(csqttLink) }
     val linkHashes = parsedLink?.hashes.orEmpty()
-    val linkTokenActive = csqttLinkMode && parsedLink?.vkAccessToken?.isNotEmpty() == true
+    val linkTokenActive = parsedLink?.vkAccessToken?.isNotEmpty() == true
     val rawManualHashes = remember(vkHashes) {
         vkHashes.split(Regex("[,\\s\\n]+"))
             .map(String::trim)
@@ -125,23 +117,14 @@ internal fun ConnectionTab(
     )
     val vkTokenActive = savedVkAccessToken?.isNotBlank() == true
     val hashesReady = hashSettingsLoaded && ConnectionStartPolicy.hasReadyVkCredentials(
-        linkMode = csqttLinkMode,
         linkHashCount = linkHashes.size,
         linkTokenPresent = linkTokenActive,
         autoHashMode = autoHashMode,
         storedTokenPresent = vkTokenActive,
         manualHashCount = manualHashes.size,
     )
-    val peerPortValid = !manualPortsEnabled || serverPeerPort in 1..65535
-    val trimmedPeer = peer.trim()
-    val isLocalOrUnspecifiedPeer = trimmedPeer == "0.0.0.0" || trimmedPeer == "127.0.0.1" || trimmedPeer.equals("localhost", ignoreCase = true) || trimmedPeer == "::1"
     val startBlocker = ConnectionStartPolicy.blocker(
-        linkMode = csqttLinkMode,
         linkValid = parsedLink != null,
-        peerValid = trimmedPeer.isNotBlank() && !trimmedPeer.contains(":") && !isLocalOrUnspecifiedPeer,
-        peerPortValid = peerPortValid,
-        connectionPasswordSet = connectionPassword.isNotBlank(),
-        connectionPasswordReadable = tunnelAuthSettings.connectionPasswordState != StoredSecretState.Unreadable,
         hashesReady = hashesReady,
     )
     val isValid = startBlocker == null
@@ -177,7 +160,7 @@ internal fun ConnectionTab(
                 context.showRaisedToast("Заполните настройки подключения", Toast.LENGTH_SHORT)
                 return@launch
             }
-            TunnelManager.isLoggingEnabled = settingsStore.loggingEnabled.first()
+            TunnelManager.isLoggingEnabled = settingsStore.participantShowLogs.first()
             val nextGen = System.currentTimeMillis() / 1000L
             val salt = newTunnelSessionId()
             val intent = startIntent(source, nextGen, salt)
@@ -226,19 +209,6 @@ internal fun ConnectionTab(
                 99,
                 true,
             )
-            if (blocker == ConnectionStartBlocker.StoredSecret) {
-                scope.launch {
-                    val reset = settingsStore.resetUnreadableConnectionPassword()
-                    if (reset) {
-                        context.showRaisedToast(
-                            "Сохранённый пароль сброшен. Введите его заново в разделе «Авторизация».",
-                            Toast.LENGTH_LONG,
-                        )
-                    }
-                    onInvalidConfiguration()
-                }
-                return
-            }
             onInvalidConfiguration()
             return
         }
@@ -267,6 +237,7 @@ internal fun ConnectionTab(
                 autoPausedForWifi = autoPausedForWifi,
                 cooldownActive = cooldownActive,
                 configurationValid = isValid,
+                linkMissing = csqttLink.isBlank(),
                 onToggleTunnel = { toggleTunnel() },
             )
         }
@@ -281,6 +252,7 @@ private fun TunnelConnectionPanel(
     autoPausedForWifi: Boolean,
     cooldownActive: Boolean,
     configurationValid: Boolean,
+    linkMissing: Boolean,
     onToggleTunnel: () -> Unit,
 ) {
     val isStarting = tunnelStarting && !tunnelRunning && !tunnelStopping
@@ -348,6 +320,15 @@ private fun TunnelConnectionPanel(
                 textAlign = TextAlign.Center,
             )
 
+            if (linkMissing) {
+                Text(
+                    text = "Вставьте ссылку csqtt:// из панели",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center,
+                )
+            }
+
             TunnelUptimeText(tunnelRunning = tunnelRunning || autoPausedForWifi || tunnelStopping)
         }
     }
@@ -374,16 +355,4 @@ private fun formatTunnelUptime(seconds: Long?): String {
     val minutes = (totalSeconds % 3600) / 60
     val sec = totalSeconds % 60
     return String.format(Locale.US, "%02d:%02d:%02d", hours, minutes, sec)
-}
-
-private fun formatMillis(value: Double): String = when {
-    value < 0.05 -> "wall 0 мс"
-    value < 10.0 -> String.format(Locale.US, "wall %.1f мс", value)
-    else -> String.format(Locale.US, "wall %.0f мс", value)
-}
-
-private fun formatRate(value: Double): String = when {
-    value < 0.05 -> "0/с"
-    value < 10.0 -> String.format(Locale.US, "%.1f/с", value)
-    else -> String.format(Locale.US, "%.0f/с", value)
 }
