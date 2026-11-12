@@ -15,6 +15,13 @@ set -euo pipefail
 SERVER_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd -- "$SERVER_DIR/.." && pwd)"
 
+# Один target-dir на clippy/test/release: release-зависимости, собранные
+# clippy, переиспользуются финальной сборкой, а debug-тесты живут в том же
+# каталоге отдельным профилем. Имя обязано совпадать с build_linux_variants.sh
+# (build/csqtt-uring-linux-$asset).
+SERVER_TARGET_ASSET="csqtt-linux-amd64"
+SERVER_TARGET_DIR="$ROOT/build/csqtt-uring-linux-$SERVER_TARGET_ASSET"
+
 TOOLCHAIN="1.97.1"
 MUSL_TARGETS=(
   x86_64-unknown-linux-musl
@@ -219,7 +226,7 @@ if [[ "$RUN_TESTS" == 1 ]]; then
   section "cargo clippy (x86_64-unknown-linux-musl, release, -D warnings)"
   (
     cd "$SERVER_DIR"
-    CARGO_TARGET_DIR="$ROOT/build/csqtt-uring-linux-clippy" \
+    CARGO_TARGET_DIR="$SERVER_TARGET_DIR" \
       cargo "+$TOOLCHAIN" clippy --release --target x86_64-unknown-linux-musl \
       ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"} --all-targets -- -D warnings
   )
@@ -227,7 +234,7 @@ if [[ "$RUN_TESTS" == 1 ]]; then
   section "cargo test (native Linux, x86_64-unknown-linux-musl)"
   (
     cd "$SERVER_DIR"
-    CARGO_TARGET_DIR="$ROOT/build/linux-musl-tests" \
+    CARGO_TARGET_DIR="$SERVER_TARGET_DIR" \
       cargo "+$TOOLCHAIN" test --target x86_64-unknown-linux-musl \
       ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"} --all-targets
   )
@@ -251,6 +258,28 @@ bash "$SERVER_DIR/build_linux_variants.sh" ${VARIANT_ARGS[@]+"${VARIANT_ARGS[@]}
 section "Copying server assets"
 mkdir -p "$ASSETS_DIR" "$DIST_DIR" "$(dirname "$PROVENANCE_MANIFEST")"
 
+# musl-цель обязана дать статически слинкованный бинарь. Динамический ELF
+# (interpreter /lib64/ld-linux-x86-64.so.2) получается, когда финальный линк
+# идёт ручной zig-обёрткой без --target: такой бинарь не запускается в
+# alpine-образе и не является переносимым серверным ассетом. Проверяем здесь,
+# чтобы сборка падала на месте, а не в контейнере.
+assert_static_binary() {
+  local src="$1"
+  local asset="$2"
+
+  if command -v readelf >/dev/null 2>&1; then
+    if readelf -l "$src" 2>/dev/null | grep -q 'INTERP'; then
+      echo "Error: $asset is dynamically linked; expected a static musl binary" >&2
+      exit 1
+    fi
+  elif command -v file >/dev/null 2>&1; then
+    if ! file -b "$src" | grep -q 'statically linked'; then
+      echo "Error: $asset is not static: $(file -b "$src")" >&2
+      exit 1
+    fi
+  fi
+}
+
 copy_asset() {
   local target="$1"
   local asset="$2"
@@ -260,6 +289,7 @@ copy_asset() {
     echo "Error: expected binary not found: $src" >&2
     exit 1
   fi
+  assert_static_binary "$src" "$asset"
   install -m 0755 "$src" "$ASSETS_DIR/$asset"
   install -m 0755 "$src" "$DIST_DIR/$asset"
   echo "  $asset: $(stat -c '%s' "$ASSETS_DIR/$asset") bytes"

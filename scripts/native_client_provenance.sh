@@ -89,6 +89,7 @@ done
     exit 2
 }
 ROOT="$(cd -- "$ROOT" && pwd)"
+NATIVE_INPUTS_MANIFEST="$ROOT/rust-client/native-inputs.txt"
 
 valid_variant() {
     case "$1" in
@@ -195,35 +196,33 @@ cargo_package_field() {
 }
 
 build_input_files() {
-    local prefix
-    printf '%s\n' \
-        rust-client/build_so.sh \
-        rust-client/build_android_abis.sh \
-        rust-client/Cargo.toml \
-        rust-client/Cargo.lock \
-        rust-client/rust-toolchain.toml \
-        scripts/android_env.sh \
-        scripts/native_client_provenance.sh
+    local line pattern path
+    require_file "$NATIVE_INPUTS_MANIFEST" "Native inputs manifest"
+    # Сам манифест — тоже вход: правка списка обязана менять хеш.
+    printf '%s\n' "rust-client/native-inputs.txt"
 
-    # Cargo config files: they pick the target and the rustflags, so they change
-    # the binary. Listed only when present, because every entry below is required
-    # to exist by canonical_build_input_hash.
-    for prefix in ".cargo" "rust-client/.cargo"; do
-        [[ -d "$ROOT/$prefix" ]] || continue
-        ( cd "$ROOT/$prefix" && find . -type f -printf "$prefix/%P\n" )
-    done
-
-    require_dir "$ROOT/rust-client/vendor/primp" "Vendored primp sources"
-    (
-        cd "$ROOT/rust-client/vendor/primp"
-        find . -type f -not -path './target/*' -printf 'rust-client/vendor/primp/%P\n'
-    )
-
-    require_dir "$ROOT/rust-client/vendor/netstack-smoltcp" "Vendored netstack-smoltcp sources"
-    (
-        cd "$ROOT/rust-client/vendor/netstack-smoltcp"
-        find . -type f -not -path './target/*' -printf 'rust-client/vendor/netstack-smoltcp/%P\n'
-    )
+    shopt -s nullglob globstar
+    local -a matches=()
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%%#*}"
+        pattern="$(printf '%s' "$line" | tr -d '[:space:]')"
+        [[ -n "$pattern" ]] || continue
+        matches=()
+        for path in "$ROOT"/$pattern; do
+            [[ -f "$path" ]] || continue
+            path="${path#"$ROOT"/}"
+            # Cargo-кэши внутри vendor не влияют на бинарник.
+            [[ "$path" == */target/* ]] && continue
+            matches+=("$path")
+        done
+        # Запись без `**` обязана что-то находить: иначе опечатка или удалённый
+        # файл молча выпадут из хеша, и provenance перестанет ловить изменения.
+        if ((${#matches[@]} == 0)) && [[ "$pattern" != *"**"* ]]; then
+            die "Native inputs manifest entry matched nothing: $pattern ($NATIVE_INPUTS_MANIFEST)"
+        fi
+        ((${#matches[@]} == 0)) || printf '%s\n' "${matches[@]}"
+    done <"$NATIVE_INPUTS_MANIFEST"
+    shopt -u nullglob globstar
 }
 
 canonical_build_input_hash() {
@@ -421,6 +420,20 @@ verify_manifest() {
         [[ "$m_size" == "$(artifact_size "$prod")" ]] || die "Rust native provenance size mismatch for $abi"
         [[ "$m_sha" == "$(sha256_file "$prod")" ]] || die "Rust native provenance hash mismatch for $abi"
     done
+
+    # Симметрично серверному count-check: набор .so в jniLibs обязан совпадать с
+    # запрошенными ABI. Без этой проверки сужение -Pcsqtt.abis оставляло бы в
+    # каталоге старые библиотеки, и APK молча менял состав.
+    local expected_abis actual_abis
+    expected_abis="$(printf '%s\n' "${ABIS[@]}" | LC_ALL=C sort | tr '\n' ' ')"
+    actual_abis="$(
+        if [[ -d "$JNILIBS_DIR" ]]; then
+            find "$JNILIBS_DIR" -mindepth 2 -maxdepth 2 -type f -name libclient.so -printf '%h\n' |
+                while IFS= read -r dir; do basename "$dir"; done | LC_ALL=C sort | tr '\n' ' '
+        fi
+    )"
+    [[ "$expected_abis" == "$actual_abis" ]] ||
+        die "Native payload ABIs do not match the requested set: expected [${expected_abis% }], found [${actual_abis% }] in $JNILIBS_DIR"
 
     printf 'Rust native provenance verified: %s (%s variant, cargo %s)\n' "$MARKER" "$VARIANT" "$CARGO_PROFILE"
 }

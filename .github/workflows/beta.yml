@@ -17,6 +17,11 @@ permissions:
 #
 # Сам workflow ничего не публикует в GitHub Releases и не создаёт тегов:
 # единственный адресат беты — Telegram-канал.
+#
+# Коммит, на котором уже стоит тег `v*`, пропускается: это релизный коммит,
+# его APK публикует release.yml, дублировать бету в канал незачем. Поэтому
+# порядок выпуска — сначала тег, потом push в main (иначе бета стартует
+# раньше, чем появится тег).
 
 jobs:
   version:
@@ -30,6 +35,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       version-code: ${{ steps.version.outputs.version-code }}
       started: ${{ steps.start.outputs.started }}
+      skip: ${{ steps.tags.outputs.skip }}
     steps:
       # Длительность в сообщении считается от этой точки до отправки: иначе
       # пришлось бы врать про «собрано за», показывая только часть пайплайна.
@@ -42,8 +48,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          fetch-depth: 1
+          # Теги нужны, чтобы отличить релизный коммит от обычного.
+          fetch-depth: 0
           persist-credentials: false
+
+      - name: Skip when the commit is released
+        id: tags
+        run: |
+          set -euo pipefail
+          tag="$(git tag --points-at HEAD | head -n1)"
+          if [[ -n "$tag" ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Коммит $(git rev-parse --short HEAD) несёт тег $tag: бета не собирается, его APK публикует release.yml"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
 
       # Идёт до сборки: пустой телеграмный секрет обязан ронять прогон за
       # секунды, а не через двадцать минут, после которых APK всё равно уехал
@@ -80,6 +99,7 @@ jobs:
   build:
     name: Build beta APK
     needs: version
+    if: needs.version.outputs.skip != 'true'
     permissions:
       contents: read
     # Reusable workflow: ни runs-on, ни timeout-minutes здесь быть не может —
@@ -101,6 +121,7 @@ jobs:
   notify:
     name: Send to Telegram
     needs: [version, build]
+    if: needs.version.outputs.skip != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -179,10 +200,10 @@ jobs:
             printf 'CSQTT Beta\n\n'
             printf 'Version: %s (%s)\n' "$VERSION" "$VERSION_CODE"
             printf 'APK: %s\n\n' "$(basename -- "$dst")"
-            # Промежуточный APK: панель уже есть, серверного деплоя ещё нет.
-            # Тестер обязан узнать это из сообщения, а не из отчёта об ошибке.
-            printf 'Внимание: промежуточная сборка — вкладка «Деплой» нерабочая.\n'
-            printf 'Клиенты создаются в веб-панели, сервер ставится через install.sh/csqttctl.\n'
+            # Приложение — только участник: сервер в APK не едет и из
+            # приложения не ставится. Тестер узнаёт это из сообщения.
+            printf 'Внимание: приложение — только участник; сервер ставится через bootstrap.sh/install.sh и обслуживается csqttctl.\n'
+            printf 'Клиенты создаются в веб-панели, подключение — по ссылке csqtt://.\n'
             printf 'Понижение версии — восстановление БД.\n\n'
             printf 'Commit: <a href="%s/%s/commit/%s">%s</a>\n' \
               "$server_url" "$GITHUB_REPOSITORY" "$COMMIT" "$commit_short"

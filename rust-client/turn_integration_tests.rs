@@ -708,6 +708,7 @@ async fn authenticated_flow_survives_pool_deficit_and_keeps_channel_data_zero_co
     let server_address = server.local_addr().unwrap();
     let peer: SocketAddr = "127.0.0.1:39001".parse().unwrap();
     let relay: SocketAddr = "127.0.0.1:49001".parse().unwrap();
+    let (send_replies, wait_replies) = oneshot::channel();
     let server_task = tokio::spawn({
         let server = server.clone();
         async move {
@@ -737,6 +738,10 @@ async fn authenticated_flow_survives_pool_deficit_and_keeps_channel_data_zero_co
             let (outbound, outbound_client) = recv_datagram(&server).await;
             assert_eq!(outbound_client, client);
             assert_eq!(outbound, channel_data(channel, b"outbound"));
+
+            // Пул ёмкостью 1: пока писатель не вернул лизинг, любой входящий
+            // датаграм дропается как нехватка пула. Ждём явного разрешения.
+            wait_replies.await.unwrap();
 
             let wrong_channel = if channel == 0x7fff {
                 channel - 1
@@ -788,6 +793,18 @@ async fn authenticated_flow_survives_pool_deficit_and_keeps_channel_data_zero_co
     held.read_area()[..8].copy_from_slice(b"outbound");
     held.set_read_len(8).unwrap();
     allocation.send(held).await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if pool.available() == pool.capacity() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("outbound pool lease did not return before the server reply");
+    send_replies.send(()).unwrap();
 
     let mut inbound = tokio::time::timeout(Duration::from_secs(3), receiver.recv())
         .await

@@ -175,6 +175,7 @@ sudo csqttctl credentials   # URL панели, логин и пароль па�
 sudo csqttctl logs [-f]     # журнал установки и лог службы/контейнера
 sudo csqttctl panel         # только URL панели
 sudo csqttctl update        # скачать свежий install.sh и обновить сервер
+sudo csqttctl update --yes  # то же неинтерактивно (CI, без TTY)
 sudo csqttctl uninstall     # остановить и удалить runtime, сохранив конфигурацию и БД
 sudo csqttctl uninstall --purge  # дополнительно удалить /etc/csqtt
 ```

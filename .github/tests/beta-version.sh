@@ -11,6 +11,11 @@
 set -euo pipefail
 export LC_ALL=C
 
+# В CI переменные GITHUB_OUTPUT/GITHUB_ENV заданы для каждого шага, и
+# скрипты пишут туда вместо stdout. Тест проверяет именно stdout, поэтому
+# CI-каналы нужно убрать — иначе локально зелёный тест падает в прогоне.
+unset GITHUB_OUTPUT GITHUB_ENV GITHUB_PATH GITHUB_STEP_SUMMARY
+
 TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$TEST_DIR/../.." && pwd)"
 SCRIPT="$REPO_ROOT/.github/scripts/beta-version.sh"

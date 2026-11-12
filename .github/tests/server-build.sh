@@ -165,6 +165,11 @@ assert build['cwd'] == root + '/rust-server', build
 assert build['targetDir'] == root + '/build/csqtt-uring-linux-csqtt-linux-amd64', build
 assert build['globalCache'] == root + '/build/zig-cache/csqtt-linux-amd64/global', build
 assert build['localCache'] == root + '/build/zig-cache/csqtt-linux-amd64/local', build
+# Один target-dir на clippy/test/release: иначе зависимости компилируются
+# трижды за прогон (clippy, тесты и финальная сборка в разных каталогах).
+for call in calls:
+    if call['tool'] == 'cargo' and call['argv'][1:2] in (['clippy'], ['test']):
+        assert call['targetDir'] == build['targetDir'], call
 PY
 }
 
