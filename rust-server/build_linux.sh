@@ -4,7 +4,8 @@
 #
 # Linux-only server build pipeline for csqtt.
 #
-# Produces one release asset, copied into the APK assets and rust-server/dist:
+# Produces one release asset, published separately from the APK (the app ships
+# only the client) and staged in app/build/generated/assets and rust-server/dist:
 #   csqtt-linux-amd64   x86_64-unknown-linux-musl
 #
 # Compilation is delegated to build_linux_variants.sh (parallel by default).

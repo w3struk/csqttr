@@ -136,10 +136,18 @@ assert_line "$NOTE" '^- one-liner: sudo bash -c "\$\(curl -fsSL https://[^ ]+/re
     "one-liner runs bootstrap.sh, not install.sh"
 assert_line "$NOTE" '^- root-shell без sudo: bash install\.sh$' "root-shell variant omits sudo"
 assert_no_line "$NOTE" '(^|[[:space:]])\./install\.sh' "installer is never invoked as ./install.sh"
-assert_line "$NOTE" '«Деплой»' "warning names the Deploy tab"
-assert_line "$NOTE" 'веб-панели' "clients are created in the web panel only"
+assert_line "$NOTE" '^Внимание: приложение — только участник' \
+    "warning says the app is participant-only"
+assert_line "$NOTE" 'bootstrap\.sh/install\.sh' "server is installed through bootstrap.sh/install.sh"
+assert_line "$NOTE" 'обслуживается csqttctl' "server is maintained through csqttctl"
+assert_line "$NOTE" 'в APK серверного бинарника нет' "server binary is not shipped in the APK"
+assert_line "$NOTE" 'ссылкой csqtt://' "owner connects with the csqtt:// link"
+assert_line "$NOTE" 'ручных профилей с' "the release says manual profiles are gone"
+assert_line "$NOTE" 'настраивается только ссылкой csqtt://' "the release tells the owner to use the link"
+assert_line "$NOTE" '«Туннель»' "the link is imported from the Tunnel tab in the panel"
 assert_line "$NOTE" 'базы данных' "downgrade is a database restore"
-assert_line "$NOTE" '^Внимание: это промежуточный релиз' "intermediate release warning"
+assert_no_line "$NOTE" '«Деплой»' "the removed Deploy tab is not mentioned"
+assert_no_line "$NOTE" 'промежуточный релиз' "no stale intermediate-release warning"
 assert_line "$NOTE" "^Подпись: CN=Test Signer, SHA-256 ${FINGERPRINT}\$" "signature line"
 
 assert_eq "$(tail -n 1 "$NOTE")" '<!-- CSQTT-TECH-NOTES-END -->' \

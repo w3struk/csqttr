@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: 2026 amurcanov
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
-# Writes or verifies the provenance manifest of the server binaries shipped in the
-# APK. Both the binaries and the manifest live under app/build/generated/.
+# Writes or verifies the provenance manifest of the server binaries published as
+# a separate release asset (never inside the APK). Both the binaries and the
+# manifest live under app/build/generated/.
 # Usage: server_asset_provenance.sh <write|verify> [--root DIR] [--assets csqtt-linux-amd64]
 #                                         [--assets-dir DIR] [--manifest FILE]
 
