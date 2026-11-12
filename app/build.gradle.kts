@@ -360,25 +360,21 @@ fun capitalised(variant: String) = variant.replaceFirstChar { it.uppercaseChar()
 
 // Conservative superset of what the provenance scripts hash: a missed file here
 // would mean Gradle skips a rebuild that provenance would then reject.
+//
+// Источник правды один — rust-client/native-inputs.txt. Его же читает
+// scripts/native_client_provenance.sh, поэтому Gradle-входы и вычислимый хеш не
+// могут разойтись. Сам манифест тоже вход: правка списка перезапускает сборку.
+// readLines() на этапе конфигурации — configuration cache учитывает это чтение.
+val nativeInputsManifest: File = rootProject.file("rust-client/native-inputs.txt")
+
+fun readNativeInputPatterns(): List<String> =
+    nativeInputsManifest.readLines()
+        .map { it.substringBefore('#').trim() }
+        .filter { it.isNotEmpty() }
+
 val clientNativeInputs = fileTree(rootProject.projectDir) {
-    include(
-        "rust-client/*.rs",
-        "rust-client/*.sh",
-        "rust-client/Cargo.toml",
-        "rust-client/Cargo.lock",
-        "rust-client/rust-toolchain.toml",
-        // The provenance scripts hash every file under vendor/, so Gradle has to
-        // watch all of them: a narrower glob would let a build task stay
-        // UP-TO-DATE while verify rejects the manifest.
-        "rust-client/vendor/**",
-        "shared/*.rs",
-        "domains.txt",
-        // Cargo config: crate-local and any ancestor one, they set target/rustflags.
-        ".cargo/config.toml",
-        "rust-client/.cargo/**",
-        "scripts/android_env.sh",
-        "scripts/native_client_provenance.sh",
-    )
+    include("rust-client/native-inputs.txt")
+    readNativeInputPatterns().forEach { include(it) }
 }
 
 fun registerNativeClientBuild(variant: String) = tasks.register<Exec>("buildNativeClient${capitalised(variant)}") {
@@ -408,8 +404,12 @@ fun registerNativeClientBuild(variant: String) = tasks.register<Exec>("buildNati
     inputs.property("variant", variant)
     inputs.property("abis", abis)
     inputs.property("nativeTests", tests)
-    outputs.dir(jniLibsDir(variant))
-    outputs.file(clientManifest(variant))
+    // Per-ABI outputs вместо outputs.dir: Gradle знает, какие именно .so
+    // принадлежат задаче, и сужение -Pcsqtt.abis не прячется за снимком каталога.
+    outputs.files(
+        selectedAbis.map { jniLibsDir(variant).resolve("$it/libclient.so") } +
+            clientManifest(variant),
+    )
     // Resolved to a local list: a lambda capturing a script-level function
     // cannot be stored in the configuration cache.
     val cargoArtifacts = clientCargoArtifacts(variant)
@@ -449,8 +449,31 @@ fun registerNativeClientVerify(
     }
 }
 
+// Сужение -Pcsqtt.abis не должно оставлять в jniLibs библиотеки прошлых сборок:
+// AGP читает каталог целиком, и старый ABI молча попал бы в APK. Проверка со
+// стороны provenance ловит это после сборки, а эта задача убирает мусор до неё.
+fun registerStaleNativeCleanup(variant: String) =
+    tasks.register("cleanStaleNativeLibs${capitalised(variant)}") {
+        val abis = selectedAbis.toSet()
+        val dir = jniLibsDir(variant)
+        group = "build"
+        description = "Removes client libraries for ABIs outside -Pcsqtt.abis."
+        doLast {
+            dir.listFiles()?.forEach { entry ->
+                if (entry.isDirectory && entry.name !in abis) {
+                    entry.deleteRecursively()
+                }
+            }
+        }
+    }
+
+val cleanStaleNativeDebug = registerStaleNativeCleanup("debug")
+val cleanStaleNativeRelease = registerStaleNativeCleanup("release")
+
 val buildNativeClientDebug = registerNativeClientBuild("debug")
 val buildNativeClientRelease = registerNativeClientBuild("release")
+buildNativeClientDebug.configure { dependsOn(cleanStaleNativeDebug) }
+buildNativeClientRelease.configure { dependsOn(cleanStaleNativeRelease) }
 val verifyNativeClientDebug = registerNativeClientVerify("debug", buildNativeClientDebug)
 val verifyNativeClientRelease = registerNativeClientVerify("release", buildNativeClientRelease)
 

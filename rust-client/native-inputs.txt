@@ -1,0 +1,26 @@
+# Единый список входов нативной клиентской сборки.
+#
+# Один источник правды для трёх потребителей:
+#   - app/build.gradle.kts            — inputs задачи buildNativeClient<Variant>;
+#   - scripts/native_client_provenance.sh — canonical_build_input_hash и verify;
+#   - ревью/CI                        — .github/tests/native-inputs.sh проверяет,
+#                                       что мёртвых записей нет.
+#
+# Формат: путь или glob относительно корня репозитория, по одному на строку.
+# `#` начинает комментарий. Записи с `**` могут не совпасть ни с чем (каталог
+# ещё не создан); любая другая запись обязана существовать, иначе сборка падает
+# с внятной ошибкой: молча потерянный вход означает битый provenance.
+#
+# Здесь только то, что реально читает cargo/скрипты сборки. Каталоги target/,
+# app/build/, build/ и документация сюда не входят.
+
+rust-client/native-inputs.txt
+rust-client/*.rs
+rust-client/*.sh
+rust-client/Cargo.toml
+rust-client/Cargo.lock
+rust-client/rust-toolchain.toml
+rust-client/vendor/**
+shared/*.rs
+scripts/android_env.sh
+scripts/native_client_provenance.sh
