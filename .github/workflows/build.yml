@@ -60,7 +60,7 @@ jobs:
       # и удаление после setup-java оставило бы висячий JAVA_HOME (sdkmanager и
       # Gradle падали бы). ubuntu-24.04 даёт ~14 ГБ SSD, а холодный прогон тянет
       # SDK+NDK, три cargo-таргета и Gradle-кэши — риск No space left on device
-      # реальный. Свой SDK ставим в $RUNNER_TEMP, поэтому предустановленный
+      # реальный. Свой SDK ставим в $HOME/android-sdk, поэтому предустановленный
       # /usr/local/lib/android не нужен; dotnet в этом job не используется.
       # df -h / печатается для диагностики, если места не хватит.
       - name: Free disk space
@@ -82,22 +82,39 @@ jobs:
         with:
           python-version: '3.12'
 
-      # SDK/NDK намеренно не кешируются: ~1 ГБ, restore ненадёжен, установка
-      # дешевле риска. Пакеты platforms;android-37.0 и build-tools;37.0.0
-      # проверены на живом `sdkmanager --list` — пакета platforms;android-37
-      # не существует (API 37 публикуется в схеме android-37.0).
-      # Свой SDK ставим в $RUNNER_TEMP, поэтому предустановленный
+      # SDK/NDK кешируются в ~/android-sdk: восстановленный каталог превращает
+      # установку в быстрые no-op проверки (лицензии и пакеты уже на месте).
+      # Ключ перечисляет все пины, поэтому смена cmdline-tools, build-tools,
+      # NDK или platforms не оставит в кеше старый пакет. Пакеты
+      # platforms;android-37.0 и build-tools;37.0.0 проверены на живом
+      # `sdkmanager --list` — пакета platforms;android-37 не существует
+      # (API 37 публикуется в схеме android-37.0).
+      # Свой SDK ставим в $HOME/android-sdk, поэтому предустановленный
       # /usr/local/lib/android удаляется шагом Free disk space выше.
+      - name: Cache Android SDK
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/android-sdk
+          key: android-sdk-${{ runner.os }}-cmd11076708-bt37.0.0-ndk27.0.12077973-platform37.0
+          restore-keys: |
+            android-sdk-${{ runner.os }}-
+
       - name: Install Android SDK
         run: |
           set -euo pipefail
-          export ANDROID_HOME="$RUNNER_TEMP/android-sdk"
-          mkdir -p "$ANDROID_HOME/cmdline-tools"
-          curl -fsSL -o "$RUNNER_TEMP/cmdtools.zip" \
-            https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
-          unzip -q "$RUNNER_TEMP/cmdtools.zip" -d "$ANDROID_HOME/cmdline-tools"
-          mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+          export ANDROID_HOME="$HOME/android-sdk"
           SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          # Восстановленный кеш уже содержит cmdline-tools: скачивание и
+          # распаковка не нужны. rm -rf — на случай неполного каталога после
+          # прерванного restore.
+          if [[ ! -x $SDKM ]]; then
+            rm -rf "$ANDROID_HOME/cmdline-tools"
+            mkdir -p "$ANDROID_HOME/cmdline-tools"
+            curl -fsSL -o "$RUNNER_TEMP/cmdtools.zip" \
+              https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            unzip -q "$RUNNER_TEMP/cmdtools.zip" -d "$ANDROID_HOME/cmdline-tools"
+            mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+          fi
           # Конечный ввод вместо `yes`: под `set -o pipefail` SIGPIPE у `yes`
           # (exit 141) уронил бы весь шаг.
           printf 'y\n%.0s' {1..100} | "$SDKM" --sdk_root="$ANDROID_HOME" --licenses > /dev/null
@@ -122,6 +139,20 @@ jobs:
             echo "BT_VER=$BT_VER"
           } >> "$GITHUB_ENV"
 
+      # Тулчейн 1.97.1 с rustfmt/clippy и target'ами качается каждый прогон за
+      # ~200 МБ; с восстановленным ~/.rustup `rustup toolchain install` и
+      # `rustup target add` становятся no-op. Ключ — хеш rust-toolchain.toml
+      # обоих крейтов, чтобы смена пина не оставила в кеше старый toolchain.
+      - name: Cache Rust toolchains
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.rustup/toolchains
+            ~/.rustup/update-hashes
+          key: rustup-${{ runner.os }}-${{ hashFiles('rust-client/rust-toolchain.toml', 'rust-server/rust-toolchain.toml') }}
+          restore-keys: |
+            rustup-${{ runner.os }}-
+
       # Версия из rust-toolchain.toml обоих крейтов; явный `toolchain install`
       # делает шаг детерминированным независимо от каталога вызова.
       - name: Install Rust 1.97.1
@@ -131,39 +162,61 @@ jobs:
           rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android x86_64-unknown-linux-musl --toolchain 1.97.1
           rustc +1.97.1 --version
 
+      - name: Cache Zig
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/zig
+          key: zig-${{ runner.os }}-0.17.0
+          restore-keys: |
+            zig-${{ runner.os }}-
+
       # Fallback при проблемах с 0.17.0: заменить версию на 0.16.0 — больше
       # ничего менять не нужно.
+      # Восстановленный ~/zig с нужной версией отменяет скачивание; в
+      # $GITHUB_PATH путь добавляется один раз (grep -qxF), иначе строка
+      # копилась бы на каждом прогоне.
       - name: Install Zig 0.17.0
         run: |
           set -euo pipefail
-          cd "$RUNNER_TEMP"
           export ZIG_VERSION='0.17.0'
-          INDEX=$(curl -fsSL https://ziglang.org/download/index.json)
-          URL=$(jq -r --arg v "$ZIG_VERSION" '.[$v]["x86_64-linux"].tarball' <<<"$INDEX")
-          SHA=$(jq -r --arg v "$ZIG_VERSION" '.[$v]["x86_64-linux"].shasum' <<<"$INDEX")
-          [[ -n $URL && $URL != null && -n $SHA && $SHA != null ]] || {
-            echo "could not resolve zig $ZIG_VERSION x86_64-linux tarball/shasum" >&2
-            exit 1
-          }
-          curl -fsSL -o zig.tar.xz "$URL"
-          echo "$SHA  zig.tar.xz" | sha256sum -c -
-          mkdir -p "$RUNNER_TOOL_CACHE/zig"
-          tar -xJf zig.tar.xz -C "$RUNNER_TOOL_CACHE/zig" --strip-components=1
-          echo "$RUNNER_TOOL_CACHE/zig" >> "$GITHUB_PATH"
+          ZIG_DIR="$HOME/zig"
+          if [[ -x "$ZIG_DIR/zig" && "$("$ZIG_DIR/zig" version)" == "$ZIG_VERSION" ]]; then
+            echo "zig $ZIG_VERSION уже установлен — установка не требуется"
+          else
+            # Неполный каталог после прерванной распаковки не должен
+            # смешиваться с новой: tar кладёт файлы поверх.
+            rm -rf "$ZIG_DIR"
+            mkdir -p "$ZIG_DIR"
+            cd "$RUNNER_TEMP"
+            INDEX=$(curl -fsSL https://ziglang.org/download/index.json)
+            URL=$(jq -r --arg v "$ZIG_VERSION" '.[$v]["x86_64-linux"].tarball' <<<"$INDEX")
+            SHA=$(jq -r --arg v "$ZIG_VERSION" '.[$v]["x86_64-linux"].shasum' <<<"$INDEX")
+            [[ -n $URL && $URL != null && -n $SHA && $SHA != null ]] || {
+              echo "could not resolve zig $ZIG_VERSION x86_64-linux tarball/shasum" >&2
+              exit 1
+            }
+            curl -fsSL -o zig.tar.xz "$URL"
+            echo "$SHA  zig.tar.xz" | sha256sum -c -
+            tar -xJf zig.tar.xz -C "$ZIG_DIR" --strip-components=1
+          fi
           echo "ZIG_VERSION=$ZIG_VERSION" >> "$GITHUB_ENV"
+          grep -qxF "$ZIG_DIR" "$GITHUB_PATH" || echo "$ZIG_DIR" >> "$GITHUB_PATH"
           # $GITHUB_PATH подействует только со следующего шага — проверяем по пути.
-          "$RUNNER_TOOL_CACHE/zig/zig" version
+          "$ZIG_DIR/zig" version
 
-      # Кешируем только модули/джарсы/wrapper, не весь ~/.gradle/caches: туда
-      # попадают cc-keystore и прочее лишнее.
+      # Кешируем только модули/джарсы/wrapper и билд-кеш Gradle, не весь
+      # ~/.gradle/caches: туда попадают cc-keystore и прочее лишнее.
+      # gradle.properties входит в ключ: им включается build cache и меняются
+      # JVM-параметры, а старый key без него переиспользовал бы чужой кеш.
       - name: Cache Gradle dependencies
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.gradle/caches/modules-2
             ~/.gradle/caches/jars-*
+            ~/.gradle/caches/build-cache-1
             ~/.gradle/wrapper
-          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle.kts', 'gradle/wrapper/gradle-wrapper.properties') }}
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle.kts', 'gradle.properties', 'gradle/wrapper/gradle-wrapper.properties') }}
           restore-keys: |
             gradle-${{ runner.os }}-
 
@@ -194,6 +247,37 @@ jobs:
           key: cargo-client-target-${{ runner.os }}-${{ hashFiles('rust-client/Cargo.lock', 'rust-client/rust-toolchain.toml') }}
           restore-keys: |
             cargo-client-target-${{ runner.os }}-
+
+      # Каталоги cargo-ndk (build/rust-client-android-<variant>-<abi>) — самая
+      # дорогая часть клиентской сборки: без кеша три ABI × два варианта
+      # компилируются с нуля. Cargo сам инвалидирует по исходникам и флагам,
+      # поэтому кеш ускоряет только неизменённые зависимости; логи
+      # (build/rust-client-android-logs) сюда не попадают.
+      - name: Cache Rust client Android targets
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            build/rust-client-android-debug-*
+            build/rust-client-android-release-*
+          key: cargo-client-android-${{ runner.os }}-${{ hashFiles('rust-client/Cargo.lock', 'rust-client/rust-toolchain.toml', 'rust-client/build_android_abis.sh') }}
+          restore-keys: |
+            cargo-client-android-${{ runner.os }}-
+
+      # Серверный target-dir (release + LTO) и zig-кеши. Имя каталога совпадает
+      # с build_linux_variants.sh и rust-server/build_linux.sh, поэтому гейт и
+      # финальная сборка переиспользуют уже собранные зависимости. Безопасно:
+      # cargo инвалидирует по исходникам, кеш ускоряет только неизменённые
+      # зависимости.
+      - name: Cache Rust server target
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            build/csqtt-uring-linux-csqtt-linux-amd64
+            build/zig-cache
+            ~/.cache/zig
+          key: cargo-server-target-${{ runner.os }}-${{ hashFiles('rust-server/Cargo.lock', 'rust-server/rust-toolchain.toml', '.github/scripts/musl-zig-env.sh') }}
+          restore-keys: |
+            cargo-server-target-${{ runner.os }}-
 
       # --locked + --version = воспроизводимая установка. `cargo install`
       # отказывается перезаписывать уже существующий бинарь ("binary
@@ -252,6 +336,36 @@ jobs:
         run: |
           set -euo pipefail
           bash scripts/deploy_shell_tests.sh
+
+      # Фикстуры .github/tests/*.sh существовали, но в CI не запускались:
+      # регрессия в release/CI-скриптах ловилась только локально. Прогоняем
+      # все и не падаем на первом — иначе за один прогон видна одна поломка.
+      # musl-zig-env.sh здесь не хелпер, а section-тест для
+      # .github/scripts/musl-zig-env.sh (сам скрипт лишь source'ится изнутри),
+      # поэтому он входит в набор наравне с остальными.
+      - name: 'Gate: CI and release script fixtures'
+        run: |
+          set -euo pipefail
+          # workflow-skeleton.sh разбирает YAML через PyYAML, а setup-python даёт
+          # чистый интерпретатор без сторонних пакетов: без этой строки локально
+          # зелёный тест падает в CI на ModuleNotFoundError.
+          if ! python3 -c 'import yaml' >/dev/null 2>&1; then
+            python3 -m pip install --quiet --disable-pip-version-check pyyaml
+          fi
+          python3 -c 'import yaml' >/dev/null
+          status=0
+          for test in .github/tests/*.sh; do
+            printf '▶ %s\n' "$test"
+            # env -u: в CI GITHUB_OUTPUT/GITHUB_ENV заданы для каждого шага, и
+            # скрипты пишут туда вместо stdout. Фикстуры проверяют stdout, поэтому
+            # тест запускается без CI-каналов — иначе локально зелёный падает в CI.
+            if ! env -u GITHUB_OUTPUT -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_STEP_SUMMARY \
+                bash "$test"; then
+              printf '✗ %s failed\n' "$test" >&2
+              status=1
+            fi
+          done
+          exit "$status"
 
       # Нативную часть не собирает: гейт висит на merge*JniLibFolders.
       - name: 'Gate: Kotlin unit tests'

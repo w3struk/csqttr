@@ -53,7 +53,8 @@ while (($#)); do
             shift
             ;;
         --version-name)
-            version_name="${2:?--version-name requires a value}"
+            (($# >= 2)) || die "--version-name requires a value"
+            version_name="$2"
             shift 2
             ;;
         --version-name=*)
@@ -61,7 +62,8 @@ while (($#)); do
             shift
             ;;
         --version-code)
-            expected_code="${2:?--version-code requires a value}"
+            (($# >= 2)) || die "--version-code requires a value"
+            expected_code="$2"
             shift 2
             ;;
         --version-code=*)
@@ -69,7 +71,8 @@ while (($#)); do
             shift
             ;;
         --expected-commit)
-            expected_commit="${2:?--expected-commit requires a value}"
+            (($# >= 2)) || die "--expected-commit requires a value"
+            expected_commit="$2"
             shift 2
             ;;
         --expected-commit=*)

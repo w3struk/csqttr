@@ -11,6 +11,11 @@
 set -euo pipefail
 export LC_ALL=C
 
+# В CI переменные GITHUB_OUTPUT/GITHUB_ENV заданы для каждого шага, и
+# скрипты пишут туда вместо stdout. Тест проверяет именно stdout, поэтому
+# CI-каналы нужно убрать — иначе локально зелёный тест падает в прогоне.
+unset GITHUB_OUTPUT GITHUB_ENV GITHUB_PATH GITHUB_STEP_SUMMARY
+
 TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$TEST_DIR/../.." && pwd)"
 SCRIPT="$REPO_ROOT/.github/scripts/build-version.sh"
@@ -74,6 +79,12 @@ assert_key "$out" suffix "-beta.abc1234" "с суффиксом: suffix"
 assert_key "$out" base "$VERSION" "с суффиксом: base не меняется"
 
 # 3–7. Отказы.
+# Пустые значения = «читать из файла»: так release.yml/build.yml передают
+# отсутствующие override'ы; пустая строка не должна падать как «нет значения».
+out="$("$SCRIPT" --root "$REPO_ROOT" --version-name "" --version-code "" --expected-commit "")"
+assert_key "$out" version "$VERSION" "пустые override'ы: version из файла"
+assert_key "$out" version-code "$CODE" "пустые override'ы: version-code из файла"
+
 expect_fail "чужой префикс отвергнут" -- --root "$REPO_ROOT" --version-name "2.6.0-x"
 expect_fail "суффикс без дефиса отвергнут" -- --root "$REPO_ROOT" --version-name "${VERSION}0"
 expect_fail "чужой versionCode отвергнут" -- --root "$REPO_ROOT" --version-code "999999"

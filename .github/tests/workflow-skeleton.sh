@@ -1347,7 +1347,7 @@ want(
     % (version_job.get("timeout-minutes"),),
 )
 
-VERSION_OUTPUTS = {"commit", "version", "version-code", "started"}
+VERSION_OUTPUTS = {"commit", "version", "version-code", "started", "skip"}
 version_outputs = version_job.get("outputs")
 want(isinstance(version_outputs, dict), "у job'а version нет outputs")
 want(
@@ -1375,8 +1375,9 @@ version_names = [step.get("name") for step in (version_job.get("steps") or [])]
 checkout = require_step(version_by_name, "Checkout", "version")
 checkout_with = checkout.get("with") or {}
 want(
-    checkout_with.get("fetch-depth") == 1,
-    "Checkout в version обязан брать fetch-depth: 1, получено %r"
+    checkout_with.get("fetch-depth") == 0,
+    "Checkout в version обязан брать fetch-depth: 0 (нужны теги, чтобы "
+    "пропускать релизные коммиты), получено %r"
     % (checkout_with.get("fetch-depth"),),
 )
 want(
@@ -1403,6 +1404,18 @@ for fragment in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "exit 1"):
         "Check bot configuration обязан падать на пустом %s, получено:\n%s"
         % (fragment, bot_run),
     )
+
+tag_check = require_step(version_by_name, "Skip when the commit is released", "tags")
+want(tag_check.get("id") == "tags", "у 'Skip when the commit is released' должен быть id: tags")
+want(
+    "git tag --points-at HEAD" in str(tag_check.get("run", "")),
+    "'Skip when the commit is released' обязан проверять git tag --points-at HEAD",
+)
+want(
+    version_names.index("Skip when the commit is released")
+    < version_names.index("Resolve beta version"),
+    "проверка тега обязана идти до Resolve beta version",
+)
 
 resolve = require_step(version_by_name, "Resolve beta version", "version")
 want(resolve.get("id") == "version", "у 'Resolve beta version' должен быть id: version")
@@ -1431,6 +1444,11 @@ want(isinstance(build_job, dict), "job build — не mapping")
 want(
     needs_list(build_job) == ["version"],
     "build.needs обязан быть ['version'], получено %r" % (build_job.get("needs"),),
+)
+want(
+    build_job.get("if") == "needs.version.outputs.skip != 'true'",
+    "build обязан пропускаться для тегированного коммита, получено %r"
+    % (build_job.get("if"),),
 )
 want(
     build_job.get("uses") == "./.github/workflows/build.yml",
