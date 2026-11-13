@@ -1,6 +1,6 @@
 <div align="center">
 
-# CSQTT-Rebirth
+# reCSQTT
 
 <br>
 
@@ -12,9 +12,13 @@
 
 <br>
 
-**CSQTT** — Android-приложение и сервер для защищённого туннеля поверх TURN/RTP.
+**reCSQTT** — Android-приложение и сервер для защищённого туннеля поверх TURN/RTP.
 Клиент поднимает локальный интерфейс на устройстве, маскируя транспорт под
 зашифрованный медиатрафик звонка.
+
+reCSQTT — новое имя проекта; прежнее имя CSQTT сохранено в контрактах: package id
+`csqtt.quic.amurcanov`, ссылки `csqtt://`, пути `/etc/csqtt`, env `CSQTT_*`, юниты и
+бинарники. Обновление существующих установок и APK выполняется поверх, без миграции.
 
 **Кросс-проекты с поддержкой CSQTT:**
 - Windows & Linux порт — [luminescq/focsq](https://github.com/luminescq/focsq)
@@ -44,24 +48,24 @@ One-liner (скачивает `bootstrap.sh` последнего релиза, 
 базовую систему, поэтому он и стоит первым — `curl` там опционален:
 
 ```bash
-sudo bash -c "$(wget -qO- https://github.com/w3struk/csqttr/releases/latest/download/bootstrap.sh)"
+sudo bash -c "$(wget -qO- https://github.com/w3struk/recsqtt/releases/latest/download/bootstrap.sh)"
 ```
 
 Если `wget` нет (Alpine, урезанные образы), тот же скрипт забирается через `curl`:
 
 ```bash
-sudo bash -c "$(curl -fsSL https://github.com/w3struk/csqttr/releases/latest/download/bootstrap.sh)"
+sudo bash -c "$(curl -fsSL https://github.com/w3struk/recsqtt/releases/latest/download/bootstrap.sh)"
 ```
 
 Неинтерактивная установка (CI, cloud-init) — флаги установщика идут после `--`:
 
 ```bash
-sudo bash -c "$(wget -qO- https://github.com/w3struk/csqttr/releases/latest/download/bootstrap.sh)" -- --yes
+sudo bash -c "$(wget -qO- https://github.com/w3struk/recsqtt/releases/latest/download/bootstrap.sh)" -- --yes
 ```
 
 `bootstrap.sh` тонкий: он скачивает `install.sh` и `SHA256SUMS` того же релиза,
 сверяет SHA-256 и запускает установщик с переданными аргументами (например,
-`--version v2.5.2` пинит версию). Если вы уже root, `sudo` не нужен:
+`--version v2.5.4` пинит версию). Если вы уже root, `sudo` не нужен:
 `bash -c "$(wget …)"`. Не используйте `wget … | sudo bash`: пайп занимает
 stdin, и интерактивные вопросы установщика (`--host`, пароль панели) ломаются.
 Без `--yes` нужен настоящий TTY; `--yes` — неинтерактивный режим.
@@ -106,7 +110,7 @@ Debian 13 Minimal `wget` и `ca-certificates` уже входят в базов�
 Скачать `install.sh` вручную (отладка или офлайн-запуск уже скачанного файла):
 
 ```bash
-wget -qO install.sh https://github.com/w3struk/csqttr/releases/latest/download/install.sh
+wget -qO install.sh https://github.com/w3struk/recsqtt/releases/latest/download/install.sh
 sudo bash install.sh --yes
 ```
 

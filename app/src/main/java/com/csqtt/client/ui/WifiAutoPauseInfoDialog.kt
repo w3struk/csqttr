@@ -46,7 +46,7 @@ internal fun WifiAutoPauseInfoDialog(onDismiss: () -> Unit) {
                     fontWeight = FontWeight.Bold,
                 )
                 Text(
-                    "Когда функция включена и устройство подключается к Wi-Fi, CSQTT переходит в ожидание и отключает свой VPN-сервис. После отключения Wi-Fi CSQTT автоматически возвращается к обычному подключению, если до паузы он был включён.\n\nПо умолчанию функция выключена.",
+                    "Когда функция включена и устройство подключается к Wi-Fi, reCSQTT переходит в ожидание и отключает свой VPN-сервис. После отключения Wi-Fi reCSQTT автоматически возвращается к обычному подключению, если до паузы он был включён.\n\nПо умолчанию функция выключена.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     lineHeight = 16.sp,

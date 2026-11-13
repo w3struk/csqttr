@@ -192,7 +192,7 @@ out_dir="$(dirname -- "$out")"
 
 note="$(
     {
-        printf '## CSQTT %s\n\n' "$version"
+        printf '## reCSQTT %s\n\n' "$version"
         printf 'Тег: %s\n' "$tag"
         printf 'Версия: %s (versionCode %s)\n' "$version" "$version_code"
         printf 'Коммит: %s (%s)\n' "$commit" "$short_commit"
@@ -201,19 +201,19 @@ note="$(
 
         printf 'Приложение:\n'
         printf '%s\n' \
-            "- CSQTT-$version-universal.apk" \
-            "- CSQTT-$version-arm64-v8a.apk" \
-            "- CSQTT-$version-armeabi-v7a.apk"
+            "- recsqtt-$version-universal.apk" \
+            "- recsqtt-$version-arm64-v8a.apk" \
+            "- recsqtt-$version-armeabi-v7a.apk"
 
         printf '\nСервер:\n'
-        printf '%s\n' '- csqtt-linux-amd64'
+        printf '%s\n' '- recsqtt-linux-amd64'
 
-        printf '\nКонтейнерный образ: ghcr.io/%s/csqtt:%s (amd64)\n\n' \
+        printf '\nКонтейнерный образ: ghcr.io/%s/recsqtt:%s (amd64)\n\n' \
             "${repo_slug%%/*}" "$version"
 
         printf 'Контрольные суммы: SHA256SUMS\n\n'
         # GitHub не хранит режим файла в ассетах: без chmod бинарь не запустится.
-        printf 'Права после скачивания: chmod +x csqtt-linux-amd64\n\n'
+        printf 'Права после скачивания: chmod +x recsqtt-linux-amd64\n\n'
 
         printf 'Установщик: bootstrap.sh → install.sh\n\n'
         printf 'Установка:\n'

@@ -46,7 +46,7 @@ chmod +x "$TMP/bin/curl"
 printf '{"ok":true,"result":{"message_id":42,"chat":{"id":-1001234567890}}}' >"$TMP/body-ok.json"
 printf '{"ok":false,"error_code":403,"description":"Forbidden: bot is not a member of the channel chat"}' >"$TMP/body-err.json"
 
-printf 'CSQTT 2.5.1-beta.abc1234 | коммит abc1234' >"$TMP/caption.txt"
+printf 'reCSQTT 2.5.1-beta.abc1234 | коммит abc1234' >"$TMP/caption.txt"
 printf 'apk-bytes' >"$TMP/beta.apk"
 
 export PATH="$TMP/bin:$PATH"

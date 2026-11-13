@@ -112,7 +112,7 @@ ok
 [[ -f "$NOTE" ]] || fail "note file was not created: $NOTE"
 ok
 
-assert_line "$NOTE" "^## CSQTT ${VERSION//./\\.}\$" "heading is the Gradle version"
+assert_line "$NOTE" "^## reCSQTT ${VERSION//./\\.}\$" "heading is the Gradle version"
 assert_line "$NOTE" "^Тег: v2\.5\.1\$" "tag line"
 assert_line "$NOTE" "^Версия: ${VERSION//./\\.} \(versionCode ${VERSION_CODE}\)\$" \
     "version and versionCode"
@@ -120,17 +120,17 @@ assert_line "$NOTE" "^Коммит: ${HEAD_SHA} \(${HEAD_SHA:0:7}\)\$" "commit l
 assert_line "$NOTE" '^Длительность сборки: 12m 34s$' "duration is formatted as Nm Ss"
 assert_line "$NOTE" "^Wire-ревизия: ${WIRE_REVISION//./\\.}\$" "wire revision from rust-server/main.rs"
 assert_line "$NOTE" "^Приложение:\$" "app section header"
-assert_line "$NOTE" "^- CSQTT-${VERSION//./\\.}-universal\.apk\$" "universal APK listed"
-assert_line "$NOTE" "^- CSQTT-${VERSION//./\\.}-arm64-v8a\.apk\$" "arm64 APK listed"
-assert_line "$NOTE" "^- CSQTT-${VERSION//./\\.}-armeabi-v7a\.apk\$" "armeabi-v7a APK listed"
+assert_line "$NOTE" "^- recsqtt-${VERSION//./\\.}-universal\.apk\$" "universal APK listed"
+assert_line "$NOTE" "^- recsqtt-${VERSION//./\\.}-arm64-v8a\.apk\$" "arm64 APK listed"
+assert_line "$NOTE" "^- recsqtt-${VERSION//./\\.}-armeabi-v7a\.apk\$" "armeabi-v7a APK listed"
 assert_line "$NOTE" '^Сервер:$' "server section header"
-assert_line "$NOTE" '^- csqtt-linux-amd64$' "amd64 binary listed"
-assert_no_line "$NOTE" '^- csqtt-linux-arm64$' "arm64 server binary is not listed"
-assert_no_line "$NOTE" '^- csqtt-linux-armv7$' "armv7 server binary is not listed"
-assert_line "$NOTE" '^Контейнерный образ: ghcr\.io/[^/]+/csqtt:[0-9]+\.[0-9]+\.[0-9]+ \(amd64\)$' \
+assert_line "$NOTE" '^- recsqtt-linux-amd64$' "amd64 binary listed"
+assert_no_line "$NOTE" '^- recsqtt-linux-arm64$' "arm64 server binary is not listed"
+assert_no_line "$NOTE" '^- recsqtt-linux-armv7$' "armv7 server binary is not listed"
+assert_line "$NOTE" '^Контейнерный образ: ghcr\.io/[^/]+/recsqtt:[0-9]+\.[0-9]+\.[0-9]+ \(amd64\)$' \
     "container image is listed with version and amd64" 
 assert_line "$NOTE" '^Контрольные суммы: SHA256SUMS$' "checksums line"
-assert_line "$NOTE" '^Права после скачивания: chmod \+x csqtt-linux-amd64$' "chmod hint names only the amd64 server"
+assert_line "$NOTE" '^Права после скачивания: chmod \+x recsqtt-linux-amd64$' "chmod hint names only the amd64 server"
 assert_line "$NOTE" '^Установщик: bootstrap\.sh → install\.sh$' "one-liner starts from bootstrap.sh"
 assert_line "$NOTE" '^Установка:$' "install section header"
 assert_line "$NOTE" '^- sudo bash install\.sh ' "installer is run via bash, not ./install.sh"
@@ -237,7 +237,7 @@ bash "$SUT" --root "$PARTIAL_ROOT" --tag v2.5.1 --commit "$HEAD_SHA" \
     --duration-seconds 754 --wire-revision CSQTT-WIRE-3 --out "$TMP/partial.md" >/dev/null ||
     fail "explicit --wire-revision must not need rust-server/main.rs"
 ok
-assert_line "$TMP/partial.md" '^## CSQTT 1\.0\.0$' "version from the partial Gradle file"
+assert_line "$TMP/partial.md" '^## reCSQTT 1\.0\.0$' "version from the partial Gradle file"
 assert_line "$TMP/partial.md" '^Версия: 1\.0\.0 \(versionCode 7\)$' "versionCode from the partial Gradle file"
 
 # A failed run must not leave a note behind for the publish step to upload.

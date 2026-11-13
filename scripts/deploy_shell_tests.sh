@@ -422,7 +422,7 @@ case "$cmd" in
                 ;;
             *)
                 # docker_container_runs_csqtt: имя|образ|... — достаточно, чтобы
-                # контейнер распознавался как CSQTT.
+                # контейнер распознавался как наш runtime (имя/образ `csqtt`).
                 printf '/%s|%s|null|null|\n' "$(cat "$cdir/name")" "$(cat "$cdir/image_tag")"
                 ;;
         esac
@@ -787,8 +787,8 @@ t_stub_stdout() {
 }
 
 # t_http_fixture <url> <content> — кладёт ответ для заглушки curl.
-# Путь фикстуры повторяет URL без схемы: https://github.com/w3struk/csqttr/releases/download/v2.5.2/install.sh
-# -> $STUB_STATE_DIR/http/github.com/w3struk/csqttr/releases/download/v2.5.2/install.sh.
+# Путь фикстуры повторяет URL без схемы: https://github.com/w3struk/recsqtt/releases/download/v2.5.2/install.sh
+# -> $STUB_STATE_DIR/http/github.com/w3struk/recsqtt/releases/download/v2.5.2/install.sh.
 t_http_fixture() {
     local url="$1" content="$2" path
     path="${url#*://}"
@@ -2284,7 +2284,7 @@ test_binary_with_explicit_checksum_is_accepted() {
 
 test_release_redirect_resolves_tag() {
     t_begin "release redirect resolves the tag"
-    t_http_redirect "https://github.com/w3struk/csqttr/releases/tag/v2.5.2"
+    t_http_redirect "https://github.com/w3struk/recsqtt/releases/tag/v2.5.2"
     local out
     out="$(t_run 'resolve_release_tag')"
     t_assert_eq "$out" "v2.5.2" "тег обязан извлекаться из /tag/ redirect"
@@ -2292,7 +2292,7 @@ test_release_redirect_resolves_tag() {
 }
 
 test_prepare_installer_source_downloads_and_verifies() {    t_begin "prepare installer source downloads and verifies"
-    local base="https://github.com/w3struk/csqttr" tag="v2.5.2" content digest out
+    local base="https://github.com/w3struk/recsqtt" tag="v2.5.2" content digest out
     content="$(
         printf '%s\n' '#!/usr/bin/env bash'
         printf '%s\n' 'echo downloaded'
@@ -2312,7 +2312,7 @@ test_prepare_installer_source_downloads_and_verifies() {    t_begin "prepare ins
 
 test_prepare_installer_source_rejects_bad_checksum() {
     t_begin "prepare installer source rejects bad checksum"
-    local base="https://github.com/w3struk/csqttr" tag="v2.5.2"
+    local base="https://github.com/w3struk/recsqtt" tag="v2.5.2"
     t_http_fixture "$base/releases/download/$tag/install.sh" '#!/usr/bin/env bash
 echo downloaded'
     t_http_fixture "$base/releases/download/$tag/SHA256SUMS" "0000000000000000000000000000000000000000000000000000000000000000  install.sh"
@@ -3333,7 +3333,7 @@ test_certificate_without_openssl_is_not_user_managed() {
             builtin command "$@"
         }
         web_certificate_is_user_managed
-    ' "без openssl сертификат CSQTT нельзя объявить пользовательским"
+    ' "без openssl сертификат reCSQTT нельзя объявить пользовательским"
     return 0
 }
 
@@ -3384,14 +3384,14 @@ test_web_probe_uses_installer_work_dir() {
 
 test_install_order_checksum_before_cleanup() {
     t_begin "checksum failure stops before cleanup"
-    local base="https://github.com/w3struk/csqttr" tag="v2.5.2" binary digest marks status=0 out
+    local base="https://github.com/w3struk/recsqtt" tag="v2.5.2" binary digest marks status=0 out
     binary='#!/usr/bin/env bash
 printf "csqtt 2.5.2\n"'
     digest="$(printf '%s\n' "$binary" | sha256sum | awk '{print $1}')"
     : "$digest"
-    t_http_fixture "$base/releases/download/$tag/csqtt-linux-amd64" "$binary"
+    t_http_fixture "$base/releases/download/$tag/recsqtt-linux-amd64" "$binary"
     t_http_fixture "$base/releases/download/$tag/SHA256SUMS" \
-        "0000000000000000000000000000000000000000000000000000000000000000  csqtt-linux-amd64"
+        "0000000000000000000000000000000000000000000000000000000000000000  recsqtt-linux-amd64"
     marks="$SANDBOX/order"
     t_install_stage_stubs "$SANDBOX/stages.sh" "$marks"
     out="$(t_run "
@@ -3480,12 +3480,12 @@ test_reconfigure_bypasses_same_version_noop() {
 
 test_release_verified_before_cleanup() {
     t_begin "release is verified before cleanup"
-    local base="https://github.com/w3struk/csqttr" tag="v2.5.2" binary digest marks status=0 out
+    local base="https://github.com/w3struk/recsqtt" tag="v2.5.2" binary digest marks status=0 out
     binary='#!/usr/bin/env bash
 printf "csqtt 2.5.2\n"'
     digest="$(printf '%s\n' "$binary" | sha256sum | awk '{print $1}')"
-    t_http_fixture "$base/releases/download/$tag/csqtt-linux-amd64" "$binary"
-    t_http_fixture "$base/releases/download/$tag/SHA256SUMS" "$digest  csqtt-linux-amd64"
+    t_http_fixture "$base/releases/download/$tag/recsqtt-linux-amd64" "$binary"
+    t_http_fixture "$base/releases/download/$tag/SHA256SUMS" "$digest  recsqtt-linux-amd64"
     marks="$SANDBOX/order"
     t_install_stage_stubs "$SANDBOX/stages.sh" "$marks"
     out="$(t_run "
@@ -3501,7 +3501,7 @@ printf "csqtt 2.5.2\n"'
     printf '%s' "$out" | grep -Fq 'CLEANUP_REACHED' || \
         t_fail "после успешной проверки установка обязана дойти до cleanup (вывод: $out)"
     t_assert_before "$marks" "snapshot" "cleanup" "snapshot обязан идти до cleanup"
-    [ -x "$CSQTT_WORK_DIR/csqtt-linux-amd64" ] || \
+    [ -x "$CSQTT_WORK_DIR/recsqtt-linux-amd64" ] || \
         t_fail "проверенный CANDIDATE_BINARY обязан оставаться в work-dir"
     return 0
 }
@@ -3790,7 +3790,7 @@ main() {
             fi
         done
     fi
-    printf 'CSQTT install.sh behavioural tests\n'
+    printf 'reCSQTT install.sh behavioural tests\n'
     printf 'install.sh: %s\n' "$DEPLOY_SCRIPT"
     for test_name in "${selected[@]}"; do
         printf '\n▶ %s\n' "$test_name"

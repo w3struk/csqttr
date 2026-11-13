@@ -35,7 +35,7 @@ concurrency:
 #   2. `Record start time` переехал в resolve и отдаётся выходом started;
 #      длительность в note покрывает весь пайплайн, а не один job.
 #   3. Артефакт прогона называется release-assets-<version> (без `v`), а не
-#      release-assets-<tag>; внутри — apk/ и assets/, а не готовые CSQTT-*.apk.
+#      release-assets-<tag>; внутри — apk/ и assets/, а не готовые recsqtt-*.apk.
 #   4. `Collect release assets`, `Generate release note`, dry-run и публикация
 #      живут в отдельном job'е publish и берут версию/подпись из выходов build.
 #      Поэтому подстановки идут через needs.resolve.outputs.* и
@@ -138,11 +138,13 @@ jobs:
 
       # Dockerfile делает `COPY csqtt /usr/local/bin/csqtt` при контексте
       # docker/, поэтому бинарь из assets/ артефакта кладём рядом с ним.
+      # Внутреннее имя бинаря остаётся csqtt (контракт Dockerfile и entrypoint),
+      # меняется только имя релизного ассета.
       - name: Stage server binary
         run: |
           set -euo pipefail
           install -m 0755 \
-            "$RUNNER_TEMP/build-output/assets/csqtt-linux-amd64" \
+            "$RUNNER_TEMP/build-output/assets/recsqtt-linux-amd64" \
             docker/csqtt
           file docker/csqtt
 
@@ -159,7 +161,7 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ github.token }}
 
-      # Имя образа — ghcr.io/<owner>/csqtt; github.repository_owner отдаёт
+      # Имя образа — ghcr.io/<owner>/recsqtt; github.repository_owner отдаёт
       # владельца в нижнем регистре, как требует GHCR.
       - name: Build and push image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -169,8 +171,8 @@ jobs:
           platforms: linux/amd64
           push: ${{ needs.resolve.outputs.dry_run == 'false' }}
           tags: |
-            ghcr.io/${{ github.repository_owner }}/csqtt:${{ needs.resolve.outputs.version }}
-            ghcr.io/${{ github.repository_owner }}/csqtt:latest
+            ghcr.io/${{ github.repository_owner }}/recsqtt:${{ needs.resolve.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/recsqtt:latest
 
   publish:
     name: Publish release
@@ -253,7 +255,7 @@ jobs:
           done
           bash .github/scripts/publish-release.sh \
             --tag "${{ needs.resolve.outputs.tag }}" \
-            --title "CSQTT ${{ needs.resolve.outputs.version }}" \
+            --title "reCSQTT ${{ needs.resolve.outputs.version }}" \
             --note-file "$RUNNER_TEMP/release-note.md" \
             "${asset_args[@]}" \
             --dry-run
@@ -277,6 +279,6 @@ jobs:
           done
           bash .github/scripts/publish-release.sh \
             --tag "${{ needs.resolve.outputs.tag }}" \
-            --title "CSQTT ${{ needs.resolve.outputs.version }}" \
+            --title "reCSQTT ${{ needs.resolve.outputs.version }}" \
             --note-file "$RUNNER_TEMP/release-note.md" \
             "${asset_args[@]}"

@@ -37,7 +37,7 @@ internal object LinkSaveNotice {
     /** Тост после импорта конфигурации по deep-link `csqtt://`. */
     fun configToast(outcome: LinkSaveOutcome): String =
         when (outcome) {
-            LinkSaveOutcome.SAVED -> "Конфигурация CSQTT сохранена ✓"
-            LinkSaveOutcome.FAILED -> "Не удалось сохранить конфигурацию CSQTT"
+            LinkSaveOutcome.SAVED -> "Конфигурация reCSQTT сохранена ✓"
+            LinkSaveOutcome.FAILED -> "Не удалось сохранить конфигурацию reCSQTT"
         }
 }

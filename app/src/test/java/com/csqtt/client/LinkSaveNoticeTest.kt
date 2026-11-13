@@ -52,8 +52,8 @@ class LinkSaveNoticeTest {
 
     @Test
     fun `config toast texts are exact`() {
-        assertEquals("Конфигурация CSQTT сохранена ✓", LinkSaveNotice.configToast(LinkSaveOutcome.SAVED))
-        assertEquals("Не удалось сохранить конфигурацию CSQTT", LinkSaveNotice.configToast(LinkSaveOutcome.FAILED))
+        assertEquals("Конфигурация reCSQTT сохранена ✓", LinkSaveNotice.configToast(LinkSaveOutcome.SAVED))
+        assertEquals("Не удалось сохранить конфигурацию reCSQTT", LinkSaveNotice.configToast(LinkSaveOutcome.FAILED))
     }
 
     // --- Структурные проверки экранов ------------------------------------
@@ -73,8 +73,8 @@ class LinkSaveNoticeTest {
     @Test
     fun `deep-link import no longer claims the configuration was connected`() {
         assertFalse(
-            "MainActivity всё ещё печатает «Конфигурация CSQTT успешно подключена»",
-            mainActivitySource.contains("Конфигурация CSQTT успешно подключена"),
+            "MainActivity всё ещё печатает «Конфигурация reCSQTT успешно подключена»",
+            mainActivitySource.contains("Конфигурация reCSQTT успешно подключена"),
         )
         assertTrue(
             "MainActivity не использует LinkSaveNotice",

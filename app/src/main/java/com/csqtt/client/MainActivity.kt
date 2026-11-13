@@ -201,11 +201,11 @@ class MainActivity : ComponentActivity() {
         val raw = intent.dataString ?: return
         val link = parseCsqttLink(raw)
         if (link == null) {
-            showRaisedToast("Неверная ссылка CSQTT", Toast.LENGTH_SHORT)
+            showRaisedToast("Неверная ссылка reCSQTT", Toast.LENGTH_SHORT)
             return
         }
         android.app.AlertDialog.Builder(this)
-            .setTitle("Импорт конфигурации CSQTT")
+            .setTitle("Импорт конфигурации reCSQTT")
             .setMessage("Хост: ${link.host}\nПорт: ${link.port}\n\nЗаменить текущую конфигурацию?")
             .setPositiveButton("Импортировать") { _, _ ->
                 lifecycleScope.launch {

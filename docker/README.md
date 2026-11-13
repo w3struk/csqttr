@@ -1,4 +1,4 @@
-# CSQTT в Docker Compose
+# reCSQTT в Docker Compose
 
 Образ из GHCR разворачивает сервер **с нуля**: при первом `up` контейнер сам
 создаёт identity панели, `install.json`, self-signed сертификат и каталог
@@ -35,7 +35,7 @@ docker logs csqtt
 например:
 
 ```
-Панель CSQTT готова (пароль показан один раз):
+Панель reCSQTT готова (пароль показан один раз):
   URL:     https://203.0.113.7:46002/k3f9a1c7d2e4b8f0
   Логин:   a1b2c3d4e5
   Пароль:  ...
@@ -120,7 +120,7 @@ docker compose restart csqtt
 ## Обновление
 
 ```bash
-# в .env: CSQTT_IMAGE=ghcr.io/w3struk/csqtt:<новая версия>
+# в .env: CSQTT_IMAGE=ghcr.io/w3struk/recsqtt:<новая версия>
 docker compose pull
 docker compose up -d
 ```

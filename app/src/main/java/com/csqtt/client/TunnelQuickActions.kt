@@ -45,13 +45,13 @@ internal suspend fun toggleTunnelFromQuickAction(context: Context, openMain: () 
         return
     }
     if (VpnService.prepare(context) != null) {
-        context.showRaisedToast("Откройте CSQTT и выдайте VPN-разрешение", Toast.LENGTH_LONG)
+        context.showRaisedToast("Откройте reCSQTT и выдайте VPN-разрешение", Toast.LENGTH_LONG)
         openMain()
         return
     }
     val startIntent = buildQuickStartIntent(context)
     if (startIntent == null) {
-        context.showRaisedToast("Заполните настройки подключения в CSQTT", Toast.LENGTH_LONG)
+        context.showRaisedToast("Заполните настройки подключения в reCSQTT", Toast.LENGTH_LONG)
         openMain()
         return
     }

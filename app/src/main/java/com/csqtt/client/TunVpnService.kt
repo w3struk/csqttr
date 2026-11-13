@@ -291,7 +291,7 @@ class TunVpnService : VpnService() {
             // Builder и PM остаются вне мониторов. Даже кандидат на reuse
             // собирается из успешных add*, а не из зеркала желаемого правила.
             val builder = Builder()
-                .setSession("CSQTT")
+                .setSession("reCSQTT")
                 .setMtu(mtu)
                 .addAddress(canonicalClientIp, 32)
                 .addRoute("0.0.0.0", 0)
@@ -398,7 +398,7 @@ class TunVpnService : VpnService() {
                         recorder.application(selfPackage)
                     } catch (e: Exception) {
                         Log.e(TAG, "Unable to exclude CSQTT UID from its VPN", e)
-                        failVpn("Android не разрешил исключить CSQTT из собственного VPN", start)
+                        failVpn("Android не разрешил исключить reCSQTT из собственного VPN", start)
                         return
                     }
                     if (appsPlan.deviceWide) {

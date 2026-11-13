@@ -1,7 +1,7 @@
 package com.csqtt.client
 
 internal enum class ConnectionStartBlocker(val message: String) {
-    Link("нужна корректная ссылка CSQTT"),
+    Link("нужна корректная ссылка reCSQTT"),
     Hashes("нет действующих VK хешей или VK токена"),
 }
 

@@ -52,7 +52,7 @@ apk_version() {
     printf '%s' "${versions%%$'\n'*}"
 }
 
-echo "=== CSQTT APK Build Script ==="
+echo "=== reCSQTT APK Build Script ==="
 echo "=== Output: 4 APKs (universal, arm64-v8a, armeabi-v7a, x86_64) ==="
 echo
 
@@ -119,7 +119,7 @@ if [[ -z "$APK_VERSION" ]]; then
 fi
 
 # Stale split from the x86 era is never produced anymore.
-rm -f "$APK_DIR/app-x86-release.apk" "$APK_DIR"/app-*-x86-release.apk "$RELEASE_DIR/CSQTT-x86.apk"
+rm -f "$APK_DIR/app-x86-release.apk" "$APK_DIR"/app-*-x86-release.apk "$RELEASE_DIR/recsqtt-x86.apk"
 
 human_size() {
     awk -v bytes="$1" 'BEGIN {
@@ -137,7 +137,7 @@ human_size() {
 copy_apk() {
     local abi="$1" src dst bytes
     src="$APK_DIR/app-$APK_VERSION-$abi-release.apk"
-    dst="$RELEASE_DIR/CSQTT-$APK_VERSION-$abi.apk"
+    dst="$RELEASE_DIR/recsqtt-$APK_VERSION-$abi.apk"
     if [[ -f "$src" ]]; then
         cp -f "$src" "$dst"
         bytes="$(stat -c %s "$dst")"
@@ -152,7 +152,10 @@ copy_apk() {
 # APKs behind if one of the splits turns out to be missing. Every version goes,
 # not just the current one, so an older release never lingers next to a newer one.
 for abi in universal arm64-v8a armeabi-v7a x86_64; do
-    rm -f "$RELEASE_DIR/CSQTT-$abi.apk" "$RELEASE_DIR"/CSQTT-*"-$abi.apk"
+    rm -f "$RELEASE_DIR/recsqtt-$abi.apk" "$RELEASE_DIR"/recsqtt-*"-$abi.apk"
+    # The old asset prefix (CSQTT-*) predates the rename: without it an older
+    # release built before the rename would linger next to the new one.
+    rm -f "$RELEASE_DIR"/CSQTT-*"-$abi.apk"
 done
 
 MISSING=0
@@ -167,10 +170,10 @@ echo
 echo "=== DONE ==="
 echo "Output directory: app/release/"
 echo
-echo "  CSQTT-$APK_VERSION-universal.apk    - all architectures in one APK"
-echo "  CSQTT-$APK_VERSION-arm64-v8a.apk    - 64-bit ARM only"
-echo "  CSQTT-$APK_VERSION-armeabi-v7a.apk  - 32-bit ARM only"
-echo "  CSQTT-$APK_VERSION-x86_64.apk       - 64-bit x86 only"
+echo "  recsqtt-$APK_VERSION-universal.apk    - all architectures in one APK"
+echo "  recsqtt-$APK_VERSION-arm64-v8a.apk    - 64-bit ARM only"
+echo "  recsqtt-$APK_VERSION-armeabi-v7a.apk  - 32-bit ARM only"
+echo "  recsqtt-$APK_VERSION-x86_64.apk       - 64-bit x86 only"
 echo
 
 if ((MISSING > 0)); then

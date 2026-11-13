@@ -272,7 +272,7 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
-            build/csqtt-uring-linux-csqtt-linux-amd64
+            build/csqtt-uring-linux-recsqtt-linux-amd64
             build/zig-cache
             ~/.cache/zig
           key: cargo-server-target-${{ runner.os }}-${{ hashFiles('rust-server/Cargo.lock', 'rust-server/rust-toolchain.toml', '.github/scripts/musl-zig-env.sh') }}
@@ -406,11 +406,11 @@ jobs:
       # Серверный бинарник упаковывался в APK только пока приложение умело
       # разворачивать сервер. Теперь он публикуется отдельным ассетом, поэтому
       # CI собирает его здесь: collect-release-assets.sh у вызывающего читает
-      # app/build/generated/assets/csqtt-linux-amd64.
+      # app/build/generated/assets/recsqtt-linux-amd64.
       #
       # --tests: fmt/clippy/test живут в этом же шаге и в том же
       # CARGO_TARGET_DIR, что и сама сборка
-      # (build/csqtt-uring-linux-csqtt-linux-amd64), поэтому clippy и zigbuild
+      # (build/csqtt-uring-linux-recsqtt-linux-amd64), поэтому clippy и zigbuild
       # делят собранные зависимости. Свой CARGO_TARGET_DIR здесь задавать
       # нельзя — он снова развёл бы каталоги и удвоил компиляцию.
       # musl-zig-env.sh даёт cc-rs musl C/C++ (без него cc-rs падает:
@@ -495,7 +495,7 @@ jobs:
           rm -rf "$STAGE"
           mkdir -p "$STAGE/apk" "$STAGE/assets"
           cp -f app/build/outputs/apk/release/*.apk "$STAGE/apk/"
-          cp -f app/build/generated/assets/csqtt-linux-amd64 "$STAGE/assets/"
+          cp -f app/build/generated/assets/recsqtt-linux-amd64 "$STAGE/assets/"
           compgen -G "$STAGE/apk/*.apk" > /dev/null || {
             echo "no APK produced in app/build/outputs/apk/release" >&2
             exit 1
@@ -512,7 +512,9 @@ jobs:
           status=0
           for f in "$STAGE"/apk/*.apk; do
             [[ -f $f ]] || continue
-            if unzip -l "$f" | grep -E 'assets/(csqtt-linux-amd64|deploy\.sh)'; then
+            # Both the current and the pre-rebrand server asset name are
+            # rejected: the APK must never carry a server payload under either.
+            if unzip -l "$f" | grep -E 'assets/(recsqtt-linux-amd64|csqtt-linux-amd64|deploy\.sh)'; then
               echo "unexpected server payload in $f" >&2
               status=1
             fi

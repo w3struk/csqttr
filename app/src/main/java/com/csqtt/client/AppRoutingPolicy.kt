@@ -289,7 +289,7 @@ internal object VpnAppRouting {
                 add("оранжевые приложения не разрешены пользователем" to Fix.USER)
             }
             if (installedRule.all { it in transportPackages }) {
-                add("все выбранные приложения — транспортные пакеты CSQTT" to Fix.SERVER)
+                add("все выбранные приложения — транспортные пакеты reCSQTT" to Fix.SERVER)
             }
             if (userExcludedInstalled.isNotEmpty()) {
                 add("вы исключили установленные приложения правила" to Fix.USER_EXCLUSIONS)

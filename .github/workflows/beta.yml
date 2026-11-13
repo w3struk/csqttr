@@ -175,7 +175,7 @@ jobs:
             exit 1
           }
           mkdir -p "$RUNNER_TEMP/telegram"
-          dst="$RUNNER_TEMP/telegram/CSQTT-${VERSION}-arm64-v8a.apk"
+          dst="$RUNNER_TEMP/telegram/recsqtt-${VERSION}-arm64-v8a.apk"
           cp -f "${matches[0]}" "$dst"
 
           # HTML-разметка нужна ради ссылки на коммит, поэтому текст, который
@@ -197,7 +197,7 @@ jobs:
           server_url="${GITHUB_SERVER_URL:-https://github.com}"
 
           {
-            printf 'CSQTT Beta\n\n'
+            printf 'reCSQTT Beta\n\n'
             printf 'Version: %s (%s)\n' "$VERSION" "$VERSION_CODE"
             printf 'APK: %s\n\n' "$(basename -- "$dst")"
             # Приложение — только участник: сервер в APK не едет и из

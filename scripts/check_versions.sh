@@ -163,7 +163,7 @@ fi
 MAIN_RS="$ROOT/rust-server/main.rs"
 if require_file "$MAIN_RS"; then
     check_version "$MAIN_RS (баннер)" \
-        "$(sed -n 's/.* CSQTT Server \([0-9][0-9.]*\).*/\1/p' "$MAIN_RS" | head -n 1)"
+        "$(sed -n 's/.* reCSQTT Server \([0-9][0-9.]*\).*/\1/p' "$MAIN_RS" | head -n 1)"
 fi
 
 WEB_PANEL="$ROOT/rust-server/web_panel.rs"

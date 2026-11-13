@@ -147,7 +147,7 @@ private fun LogsTerminal() {
                         currentLogs.map { LogTimestampPolicy.copyLine(it) },
                     )
                     val clipboard = context.getSystemService(ClipboardManager::class.java)
-                    clipboard?.setPrimaryClip(ClipData.newPlainText("CSQTT Report", text))
+                    clipboard?.setPrimaryClip(ClipData.newPlainText("reCSQTT Report", text))
                     if (clipboard != null) {
                         context.showRaisedToast(
                             if (currentLogs.isEmpty()) reportCopiedMessage else logsReportCopiedMessage,

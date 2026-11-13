@@ -468,7 +468,7 @@ internal fun SettingsTabContent(
                         text = if (linkText.isBlank()) {
                             "Вставьте ссылку csqtt:// из панели"
                         } else {
-                            "Неверная ссылка CSQTT v2"
+                            "Неверная ссылка reCSQTT v2"
                         },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.error,

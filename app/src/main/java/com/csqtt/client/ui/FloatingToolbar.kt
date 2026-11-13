@@ -83,7 +83,7 @@ fun FloatingToolbar(
                         Toast.makeText(context, LinkSaveNotice.linkToast(outcome), Toast.LENGTH_LONG).show()
                     }
                 } else {
-                    Toast.makeText(context, "QR-код не содержит ссылку CSQTT", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "QR-код не содержит ссылку reCSQTT", Toast.LENGTH_SHORT).show()
                 }
             }
         )
