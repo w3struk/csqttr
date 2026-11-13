@@ -1,5 +1,5 @@
 #!/bin/sh
-# Self-provisioning entrypoint for the CSQTT Docker image.
+# Self-provisioning entrypoint for the reCSQTT Docker image.
 #
 # The installer is not required: on the first start this script creates
 # /etc/csqtt (identity, install.json, TLS pair), and the named volume keeps it
@@ -22,10 +22,10 @@ IP_WEB_PORT=46002
 DOMAIN_WEB_PORT=443
 NETWORK_READY_FILE=/run/csqtt/docker-network.ready
 
-log() { printf '[csqtt] %s\n' "$*" >&2; }
-warn() { printf '[csqtt] warning: %s\n' "$*" >&2; }
+log() { printf '[recsqtt] %s\n' "$*" >&2; }
+warn() { printf '[recsqtt] warning: %s\n' "$*" >&2; }
 die() {
-    printf '[csqtt] error: %s\n' "$*" >&2
+    printf '[recsqtt] error: %s\n' "$*" >&2
     exit 1
 }
 
@@ -384,7 +384,7 @@ panel_url() {
 # created, or when a missing password had to be regenerated.
 if [ "$BOOTSTRAP_PRINT_CREDENTIALS" = 1 ]; then
     printf '\n──────────────────────────────────────────────────────────────\n'
-    printf 'Панель CSQTT готова (пароль показан один раз):\n'
+    printf 'Панель reCSQTT готова (пароль показан один раз):\n'
     printf '  URL:     %s\n' "$(panel_url)"
     printf '  Логин:   %s\n' "$CSQTT_WEB_USER"
     printf '  Пароль:  %s\n' "$CSQTT_WEB_PASS"
@@ -437,10 +437,12 @@ detect_wan_interface() {
 }
 
 # best-effort: /proc/sys is read-only in many container setups and that is fine.
+# The write goes through a subshell, otherwise the shell itself prints
+# "can't create /proc/sys/...: Read-only file system" on every start: the
+# diagnostic comes from the redirection, not from printf, so a per-command
+# `2>/dev/null` would not suppress it.
 write_sysctl() {
-    sysctl_path=/proc/sys/$1
-    [ -w "$sysctl_path" ] || return 0
-    printf '%s\n' "$2" >"$sysctl_path" 2>/dev/null || true
+    ( printf '%s\n' "$2" >"/proc/sys/$1" ) 2>/dev/null || true
 }
 
 write_sysctl net/ipv4/ip_forward 1
@@ -539,5 +541,5 @@ fi
     : >"$NETWORK_READY_FILE" 2>/dev/null || true
 )
 
-log "starting csqtt: peer/udp $PEER_PORT, web/tcp $WEB_PORT, mode ${PANEL_MODE:-unknown}"
+log "starting reCSQTT: peer/udp $PEER_PORT, web/tcp $WEB_PORT, mode ${PANEL_MODE:-unknown}"
 exec "$CSQTT_BIN" --listen "0.0.0.0:$PEER_PORT" --web-port "$WEB_PORT" --config-dir "$CONFIG_DIR"

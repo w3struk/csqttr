@@ -1,7 +1,7 @@
 ---
 version: alpha
-name: CSQTT Android
-description: Дизайн-система Android-клиента CSQTT (Jetpack Compose, Material 3)
+name: reCSQTT Android
+description: Дизайн-система Android-клиента reCSQTT (Jetpack Compose, Material 3)
 colors:
   primary: "#1A73E8"
   on-primary: "#FFFFFF"

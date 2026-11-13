@@ -124,7 +124,7 @@
 
         <receiver
             android:name=".VpnWidgetProvider"
-            android:label="CSQTT ВПН Виджет"
+            android:label="reCSQTT ВПН Виджет"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />

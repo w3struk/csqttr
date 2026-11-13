@@ -110,7 +110,7 @@ while (($# > 0)); do
             die "unknown option '$opt'"
             ;;
         *)
-            # Глоб CSQTT-*.apk, переданный без --apk, развернулся бы в
+            # Глоб recsqtt-*.apk, переданный без --apk, развернулся бы в
             # позиционные аргументы — падать нужно здесь, до дорогой части.
             die "unexpected positional argument '$opt': pass each APK with its own --apk"
             ;;

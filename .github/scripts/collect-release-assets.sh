@@ -6,6 +6,10 @@
 # bootstrap.sh и SHA256SUMS с шестью записями — шесть ассетов, семь файлов.
 # Имена входов жёсткие — никаких глобов.
 #
+# Бренд reCSQTT: APK публикуются как recsqtt-<version>-<abi>.apk, серверный
+# ассет — recsqtt-linux-amd64. install.sh и bootstrap.sh сохраняют свои имена:
+# на них завязаны документированный one-liner и README.
+#
 # Usage:
 #   collect-release-assets.sh --root DIR [--apk-dir DIR] [--assets-dir DIR]
 #                             --out DIR [--list-file FILE] [--version V]
@@ -18,7 +22,7 @@ Usage: collect-release-assets.sh --root DIR [--apk-dir DIR] [--assets-dir DIR]
                                  --out DIR [--list-file FILE] [--version V]
 
 Copies the three release APKs, the amd64 server binary, scripts/install.sh and
-scripts/bootstrap.sh into --out, renames the APKs to CSQTT-<version>-<abi>.apk
+scripts/bootstrap.sh into --out, renames the APKs to recsqtt-<version>-<abi>.apk
 and writes six SHA256SUMS entries (six assets, seven files).
 Prints the seven absolute paths (SHA256SUMS last) to stdout and to the
 list file.
@@ -129,7 +133,7 @@ if [[ -z "$list_file" ]]; then
 fi
 
 abis=(universal arm64-v8a armeabi-v7a)
-server_binaries=(csqtt-linux-amd64)
+server_binaries=(recsqtt-linux-amd64)
 installer_script="scripts/install.sh"
 bootstrap_script="scripts/bootstrap.sh"
 
@@ -143,7 +147,7 @@ copied=()
 for abi in "${abis[@]}"; do
     src="$apk_dir/app-$version-$abi-release.apk"
     require_input "$src"
-    dst="$out/CSQTT-$version-$abi.apk"
+    dst="$out/recsqtt-$version-$abi.apk"
     cp -f "$src" "$dst" || die "cannot copy $src"
     copied+=("$dst")
 done
@@ -174,15 +178,18 @@ copied+=("$dst")
 
 # Reused publication directories may contain obsolete ARM servers. Remove
 # only these known names; foreign files must survive and remain unpublished.
+# The names are the historical csqtt-* ones on purpose: they are the files a
+# reused directory can actually hold, so the rebrand must not stop them from
+# being cleaned up.
 rm -f -- "$out/csqtt-linux-arm64" "$out/csqtt-linux-armv7"
 
 (
     cd -- "$out" || exit 1
     sha256sum \
-        "csqtt-linux-amd64" \
-        "CSQTT-$version-universal.apk" \
-        "CSQTT-$version-arm64-v8a.apk" \
-        "CSQTT-$version-armeabi-v7a.apk" \
+        "recsqtt-linux-amd64" \
+        "recsqtt-$version-universal.apk" \
+        "recsqtt-$version-arm64-v8a.apk" \
+        "recsqtt-$version-armeabi-v7a.apk" \
         "install.sh" \
         "bootstrap.sh" >SHA256SUMS
 ) || die "cannot compute SHA256SUMS in $out"

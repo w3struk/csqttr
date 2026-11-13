@@ -5,7 +5,7 @@ set -Eeuo pipefail
 export DEBIAN_FRONTEND=noninteractive
 export TERM="${TERM:-xterm}"
 
-readonly SCRIPT_VERSION="2.5.3"
+readonly SCRIPT_VERSION="2.5.4"
 # Журнал установки. Отдельная константа, потому что читающие подкоманды
 # (logs/status/credentials/panel) обязаны видеть настоящий путь, а писать в
 # журнал им нельзя: main перенаправляет их LOG_FILE в /dev/null.
@@ -59,7 +59,7 @@ CANDIDATE_ENV_FILE=""
 readonly CSQTT_SYSCTL_FILE="${CSQTT_SYSCTL_FILE-${CSQTT_SYSCTL_DIR}/99-csqtt.conf}"
 readonly CSQTT_UDP_SYSCTL_FILE="${CSQTT_UDP_SYSCTL_FILE-${CSQTT_SYSCTL_DIR}/99-csqtt-udp-buffers.conf}"
 readonly IPT_COMMENT="CSQTT_MANAGED"
-readonly CSQTT_DOCKER_IMAGE="csqtt:2.5.3"
+readonly CSQTT_DOCKER_IMAGE="csqtt:2.5.4"
 readonly CSQTT_DOCKER_CONTAINER="csqtt"
 readonly CSQTT_DOCKER_PREREQ_SERVICE="csqtt-docker-prereq.service"
 readonly CSQTT_DOCKER_PREREQ_HELPER="${CSQTT_DOCKER_PREREQ_HELPER-${CSQTT_LIB_DIR}/docker-prereq.sh}"
@@ -75,7 +75,7 @@ readonly EXIT_CUTOVER_FAILED=30
 # Число совпадает с production-дефолтом lock-файла; при re-exec дескриптор
 # обязан быть закрыт, иначе новый процесс унаследует lock и упрётся в себя.
 readonly CSQTT_INSTALL_LOCK_FD=9
-readonly CSQTT_RELEASE_BASE="https://github.com/w3struk/csqttr"
+readonly CSQTT_RELEASE_BASE="https://github.com/w3struk/recsqtt"
 # Временный каталог загрузки. Пусто — создать mktemp -d; тесты подставляют свой.
 CSQTT_WORK_DIR="${CSQTT_WORK_DIR:-}"
 CSQTT_WORK_DIR_OWNED="${CSQTT_WORK_DIR_OWNED:-0}"
@@ -165,7 +165,7 @@ validate_distinct_network_ports() {
 }
 
 # Путь обязан быть абсолютным и не равен корню: иначе rm -rf по нему уничтожит
-# систему, а не runtime CSQTT. Ошибка — всегда exit 2 (ошибка аргументов).
+# систему, а не runtime reCSQTT. Ошибка — всегда exit 2 (ошибка аргументов).
 validate_runtime_path() {
     local name="$1" value="$2"
     case "$value" in
@@ -269,7 +269,7 @@ rollback_runtime() {
         CSQTT_DOCKER_RUN_IMAGE=""
         cleanup_deploy_artifacts
         printf 'CSQTT_DEPLOY_ROLLED_BACK|%s|%s\n' "$DEPLOY_PHASE" "$reason"
-        log_info "Предыдущий runtime CSQTT восстановлен"
+        log_info "Предыдущий runtime reCSQTT восстановлен"
         exit 30
     fi
     cleanup_deploy_artifacts
@@ -283,7 +283,7 @@ rollback_runtime() {
 restart_stopped_runtime() {
     [ "${RUNTIME_STOPPED:-0}" = "1" ] || return 0
     local unit
-    log_warn "Возврат ранее остановленного runtime CSQTT (файлы не изменялись)"
+    log_warn "Возврат ранее остановленного runtime reCSQTT (файлы не изменялись)"
     case "${RUNTIME_SNAPSHOT_MODE:-}" in
         docker)
             command -v docker >/dev/null 2>&1 || { RUNTIME_STOPPED=0; return 0; }
@@ -432,7 +432,7 @@ force_stop_csqtt_processes() {
         found=0
         while IFS= read -r pid; do
             found=1
-            log_warn "Принудительное завершение CSQTT: PID $pid"
+            log_warn "Принудительное завершение reCSQTT: PID $pid"
             if [ "$attempt" -le 2 ]; then
                 kill -TERM "$pid" 2>/dev/null || true
             else
@@ -510,7 +510,7 @@ archive_csqtt_docker_state() {
     [ -n "$container_id" ] || return 0
     archive_dir="${CSQTT_RUNTIME_ARCHIVE_DIR}/docker-${container_id:0:12}-$(date +%s)"
     umask 077
-    mkdir -p "$archive_dir" || die "Не удалось подготовить архив состояния Docker CSQTT"
+    mkdir -p "$archive_dir" || die "Не удалось подготовить архив состояния Docker reCSQTT"
     for source in "${CSQTT_CONFIG_DIR}/${CSQTT_DATABASE_FILE}" "${CSQTT_CONFIG_DIR}/${CSQTT_DATABASE_WAL_FILE}" "${CSQTT_CONFIG_DIR}/${CSQTT_DATABASE_SHM_FILE}" "${CSQTT_CONFIG_DIR}/passwords.json" "${CSQTT_CONFIG_DIR}/passwords.json.imported"; do
         base="${source##*/}"
         if docker cp "${container}:${source}" "${archive_dir}/${base}" >/dev/null 2>&1; then
@@ -519,7 +519,7 @@ archive_csqtt_docker_state() {
         fi
     done
     if [ "$copied" -eq 1 ]; then
-        log_info "Состояние Docker CSQTT сохранено: $archive_dir"
+        log_info "Состояние Docker reCSQTT сохранено: $archive_dir"
     else
         rmdir "$archive_dir" >/dev/null 2>&1 || true
     fi
@@ -540,7 +540,7 @@ stop_and_archive_csqtt_docker_container() {
     fi
     archive_csqtt_docker_state "$container"
     timeout 10 docker rm -f "$container" >/dev/null 2>&1 || \
-        die "Не удалось остановить старый Docker-контейнер CSQTT"
+        die "Не удалось остановить старый Docker-контейнер reCSQTT"
 }
 
 remove_all_csqtt_docker_containers() {
@@ -551,7 +551,7 @@ remove_all_csqtt_docker_containers() {
         docker_container_runs_csqtt "$container" || continue
         name="$(docker inspect --format '{{.Name}}' "$container" 2>/dev/null || printf '%s' "$container")"
         name="${name#/}"
-        log_info "Остановка Docker runtime CSQTT: $name"
+        log_info "Остановка Docker runtime reCSQTT: $name"
         stop_and_archive_csqtt_docker_container "$container"
     done < <(docker ps -aq --no-trunc 2>/dev/null || true)
 }
@@ -603,13 +603,13 @@ stop_csqtt_docker_prereq() {
         SYSTEMD_NEEDS_RELOAD=0
     fi
     if systemctl is-active --quiet "$CSQTT_DOCKER_PREREQ_SERVICE"; then
-        log_info "Остановка Docker prerequisite CSQTT: $CSQTT_DOCKER_PREREQ_SERVICE"
+        log_info "Остановка Docker prerequisite reCSQTT: $CSQTT_DOCKER_PREREQ_SERVICE"
         timeout 10 systemctl stop "$CSQTT_DOCKER_PREREQ_SERVICE" >/dev/null 2>&1 || true
         if systemctl is-active --quiet "$CSQTT_DOCKER_PREREQ_SERVICE"; then
             timeout 2 systemctl kill --kill-who=all --signal=SIGKILL "$CSQTT_DOCKER_PREREQ_SERVICE" >/dev/null 2>&1 || true
         fi
         if systemctl is-active --quiet "$CSQTT_DOCKER_PREREQ_SERVICE"; then
-            die "Не удалось остановить Docker prerequisite CSQTT: $CSQTT_DOCKER_PREREQ_SERVICE"
+            die "Не удалось остановить Docker prerequisite reCSQTT: $CSQTT_DOCKER_PREREQ_SERVICE"
         fi
     fi
 }
@@ -619,7 +619,7 @@ stop_all_running_csqtt_systemd_units() {
     local unit
     while IFS= read -r unit; do
         [ -n "$unit" ] || continue
-        log_info "Остановка systemd runtime CSQTT: $unit"
+        log_info "Остановка systemd runtime reCSQTT: $unit"
         if ! timeout 10 systemctl stop "$unit" >/dev/null 2>&1; then
             log_warn "systemctl stop завершился с ошибкой для $unit; проверяется фактическое состояние"
         fi
@@ -627,7 +627,7 @@ stop_all_running_csqtt_systemd_units() {
             timeout 2 systemctl kill --kill-who=all --signal=SIGKILL "$unit" >/dev/null 2>&1 || true
         fi
         if systemctl is-active --quiet "$unit"; then
-            die "Не удалось остановить systemd runtime CSQTT: $unit"
+            die "Не удалось остановить systemd runtime reCSQTT: $unit"
         fi
         systemctl disable "$unit" >/dev/null 2>&1 || true
     done < <(list_csqtt_systemd_units)
@@ -665,7 +665,7 @@ check_root() {
     if [ "$(id -u)" -ne 0 ]; then
         # Root проверяется ДО TTY-guard: иначе `bash <(curl ...)` без sudo
         # сообщал бы про stdin, хотя настоящая причина — отсутствие прав.
-        die "Скрипт должен быть запущен от root. Скачайте установщик и запустите через sudo: curl -fsSL https://github.com/w3struk/csqttr/releases/latest/download/install.sh -o /tmp/csqtt-install.sh && sudo bash /tmp/csqtt-install.sh --yes" "$EXIT_INVALID_ARGUMENT"
+        die "Скрипт должен быть запущен от root. Скачайте установщик и запустите через sudo: curl -fsSL https://github.com/w3struk/recsqtt/releases/latest/download/install.sh -o /tmp/csqtt-install.sh && sudo bash /tmp/csqtt-install.sh --yes" "$EXIT_INVALID_ARGUMENT"
     fi
 }
 
@@ -675,7 +675,7 @@ require_tty_guard() {
     [ "${CHECK_ONLY:-0}" -eq 0 ] || return 0
     [ "${YES:-0}" -eq 0 ] || return 0
     [ -t 0 ] && return 0
-    die "Нет TTY для интерактивной установки. Скачайте установщик и запустите неинтерактивно: curl -fsSL https://github.com/w3struk/csqttr/releases/latest/download/install.sh -o /tmp/csqtt-install.sh && sudo bash /tmp/csqtt-install.sh --yes" "$EXIT_INVALID_ARGUMENT"
+    die "Нет TTY для интерактивной установки. Скачайте установщик и запустите неинтерактивно: curl -fsSL https://github.com/w3struk/recsqtt/releases/latest/download/install.sh -o /tmp/csqtt-install.sh && sudo bash /tmp/csqtt-install.sh --yes" "$EXIT_INVALID_ARGUMENT"
 }
 
 # --web-pass-stdin не имеет права читать тело piped-скрипта как пароль:
@@ -690,7 +690,7 @@ read_web_password_from_stdin() {
         exec 3<&-
         printf '\n' >&2
     else
-        die "--web-pass-stdin: stdin занят piped-скриптом, а ${tty} недоступен. Скачайте установщик и повторите: curl -fsSL https://github.com/w3struk/csqttr/releases/latest/download/install.sh -o /tmp/csqtt-install.sh && sudo bash /tmp/csqtt-install.sh --web-pass-stdin --yes" "$EXIT_INVALID_ARGUMENT"
+        die "--web-pass-stdin: stdin занят piped-скриптом, а ${tty} недоступен. Скачайте установщик и повторите: curl -fsSL https://github.com/w3struk/recsqtt/releases/latest/download/install.sh -o /tmp/csqtt-install.sh && sudo bash /tmp/csqtt-install.sh --web-pass-stdin --yes" "$EXIT_INVALID_ARGUMENT"
     fi
     [ -n "${WEB_PASS:-}" ] || die "--web-pass-stdin получил пустой пароль" "$EXIT_INVALID_ARGUMENT"
     WEB_PASS_STDIN=0
@@ -1100,10 +1100,10 @@ secure_persistent_state() {
 ensure_csqtt_directory() {
     local path="$1" mode="$2"
     if [ -L "$path" ] || [ ! -d "$path" ]; then
-        rm -rf -- "$path" || die "Не удалось очистить путь CSQTT: $path"
+        rm -rf -- "$path" || die "Не удалось очистить путь reCSQTT: $path"
     fi
-    mkdir -p -- "$path" || die "Не удалось подготовить каталог CSQTT: $path"
-    chmod "$mode" "$path" || die "Не удалось установить права на каталог CSQTT: $path"
+    mkdir -p -- "$path" || die "Не удалось подготовить каталог reCSQTT: $path"
+    chmod "$mode" "$path" || die "Не удалось установить права на каталог reCSQTT: $path"
 }
 
 # Каталог данных нельзя пересоздавать: владелец мог вынести его на другой диск
@@ -1114,16 +1114,16 @@ ensure_persistent_directory() {
     if [ -L "$path" ]; then
         resolved="$(readlink -f -- "$path" 2>/dev/null || true)"
         [ -n "$resolved" ] || \
-            die "Не удалось разрешить символическую ссылку каталога данных CSQTT: $path"
+            die "Не удалось разрешить символическую ссылку каталога данных reCSQTT: $path"
         [ -d "$resolved" ] || \
-            die "Символическая ссылка каталога данных CSQTT ведёт в несуществующий путь: $path -> $resolved"
+            die "Символическая ссылка каталога данных reCSQTT ведёт в несуществующий путь: $path -> $resolved"
         path="$resolved"
     fi
     if [ -e "$path" ] && [ ! -d "$path" ]; then
-        die "Путь каталога данных CSQTT существует, но это не каталог: $path"
+        die "Путь каталога данных reCSQTT существует, но это не каталог: $path"
     fi
-    mkdir -p -- "$path" || die "Не удалось подготовить каталог CSQTT: $path"
-    chmod "$mode" "$path" || die "Не удалось установить права на каталог CSQTT: $path"
+    mkdir -p -- "$path" || die "Не удалось подготовить каталог reCSQTT: $path"
+    chmod "$mode" "$path" || die "Не удалось установить права на каталог reCSQTT: $path"
 }
 
 clear_runtime_config_preserving_database() {
@@ -1240,9 +1240,9 @@ csqtt_docker_image_exists() {
         docker image inspect "$CSQTT_DOCKER_IMAGE" >/dev/null 2>&1
 }
 
-# fresh|systemd|docker. Unit обязан существовать и указывать на runtime CSQTT;
+# fresh|systemd|docker. Unit обязан существовать и указывать на runtime reCSQTT;
 # в тестах и при недоступном systemctl эквивалентная проверка делается по
-# самому unit-файлу. Docker — контейнер или образ CSQTT.
+# самому unit-файлу. Docker — контейнер или образ reCSQTT.
 detect_existing_install() {
     if [ -f "${CSQTT_SYSTEMD_DIR}/csqtt.service" ] && \
        { csqtt_systemd_unit_is_managed || csqtt_unit_file_is_managed; }; then
@@ -1624,7 +1624,7 @@ restore_network_rules_from_snapshot() {
         if [ "${expected_rules:-0}" -gt 0 ]; then
             restored_rules="$({ iptables -S 2>/dev/null; iptables -t nat -S 2>/dev/null; } | grep -c CSQTT_MANAGED || true)"
             [ "${restored_rules:-0}" -gt 0 ] || \
-                log_warn "правила CSQTT не видны после iptables-restore; проверьте backend iptables" >&2
+                log_warn "правила reCSQTT не видны после iptables-restore; проверьте backend iptables" >&2
         fi
     fi
 
@@ -1795,11 +1795,11 @@ perform_rollback() {
     case "${RUNTIME_SNAPSHOT_MODE:-}" in
         systemd|docker)
             start_restored_runtime || {
-                log_error "Не удалось запустить восстановленный runtime CSQTT" >&2
+                log_error "Не удалось запустить восстановленный runtime reCSQTT" >&2
                 return 1
             }
             restore_runtime_health_check || {
-                log_error "Восстановленный runtime CSQTT не прошёл health-check" >&2
+                log_error "Восстановленный runtime reCSQTT не прошёл health-check" >&2
                 return 1
             }
             ;;
@@ -2188,7 +2188,7 @@ verify_candidate_binary() {
 
 prepare_binary_candidate() {
     DEPLOY_PHASE="preflight"
-    CANDIDATE_BINARY="${CSQTT_WORK_DIR}/csqtt-linux-amd64"
+    CANDIDATE_BINARY="${CSQTT_WORK_DIR}/recsqtt-linux-amd64"
     cp -- "$BINARY_PATH" "$CANDIDATE_BINARY" || \
         die "Не удалось скопировать локальный бинарник в work-dir" "$EXIT_PREFLIGHT_FAILED"
     chmod 0755 "$CANDIDATE_BINARY" || \
@@ -2197,7 +2197,7 @@ prepare_binary_candidate() {
     log_info "Локальный бинарник проверен до остановки текущего сервиса"
 }
 
-# Скачивает csqtt-linux-amd64 и SHA256SUMS, проверяет checksum и оставляет
+# Скачивает recsqtt-linux-amd64 и SHA256SUMS, проверяет checksum и оставляет
 # проверенный CANDIDATE_BINARY в work-dir. --binary заменяет загрузку локальным
 # файлом, но требует checksum (см. validate_binary_options).
 prepare_candidate_release() {
@@ -2216,10 +2216,10 @@ prepare_candidate_release() {
     fi
     validate_release_tag "$tag"
     RELEASE_TAG="$tag"
-    CANDIDATE_BINARY="${CSQTT_WORK_DIR}/csqtt-linux-amd64"
+    CANDIDATE_BINARY="${CSQTT_WORK_DIR}/recsqtt-linux-amd64"
     sums="${CSQTT_WORK_DIR}/SHA256SUMS"
-    log_step "Загрузка csqtt ${tag}..."
-    download_release_asset "csqtt-linux-amd64" "$CANDIDATE_BINARY"
+    log_step "Загрузка reCSQTT ${tag}..."
+    download_release_asset "recsqtt-linux-amd64" "$CANDIDATE_BINARY"
     download_release_asset "SHA256SUMS" "$sums"
     verify_sha256 "$CANDIDATE_BINARY" "$sums"
     chmod 0755 "$CANDIDATE_BINARY" || \
@@ -2288,7 +2288,7 @@ remove_csqtt_tun_interface() {
 
 csqtt_cleanup() {
     prog 0.15 "Очистка..."
-    echo "🧹 Переключение со старой установки CSQTT..."
+    echo "🧹 Переключение со старой установки reCSQTT..."
 
     # Таймер продления живёт рядом с хелпером и переживает снос runtime: старый
     # юнит не попадает в list_csqtt_systemd_units (там только *.service за
@@ -2316,7 +2316,7 @@ csqtt_cleanup() {
         stop_all_running_csqtt_systemd_units
     fi
 
-    force_stop_csqtt_processes || die "Не удалось завершить процессы CSQTT"
+    force_stop_csqtt_processes || die "Не удалось завершить процессы reCSQTT"
     remove_all_csqtt_systemd_units
     [ -e "${CSQTT_SYSTEMD_DIR}/${CSQTT_DOCKER_PREREQ_SERVICE}" ] && SYSTEMD_NEEDS_RELOAD=1
     rm -f "${CSQTT_SYSTEMD_DIR}/${CSQTT_DOCKER_PREREQ_SERVICE}"
@@ -2450,7 +2450,7 @@ setup_nat_and_firewall() {
     fw_add_mss_clamping "10.66.67.0/24"
 
     echo "✓ NAT: MASQUERADE на $iface для 10.66.67.0/24"
-    echo "✓ Порты CSQTT: ${PEER_PORT}/udp(PEER), ${WEB_PORT}/tcp(WEB: $(panel_web_mode_label)), ${LE_HTTP_PORT}/tcp(LE)"
+    echo "✓ Порты reCSQTT: ${PEER_PORT}/udp(PEER), ${WEB_PORT}/tcp(WEB: $(panel_web_mode_label)), ${LE_HTTP_PORT}/tcp(LE)"
     echo "✓ TCP MSS Clamping включен"
 }
 
@@ -2641,22 +2641,22 @@ release_owned_peer_port() {
         peer_port_is_busy || return 0
         pids="\$(peer_port_pids)"
         if [ -z "\$pids" ]; then
-            echo "[CSQTT] UDP/\$PEER_PORT is occupied by a runtime without visible PID" >&2
+            echo "[reCSQTT] UDP/\$PEER_PORT is occupied by a runtime without visible PID" >&2
             ss -H -lunp "sport = :\$PEER_PORT" >&2 || true
             return 24
         fi
         for pid in \$pids; do
             if [ "\$attempt" -le 2 ]; then
-                echo "[CSQTT] UDP/\$PEER_PORT runtime PID \$pid; terminating" >&2
+                echo "[reCSQTT] UDP/\$PEER_PORT runtime PID \$pid; terminating" >&2
                 kill -TERM "\$pid" 2>/dev/null || true
             else
-                echo "[CSQTT] UDP/\$PEER_PORT runtime PID \$pid; killing" >&2
+                echo "[reCSQTT] UDP/\$PEER_PORT runtime PID \$pid; killing" >&2
                 kill -KILL "\$pid" 2>/dev/null || true
             fi
         done
         sleep 0.2
     done
-    echo "[CSQTT] UDP/\$PEER_PORT did not release" >&2
+    echo "[reCSQTT] UDP/\$PEER_PORT did not release" >&2
     ss -H -lunp "sport = :\$PEER_PORT" >&2 || true
     return 24
 }
@@ -2667,18 +2667,18 @@ if ! ip link show "\$CSQTT_IFACE" >/dev/null 2>&1; then
     exit 0
 fi
 
-echo "[CSQTT] stale TUN interface \$CSQTT_IFACE detected; recovering runtime" >&2
+echo "[reCSQTT] stale TUN interface \$CSQTT_IFACE detected; recovering runtime" >&2
 for attempt in 1 2 3 4; do
     timeout 2 ip link del "\$CSQTT_IFACE" >/dev/null 2>&1 || true
     if ! ip link show "\$CSQTT_IFACE" >/dev/null 2>&1; then
-        echo "[CSQTT] stale TUN interface \$CSQTT_IFACE removed" >&2
+        echo "[reCSQTT] stale TUN interface \$CSQTT_IFACE removed" >&2
         exit 0
     fi
     sleep 0.2
 done
 
 ip -d link show "\$CSQTT_IFACE" >&2 || true
-echo "[CSQTT] unable to release TUN interface \$CSQTT_IFACE" >&2
+echo "[reCSQTT] unable to release TUN interface \$CSQTT_IFACE" >&2
 exit 23
 RECOVEREOF
     chmod 0755 "$target"
@@ -3175,7 +3175,7 @@ resolve_install_configuration() {
 
     if [ "${ACTION:-install}" = "update" ] && [ "$existing" -eq 0 ]; then
         DEPLOY_PHASE="validation"
-        die "update требует существующую установку CSQTT; для первой установки используйте install" "$EXIT_INVALID_ARGUMENT"
+        die "update требует существующую установку reCSQTT; для первой установки используйте install" "$EXIT_INVALID_ARGUMENT"
     fi
 
     base_mode="${state_mode:-${DEPLOY_MODE:-}}"
@@ -3407,13 +3407,23 @@ panel_web_port_label() {
     printf '%s (%s)\n' "$WEB_PORT" "$(panel_web_mode_label)"
 }
 
+# Строка баннера дополняется до внутренней ширины рамки (62 символа минус
+# отступ в 7): порт туннеля и SSH бывают четырёх- и пятизначными, и без
+# выравнивания правая граница уезжает от рамки.
+installer_header_row() {
+    local text="$1" pad
+    pad=$((55 - ${#text}))
+    ((pad > 0)) || pad=0
+    printf '║       %s%*s║\n' "$text" "$pad" ''
+}
+
 print_installer_header() {
     echo "╔══════════════════════════════════════════════════════════════╗"
-    echo "║       CSQTT VPN Server — Installer v${SCRIPT_VERSION}                    ║"
+    echo "║       reCSQTT VPN Server — Installer v${SCRIPT_VERSION}                  ║"
     if [ -n "${PANEL_MODE:-}" ]; then
-        echo "║       PEER: ${PEER_PORT}  |  SSH: ${SSH_PORT}  | WEB: ${WEB_PORT}       ║"
+        installer_header_row "PEER: ${PEER_PORT}  |  SSH: ${SSH_PORT}  | WEB: ${WEB_PORT}"
     else
-        echo "║       PEER: ${PEER_PORT}  |  SSH: ${SSH_PORT}                          ║"
+        installer_header_row "PEER: ${PEER_PORT}  |  SSH: ${SSH_PORT}"
     fi
     echo "╚══════════════════════════════════════════════════════════════╝"
 }
@@ -3598,7 +3608,7 @@ web_certificate_is_csqtt_managed() {
 web_certificate_is_user_managed() {
     [ -s "$CSQTT_CONFIG_DIR/web_cert.pem" ] || return 1
     # Без openssl классифицировать нельзя: и rcgen-, и Let's Encrypt-проверки
-    # молча отказывают, и валидный сертификат CSQTT выглядел бы пользовательским
+    # молча отказывают, и валидный сертификат reCSQTT выглядел бы пользовательским
     # (тогда установщик удалил бы letsencrypt.env и не поставил продление).
     command -v openssl >/dev/null 2>&1 || return 1
     ! web_certificate_is_csqtt_managed
@@ -3712,7 +3722,7 @@ issue_letsencrypt_certificate() {
             die "Let’s Encrypt не подтвердил домен ${identifier}; смотрите ${LOG_FILE}. Проверьте A-запись и что порт ${LE_HTTP_PORT} доступен из интернета. Чтобы вернуть предыдущий режим, повторите установку, указав IP-адрес сервера"
         fi
         if ! install_letsencrypt_certificate "$identifier" "$cert_name"; then
-            die "Let’s Encrypt выдал сертификат для ${identifier}, но CSQTT не смог безопасно активировать его: проверьте свободное место в ${CSQTT_CONFIG_DIR}. Чтобы вернуть предыдущий режим, повторите установку, указав IP-адрес сервера"
+            die "Let’s Encrypt выдал сертификат для ${identifier}, но reCSQTT не смог безопасно активировать его: проверьте свободное место в ${CSQTT_CONFIG_DIR}. Чтобы вернуть предыдущий режим, повторите установку, указав IP-адрес сервера"
         fi
         log_info "Let’s Encrypt сертификат активирован для домена ${identifier}"
         return 0
@@ -3734,7 +3744,7 @@ issue_letsencrypt_certificate() {
         fi
     fi
     if ! install_letsencrypt_certificate "$identifier" "$cert_name"; then
-        log_warn "Let’s Encrypt выдал сертификат, но CSQTT не смог безопасно активировать его"
+        log_warn "Let’s Encrypt выдал сертификат, но reCSQTT не смог безопасно активировать его"
         return 1
     fi
     log_info "Let’s Encrypt IP-сертификат активирован для ${identifier}"
@@ -4066,7 +4076,7 @@ main() {
         return 0
     fi
     if [ -s "$CERT_PATH" ] && ! certificate_is_csqtt_managed; then
-        log "Let’s Encrypt: обнаружен пользовательский TLS-сертификат; CSQTT не изменяет его и отключает собственное продление"
+        log "Let’s Encrypt: обнаружен пользовательский TLS-сертификат; reCSQTT не изменяет его и отключает собственное продление"
         return 0
     fi
     identifier="$(current_identifier 2>/dev/null || true)"
@@ -4109,7 +4119,7 @@ main() {
         return 0
     fi
     reload_csqtt_tls
-    log "Let’s Encrypt: сертификат обновлён и TLS-конфигурация CSQTT перезагружена"
+    log "Let’s Encrypt: сертификат обновлён и TLS-конфигурация reCSQTT перезагружена"
 }
 
 main "$@"
@@ -4125,7 +4135,7 @@ install_letsencrypt_renewal_timer() {
     }
     cat > "${CSQTT_SYSTEMD_DIR}/${CSQTT_LE_SERVICE}" << LEUNIT
 [Unit]
-Description=Renew CSQTT Let’s Encrypt certificate
+Description=Renew reCSQTT Let’s Encrypt certificate
 After=network-online.target
 Wants=network-online.target
 
@@ -4140,7 +4150,7 @@ ExecStart=${CSQTT_LE_RENEW_HELPER}
 LEUNIT
     cat > "${CSQTT_SYSTEMD_DIR}/${CSQTT_LE_TIMER}" << LETIMER
 [Unit]
-Description=Check CSQTT Let’s Encrypt certificate lifetime
+Description=Check reCSQTT Let’s Encrypt certificate lifetime
 
 [Timer]
 OnBootSec=5min
@@ -4184,12 +4194,12 @@ setup_domain_web_panel_tls() {
 setup_web_panel_tls() {
     local public_ip cert_name
     if ! certificate_is_csqtt_letsencrypt && adopt_letsencrypt_certificate; then
-        log_info "Let’s Encrypt-сертификат CSQTT принят под автоматическое продление"
+        log_info "Let’s Encrypt-сертификат reCSQTT принят под автоматическое продление"
     fi
     if web_certificate_is_user_managed; then
         rm -f -- "$CSQTT_LE_STATE_FILE"
         disable_letsencrypt_renewal_timer
-        log_info "Используется заранее установленный TLS-сертификат пользователя; CSQTT сохраняет его и не заменяет Let’s Encrypt"
+        log_info "Используется заранее установленный TLS-сертификат пользователя; reCSQTT сохраняет его и не заменяет Let’s Encrypt"
         return 0
     fi
     if [ "${PANEL_MODE:-ip}" = "domain" ]; then
@@ -4329,7 +4339,7 @@ ensure_tun_device() {
 }
 
 check_kernel_compatibility() {
-    [ "$(uname -s)" = "Linux" ] || die "CSQTT Server поддерживает только Linux"
+    [ "$(uname -s)" = "Linux" ] || die "reCSQTT Server поддерживает только Linux"
     local release base major minor
     release="$(uname -r)"
     base="${release%%-*}"
@@ -4543,7 +4553,7 @@ PREREQ
     unit_tmp="$(mktemp)"
     cat > "$unit_tmp" << PREREQUNIT
 [Unit]
-Description=Prepare CSQTT Docker TUN and xtables lock
+Description=Prepare reCSQTT Docker TUN and xtables lock
 After=local-fs.target
 Before=docker.service
 
@@ -4630,7 +4640,7 @@ prepare_docker_candidate() {
     CSQTT_DOCKER_CANDIDATE_IMAGE="${CSQTT_DOCKER_IMAGE}-candidate-$$"
     if ! docker_build_candidate_image "$CSQTT_DOCKER_CANDIDATE_IMAGE" "$context_dir"; then
         tail -n 80 "$LOG_FILE" | sed 's/^/   >> /' >&2 || true
-        die "Сборка Docker-образа CSQTT завершилась ошибкой" "$EXIT_PREFLIGHT_FAILED"
+        die "Сборка Docker-образа reCSQTT завершилась ошибкой" "$EXIT_PREFLIGHT_FAILED"
     fi
     probe_docker_runtime "$CSQTT_DOCKER_CANDIDATE_IMAGE"
     remove_managed_work_dir "$DOCKER_CONTEXT_DIR" || true
@@ -4702,7 +4712,7 @@ run_csqtt_docker_container() {
         --listen "0.0.0.0:${PEER_PORT}" \
         --web-port "$WEB_PORT" \
         --config-dir "$CSQTT_CONFIG_DIR" >>"$LOG_FILE" 2>&1 || \
-        die "Не удалось создать Docker-контейнер CSQTT"
+        die "Не удалось создать Docker-контейнер reCSQTT"
 }
 
 print_docker_deploy_summary() {
@@ -4752,7 +4762,7 @@ start_csqtt_docker() {
 
     if [ "$found" -ne 1 ]; then
         docker logs --tail 50 "$CSQTT_DOCKER_CONTAINER" 2>&1 | sed 's/^/   >> /' || true
-        die "Docker CSQTT не запустился или TUN $CSQTT_IFACE не создан"
+        die "Docker reCSQTT не запустился или TUN $CSQTT_IFACE не создан"
     fi
 
     sleep "$START_STABILITY_SECONDS"
@@ -4761,7 +4771,7 @@ start_csqtt_docker() {
     if [ "$running" != "true" ] || [ "$main_pid" != "$candidate_pid" ] || [ "$restarts" != "$candidate_restarts" ] || \
        ! ip link show "$CSQTT_IFACE" >/dev/null 2>&1; then
         docker logs --tail 50 "$CSQTT_DOCKER_CONTAINER" 2>&1 | sed 's/^/   >> /' || true
-        die "Docker CSQTT вошёл в crash-loop во время стабильной проверки"
+        die "Docker reCSQTT вошёл в crash-loop во время стабильной проверки"
     fi
 
     verify_configured_network
@@ -4773,13 +4783,13 @@ start_csqtt_docker() {
 
 setup_csqtt_service() {
     prog 0.75 "Сервис..."
-    echo "🔧 Создание systemd-сервиса CSQTT..."
+    echo "🔧 Создание systemd-сервиса reCSQTT..."
 
     local unit_tmp
     unit_tmp="$(mktemp)"
     cat > "$unit_tmp" << CSQTTSVC
 [Unit]
-Description=CSQTT VPN Server
+Description=reCSQTT VPN Server
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=60
@@ -4859,7 +4869,7 @@ start_csqtt() {
         return
     fi
     prog 0.90 "Запуск..."
-    echo "🚀 Запуск CSQTT VPN Server..."
+    echo "🚀 Запуск reCSQTT VPN Server..."
 
     [ -x "${CSQTT_BIN_DIR}/csqtt" ] || die "Исполняемый файл ${CSQTT_BIN_DIR}/csqtt не установлен"
 
@@ -4897,7 +4907,7 @@ start_csqtt() {
 
     if [ "$found" -ne 1 ]; then
         diagnose_systemd_failure
-        die "CSQTT не запустился: сервис не running или TUN $CSQTT_IFACE не создан"
+        die "reCSQTT не запустился: сервис не running или TUN $CSQTT_IFACE не создан"
     fi
 
     sleep "$START_STABILITY_SECONDS"
@@ -4915,13 +4925,13 @@ start_csqtt() {
        [ "$restarts" != "$candidate_restarts" ] || ! kill -0 "$candidate_pid" 2>/dev/null || \
        ! ip link show "$CSQTT_IFACE" >/dev/null 2>&1; then
         diagnose_systemd_failure
-        die "CSQTT вошёл в crash-loop или потерял TUN во время стабильной проверки"
+        die "reCSQTT вошёл в crash-loop или потерял TUN во время стабильной проверки"
     fi
 
     verify_configured_network
     verify_web_panel
     [ "$restarts" -eq 0 ] || log_warn "Во время старта csqtt перезапустился $restarts раз(а), затем стабилизировался"
-    log_info "CSQTT сервер подтверждён: PID $candidate_pid, интерфейс $CSQTT_IFACE активен"
+    log_info "reCSQTT сервер подтверждён: PID $candidate_pid, интерфейс $CSQTT_IFACE активен"
     finish_deployment
 
     prog 1.0 "Готово!"
@@ -4989,7 +4999,7 @@ do_status() {
     [ -n "$mode" ] || mode="$(detect_existing_install 2>/dev/null || printf 'fresh')"
     version="$(status_state_value version)"
     panel_mode="$(status_state_value panel_mode)"
-    printf 'Статус CSQTT:\n'
+    printf 'Статус reCSQTT:\n'
     printf '  Режим:      %s\n' "$mode"
     printf '  Установщик: %s\n' "$SCRIPT_VERSION"
     printf '  Установка:  %s\n' "${version:-неизвестна}"
@@ -5120,7 +5130,7 @@ do_panel() {
 }
 
 do_uninstall() {
-    log_step "Удаление CSQTT..."
+    log_step "Удаление reCSQTT..."
 
     remove_all_csqtt_docker_containers
     if command -v docker >/dev/null 2>&1; then
@@ -5133,7 +5143,7 @@ do_uninstall() {
         stop_csqtt_docker_prereq
         stop_all_running_csqtt_systemd_units
     fi
-    force_stop_csqtt_processes || log_warn "Не все процессы CSQTT завершились до удаления runtime"
+    force_stop_csqtt_processes || log_warn "Не все процессы reCSQTT завершились до удаления runtime"
     remove_all_csqtt_systemd_units
     rm -f "${CSQTT_SYSTEMD_DIR}/${CSQTT_DOCKER_PREREQ_SERVICE}"
     rm -f "${CSQTT_SYSTEMD_DIR}/docker.service.requires/${CSQTT_DOCKER_PREREQ_SERVICE}"
@@ -5155,18 +5165,18 @@ do_uninstall() {
     remove_cli_installation
     if [ "${PURGE:-0}" = "1" ]; then
         rm -rf -- "$CSQTT_CONFIG_DIR"
-        log_info "CSQTT удалён вместе с конфигурацией ${CSQTT_CONFIG_DIR}; ${CSQTT_LE_ROOT} не тронут"
+        log_info "reCSQTT удалён вместе с конфигурацией ${CSQTT_CONFIG_DIR}; ${CSQTT_LE_ROOT} не тронут"
     else
         secure_persistent_state
-        log_info "CSQTT удалён. SQLite state и конфигурация сохранены в ${CSQTT_CONFIG_DIR}"
+        log_info "reCSQTT удалён. SQLite state и конфигурация сохранены в ${CSQTT_CONFIG_DIR}"
     fi
 }
 
 handle_unexpected_error() {
     local line="$1" status="$2"
     trap - ERR
-    log_error "Неперехваченная ошибка CSQTT install.sh (строка $line, exit=$status)"
-    printf 'CSQTT_DEPLOY_ERROR|%s|Неперехваченная ошибка CSQTT install.sh (строка %s, exit=%s)\n' "$DEPLOY_PHASE" "$line" "$status"
+    log_error "Неперехваченная ошибка reCSQTT install.sh (строка $line, exit=$status)"
+    printf 'CSQTT_DEPLOY_ERROR|%s|Неперехваченная ошибка reCSQTT install.sh (строка %s, exit=%s)\n' "$DEPLOY_PHASE" "$line" "$status"
     if [ "${ROLLBACK_ARMED:-0}" = "1" ]; then
         rollback_runtime "unexpected error at line ${line}"
     fi
@@ -5216,7 +5226,7 @@ trap 'handle_deploy_signal TERM' TERM
 
 usage() {
     cat <<'USAGE'
-CSQTT installer
+reCSQTT installer
 
 Использование: install.sh [команда] [флаги]
 
@@ -5509,7 +5519,7 @@ install_main() {
     require_tty_guard
     acquire_install_lock
     prepare_install_log
-    echo "=== CSQTT Installer v${SCRIPT_VERSION} — $(date) ===" >> "$LOG_FILE"
+    echo "=== reCSQTT Installer v${SCRIPT_VERSION} — $(date) ===" >> "$LOG_FILE"
 
     DEPLOY_PHASE="validation"
     read_web_password_if_requested
@@ -5531,7 +5541,7 @@ install_main() {
     # «no-op» стоил бы простоя панели.
     if [ "${FORCE:-0}" -ne 1 ] && install_is_already_current; then
         print_installer_header
-        log_info "CSQTT: уже последняя версия ${SCRIPT_VERSION}; переустановка не требуется (используйте --force)"
+        log_info "reCSQTT: уже последняя версия ${SCRIPT_VERSION}; переустановка не требуется (используйте --force)"
         printf 'CSQTT_INSTALL_ALREADY_CURRENT|%s\n' "$SCRIPT_VERSION"
         return 0
     fi
@@ -5610,7 +5620,7 @@ uninstall_main() {
     # идущим обновлением (иначе он снесёт runtime под работающим cutover).
     acquire_install_lock
     prepare_install_log
-    echo "=== CSQTT Installer v${SCRIPT_VERSION} — $(date) ===" >> "$LOG_FILE"
+    echo "=== reCSQTT Installer v${SCRIPT_VERSION} — $(date) ===" >> "$LOG_FILE"
     print_installer_header
     DEPLOY_PHASE="validation"
     validate_runtime_paths

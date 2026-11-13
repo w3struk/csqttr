@@ -6,7 +6,7 @@
 #
 # Produces one release asset, published separately from the APK (the app ships
 # only the client) and staged in app/build/generated/assets and rust-server/dist:
-#   csqtt-linux-amd64   x86_64-unknown-linux-musl
+#   recsqtt-linux-amd64   x86_64-unknown-linux-musl
 #
 # Compilation is delegated to build_linux_variants.sh (parallel by default).
 
@@ -17,9 +17,10 @@ ROOT="$(cd -- "$SERVER_DIR/.." && pwd)"
 
 # Один target-dir на clippy/test/release: release-зависимости, собранные
 # clippy, переиспользуются финальной сборкой, а debug-тесты живут в том же
-# каталоге отдельным профилем. Имя обязано совпадать с build_linux_variants.sh
+# каталоге отдельным профилем. Имя обязано совпадать с build_linux_variants.sh,
+# rust-server/.cargo/config.toml и путём в кеше build.yml
 # (build/csqtt-uring-linux-$asset).
-SERVER_TARGET_ASSET="csqtt-linux-amd64"
+SERVER_TARGET_ASSET="recsqtt-linux-amd64"
 SERVER_TARGET_DIR="$ROOT/build/csqtt-uring-linux-$SERVER_TARGET_ASSET"
 
 TOOLCHAIN="1.97.1"
@@ -272,12 +273,16 @@ copy_asset() {
   echo "  $asset: $(stat -c '%s' "$ASSETS_DIR/$asset") bytes"
 }
 
-copy_asset x86_64-unknown-linux-musl csqtt-linux-amd64
+copy_asset x86_64-unknown-linux-musl recsqtt-linux-amd64
 
-# Obsolete single-asset name from the pre-variant pipeline.
+# Obsolete single-asset name from the pre-variant pipeline. The Cargo binary
+# itself is still called `csqtt` — that name is a contract with Dockerfile and
+# csqttctl, only the published asset name carries the reCSQTT brand.
 rm -f "$ASSETS_DIR/csqtt"
 
 # Remove only the known stale ARM payloads, never other files or build caches.
+# csqtt-* here is the historical asset name these files were shipped under;
+# renaming the check would leave them behind in a reused output directory.
 rm -f "$ASSETS_DIR/csqtt-linux-arm64" "$ASSETS_DIR/csqtt-linux-armv7" \
   "$DIST_DIR/csqtt-linux-arm64" "$DIST_DIR/csqtt-linux-armv7"
 
@@ -308,5 +313,5 @@ bash "$PROVENANCE_SCRIPT" write "${PROVENANCE_ARGS[@]}"
 bash "$PROVENANCE_SCRIPT" verify "${PROVENANCE_ARGS[@]}"
 
 section "Done"
-echo "Assets: $ASSETS_DIR/csqtt-linux-amd64"
-echo "Dist:   $DIST_DIR/csqtt-linux-amd64"
+echo "Assets: $ASSETS_DIR/recsqtt-linux-amd64"
+echo "Dist:   $DIST_DIR/recsqtt-linux-amd64"

@@ -5652,9 +5652,9 @@ pub async fn run(
 
 const PWA_MANIFEST: &str = r##"{
   "id": "/",
-  "name": "CSQTT",
-  "short_name": "CSQTT",
-  "description": "Панель управления сервером CSQTT",
+  "name": "reCSQTT",
+  "short_name": "reCSQTT",
+  "description": "Панель управления сервером reCSQTT",
   "lang": "ru",
   "start_url": "/",
   "scope": "/",
@@ -5699,7 +5699,7 @@ static PWA_ICON_512_PNG: LazyLock<Vec<u8>> = LazyLock::new(|| {
         .unwrap_or_default()
 });
 
-const PWA_SERVICE_WORKER: &str = r##"const CACHE_NAME = 'csqtt-panel-shell-2.5.3-pwa5';
+const PWA_SERVICE_WORKER: &str = r##"const CACHE_NAME = 'csqtt-panel-shell-2.5.4-pwa6';
 const base = self.location.pathname.replace(/\/sw\.js$/, '');
 const SHELL_ASSETS = ['/manifest.webmanifest', '/pwa-icon.svg', '/pwa-icon-192.png', '/pwa-icon-512.png', '/qrcode.min.js'].map(p => (base ? base : '') + p);
 
@@ -5780,10 +5780,10 @@ const LOGIN_HTML_TEMPLATE: &str = r##"
     <link rel="icon" type="image/svg+xml" href="/pwa-icon.svg">
     <link rel="apple-touch-icon" href="/pwa-icon.svg">
     <link rel="icon" type="image/png" sizes="192x192" href="/pwa-icon-192.png">
-    <meta property="og:title" content="CSQTT">
+    <meta property="og:title" content="reCSQTT">
     <meta property="og:type" content="website">
     <meta property="og:image" content="/pwa-icon.svg">
-    <title>CSQTT — Вход</title>
+    <title>reCSQTT — Вход</title>
     <style>
         /*__THEME_TOKENS__*/
 
@@ -5919,7 +5919,7 @@ const CLIENT_SUB_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
     <meta name="theme-color" id="themeColorMeta" content="#f8fafc">
     <link rel="icon" type="image/svg+xml" href="/pwa-icon.svg">
     <link rel="apple-touch-icon" href="/pwa-icon.svg">
-    <meta property="og:title" content="CSQTT">
+    <meta property="og:title" content="reCSQTT">
     <meta property="og:type" content="website">
     <meta property="og:image" content="/pwa-icon.svg">
     <title>Подписка: __CLIENT_NAME__</title>
@@ -6086,7 +6086,7 @@ const CLIENT_SUB_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
             </div>
         </div>
         <div class="dlg-actions" style="justify-content: center; display: flex; margin-top: 16px;">
-            <a id="qrDlgConnectBtn" href="__CSQTT_LINK__" class="btn btn-primary" style="width: 100%; height: 42px; text-decoration: none; display: flex; align-items: center; justify-content: center; font-weight: 500; font-size: 14px; border-radius: 8px;">Подключить в приложении CSQTT</a>
+            <a id="qrDlgConnectBtn" href="__CSQTT_LINK__" class="btn btn-primary" style="width: 100%; height: 42px; text-decoration: none; display: flex; align-items: center; justify-content: center; font-weight: 500; font-size: 14px; border-radius: 8px;">Подключить в приложении reCSQTT</a>
         </div>
     </dialog>
 
@@ -6179,7 +6179,7 @@ const GROUP_SUB_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
     <meta name="theme-color" id="themeColorMeta" content="#f8fafc">
     <link rel="icon" type="image/svg+xml" href="/pwa-icon.svg">
     <link rel="apple-touch-icon" href="/pwa-icon.svg">
-    <meta property="og:title" content="CSQTT">
+    <meta property="og:title" content="reCSQTT">
     <meta property="og:type" content="website">
     <title>Подписка группы: __GROUP_NAME__</title>
     <script src="/qrcode.min.js"></script>
@@ -6531,7 +6531,7 @@ const GROUP_SUB_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
                             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
                         </button>
                     </div>
-                    <a href="${esc(c.link)}" class="btn btn-primary">Подключить в приложении CSQTT</a>
+                    <a href="${esc(c.link)}" class="btn btn-primary">Подключить в приложении reCSQTT</a>
                 </div>
                 `;
             });
@@ -6563,10 +6563,10 @@ const GROUP_ADMIN_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
     <meta name="theme-color" id="themeColorMeta" content="#0a0a0c">
     <link rel="icon" type="image/svg+xml" href="/pwa-icon.svg">
     <link rel="apple-touch-icon" href="/pwa-icon.svg">
-    <meta property="og:title" content="CSQTT">
+    <meta property="og:title" content="reCSQTT">
     <meta property="og:type" content="website">
     <meta property="og:image" content="/pwa-icon.svg">
-    <title>CSQTT — Панель группы</title>
+    <title>reCSQTT — Панель группы</title>
     <script src="/qrcode.min.js"></script>
     <style>
         /*__THEME_TOKENS__*/
@@ -8191,10 +8191,10 @@ const PANEL_HTML_TEMPLATE: &str = r##"
     <link rel="icon" type="image/svg+xml" href="/pwa-icon.svg">
     <link rel="apple-touch-icon" href="/pwa-icon.svg">
     <link rel="icon" type="image/png" sizes="192x192" href="/pwa-icon-192.png">
-    <meta property="og:title" content="CSQTT">
+    <meta property="og:title" content="reCSQTT">
     <meta property="og:type" content="website">
     <meta property="og:image" content="/pwa-icon.svg">
-    <title>CSQTT</title>
+    <title>reCSQTT</title>
     <script src="/qrcode.min.js"></script>
     <style>
         /*__THEME_TOKENS__*/
@@ -9394,14 +9394,14 @@ const PANEL_HTML_TEMPLATE: &str = r##"
 <body>
     <header>
         <div class="header-container">
-            <div class="brand" aria-label="CSQTT">
-                <svg class="brand-logo" viewBox="0 0 760 184" role="img" aria-label="CSQTT">
+            <div class="brand" aria-label="reCSQTT">
+                <svg class="brand-logo" viewBox="0 0 760 184" role="img" aria-label="reCSQTT">
                     <defs>
                         <linearGradient id="csqttLogoGradient" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="68" y2="340">
                             <stop offset="0" stop-color="#3DBFFD"></stop><stop offset="0.32" stop-color="#299BFD"></stop><stop offset="0.66" stop-color="#1475FD"></stop><stop offset="1" stop-color="#0450FC"></stop>
                         </linearGradient>
                     </defs>
-                    <path fill="url(#csqttLogoGradient)" fill-rule="evenodd" d="M79,11 L66,15 L48,25 L40,32 L27,49 L21,62 L17,78 L17,98 L19,108 L22,117 L33,136 L40,144 L56,156 L66,161 L84,166 L108,166 L118,164 L127,161 L143,152 L157,139 L160,135 L160,133 L137,116 L135,116 L123,128 L113,133 L106,135 L100,135 L99,136 L87,135 L73,130 L67,126 L57,116 L51,105 L48,93 L48,83 L51,71 L58,59 L67,50 L83,42 L105,41 L115,44 L129,53 L136,61 L160,44 L160,42 L155,35 L144,25 L135,19 L124,14 L108,10 Z M219,13 L208,18 L201,23 L191,35 L186,49 L186,66 L188,73 L193,82 L200,89 L208,94 L219,98 L248,103 L264,108 L270,113 L272,117 L272,125 L267,132 L260,136 L255,137 L234,137 L220,133 L212,129 L199,119 L181,141 L199,155 L212,161 L222,164 L232,165 L233,166 L257,166 L276,161 L285,156 L292,150 L298,142 L302,132 L303,112 L297,97 L287,87 L276,81 L258,76 L234,72 L224,68 L218,63 L216,58 L217,50 L222,44 L228,41 L237,39 L248,39 L258,41 L268,45 L279,53 L281,53 L299,32 L285,21 L270,14 L259,11 L233,10 Z M354,25 L344,34 L333,49 L328,60 L324,74 L324,79 L323,80 L324,103 L329,119 L336,132 L349,147 L360,155 L372,161 L391,166 L414,166 L430,162 L442,156 L460,174 L478,156 L462,140 L469,131 L474,122 L479,109 L481,99 L481,77 L479,68 L474,54 L466,41 L453,27 L441,19 L430,14 L414,10 L385,11 L372,15 Z M389,42 L411,41 L427,47 L442,61 L449,76 L450,96 L447,106 L444,112 L439,118 L421,100 L404,116 L405,119 L418,132 L416,134 L399,136 L385,133 L377,129 L363,116 L355,99 L354,83 L357,71 L361,63 L373,50 L379,46 Z M496,13 L496,44 L536,44 L537,45 L537,163 L568,163 L568,45 L569,44 L609,44 L610,43 L610,13 Z M628,13 L627,14 L627,37 L628,38 L627,43 L628,44 L666,44 L667,45 L667,163 L698,163 L699,162 L699,45 L700,44 L738,44 L738,13 Z"></path>
+                    <path fill="url(#csqttLogoGradient)" fill-rule="evenodd" d="M75.6,95.4 Q72.8,94.1 70,93.5 Q67.3,92.8 64.5,92.8 Q56.2,92.8 51.8,98.1 Q47.3,103.4 47.3,113.2 L47.3,144 L26,144 L26,77.2 L47.3,77.2 L47.3,88.2 Q51.5,81.6 56.8,78.6 Q62.1,75.6 69.6,75.6 Q70.7,75.6 71.9,75.7 Q73.2,75.8 75.5,76.1 Z M160.3,110.4 L160.3,116.5 L110.4,116.5 Q111.1,124 115.8,127.8 Q120.4,131.5 128.8,131.5 Q135.5,131.5 142.6,129.5 Q149.7,127.5 157.1,123.5 L157.1,139.9 Q149.5,142.8 142,144.3 Q134.4,145.7 126.8,145.7 Q108.7,145.7 98.6,136.5 Q88.6,127.3 88.6,110.7 Q88.6,94.3 98.5,85 Q108.3,75.6 125.6,75.6 Q141.4,75.6 150.8,85.1 Q160.3,94.6 160.3,110.4 Z M138.3,103.3 Q138.3,97.3 134.8,93.5 Q131.2,89.8 125.5,89.8 Q119.3,89.8 115.4,93.3 Q111.6,96.8 110.6,103.3 Z M271.6,138 Q263.9,142 255.5,144.1 Q247.2,146.1 238.1,146.1 Q211,146.1 195.1,130.9 Q179.3,115.8 179.3,89.8 Q179.3,63.8 195.1,48.6 Q211,33.5 238.1,33.5 Q247.2,33.5 255.5,35.5 Q263.9,37.6 271.6,41.6 L271.6,64 Q263.8,58.7 256.3,56.2 Q248.7,53.8 240.3,53.8 Q225.4,53.8 216.8,63.4 Q208.2,73 208.2,89.8 Q208.2,106.6 216.8,116.2 Q225.4,125.8 240.3,125.8 Q248.7,125.8 256.3,123.4 Q263.8,120.9 271.6,115.6 Z M366.1,38.9 L366.1,61.8 Q357.2,57.8 348.7,55.8 Q340.2,53.8 332.6,53.8 Q322.6,53.8 317.8,56.5 Q313,59.3 313,65.1 Q313,69.5 316.2,71.9 Q319.4,74.3 327.9,76.1 L339.9,78.5 Q358,82.1 365.6,89.5 Q373.2,97 373.2,110.6 Q373.2,128.6 362.6,137.3 Q351.9,146.1 330.1,146.1 Q319.7,146.1 309.3,144.1 Q298.9,142.2 288.5,138.3 L288.5,114.7 Q298.9,120.2 308.6,123 Q318.4,125.8 327.4,125.8 Q336.5,125.8 341.4,122.8 Q346.3,119.7 346.3,114 Q346.3,109 343,106.2 Q339.7,103.4 329.8,101.2 L318.9,98.9 Q302.6,95.4 295.1,87.7 Q287.6,80.1 287.6,67.2 Q287.6,50.9 298.1,42.2 Q308.5,33.5 328.2,33.5 Q337.1,33.5 346.6,34.8 Q356,36.2 366.1,38.9 Z M448.1,146 L445.9,146 Q419.1,146 404.1,131.1 Q389.2,116.3 389.2,89.8 Q389.2,63.4 404.1,48.5 Q419,33.5 445.1,33.5 Q471.5,33.5 486.2,48.3 Q500.9,63.2 500.9,89.8 Q500.9,108.2 493.1,121.4 Q485.3,134.6 470.6,141.3 L492.5,165.7 L465.8,165.7 Z M445.1,53.8 Q432.3,53.8 425.2,63.2 Q418.2,72.7 418.2,89.8 Q418.2,107.3 425.1,116.6 Q432,125.8 445.1,125.8 Q457.9,125.8 465,116.4 Q472.1,106.9 472.1,89.8 Q472.1,72.7 465,63.2 Q457.9,53.8 445.1,53.8 Z M515.9,35.5 L616,35.5 L616,56.6 L580,56.6 L580,144 L552,144 L552,56.6 L515.9,56.6 Z M634,35.5 L734,35.5 L734,56.6 L698,56.6 L698,144 L670,144 L670,56.6 L634,56.6 Z"></path>
                 </svg>
             </div>
             <div class="header-actions">
@@ -9631,9 +9631,9 @@ const PANEL_HTML_TEMPLATE: &str = r##"
     <dialog id="localProxyInfoDlg">
         <h2 style="font-size: 20px; margin-bottom: 20px;">SOCKS5 UDP</h2>
         <ul class="proxy-info-list">
-            <li><strong>Зачем нужно?</strong> Маршрутизировать трафик из CSQTT в Xray, 3x-ui и другие панели. Это нужно, чтобы маршрутизировать трафик через geoip/geodat и работать с любыми возможностями ваших панелей.</li>
-            <li><strong>Как работает?</strong> CSQTT передаёт TCP и UDP в локальный SOCKS5. Если прокси недоступен, используется прямой выход через основной VPS.</li>
-            <li><strong>Как настроить?</strong> В соответствующем ядре или веб-панели заранее создайте инбаунд SOCKS5-прокси (в некоторых панелях он может называться mixed) с предпочитаемым портом и включите UDP в настройках прокси. Затем укажите в панели CSQTT тот же самый порт.</li>
+            <li><strong>Зачем нужно?</strong> Маршрутизировать трафик из reCSQTT в Xray, 3x-ui и другие панели. Это нужно, чтобы маршрутизировать трафик через geoip/geodat и работать с любыми возможностями ваших панелей.</li>
+            <li><strong>Как работает?</strong> reCSQTT передаёт TCP и UDP в локальный SOCKS5. Если прокси недоступен, используется прямой выход через основной VPS.</li>
+            <li><strong>Как настроить?</strong> В соответствующем ядре или веб-панели заранее создайте инбаунд SOCKS5-прокси (в некоторых панелях он может называться mixed) с предпочитаемым портом и включите UDP в настройках прокси. Затем укажите в панели reCSQTT тот же самый порт.</li>
         </ul>
         <div class="dlg-actions" style="margin-top: 24px;">
             <button class="btn btn-primary" onclick="document.getElementById('localProxyInfoDlg').close()">Понятно</button>
@@ -9642,7 +9642,7 @@ const PANEL_HTML_TEMPLATE: &str = r##"
 
     <dialog id="vkHashesInfoDlg">
         <h2 style="font-size: 20px; margin-bottom: 16px;">VK хеши в ссылке</h2>
-        <p style="color: var(--text-muted); font-size: 14px; line-height: 1.6; margin: 0;">Укажите от 1 до 6 VK-хешей через запятую без пробелов. Вставляйте только сами значения хешей. Они будут добавлены в ссылку CSQTT v2, и пользователю не придётся вводить их вручную.</p>
+        <p style="color: var(--text-muted); font-size: 14px; line-height: 1.6; margin: 0;">Укажите от 1 до 6 VK-хешей через запятую без пробелов. Вставляйте только сами значения хешей. Они будут добавлены в ссылку reCSQTT v2, и пользователю не придётся вводить их вручную.</p>
         <div class="dlg-actions" style="margin-top: 24px;">
             <button class="btn btn-primary" onclick="document.getElementById('vkHashesInfoDlg').close()">Понятно</button>
         </div>
@@ -9650,7 +9650,7 @@ const PANEL_HTML_TEMPLATE: &str = r##"
 
     <dialog id="vkTokenSettingsDlg">
         <h2 style="font-size: 20px; margin-bottom: 16px;">Настройка VK токенов</h2>
-        <p style="color: var(--text-muted); font-size: 14px; line-height: 1.6; margin: 0 0 18px;">Если сохранить VK токен здесь, все CSQTT-ссылки с включённой функцией VK токена будут автоматически использовать этот общий токен.</p>
+        <p style="color: var(--text-muted); font-size: 14px; line-height: 1.6; margin: 0 0 18px;">Если сохранить VK токен здесь, все reCSQTT-ссылки с включённой функцией VK токена будут автоматически использовать этот общий токен.</p>
         <div class="input-group" style="margin-bottom: 0;">
             <label for="vkTokenSettingsInput">Бессрочный VK токен</label>
             <input id="vkTokenSettingsInput" type="password" maxlength="4096" autocomplete="off" spellcheck="false">
@@ -10568,7 +10568,7 @@ const PANEL_HTML_TEMPLATE: &str = r##"
                 </div>
                 <div class="api-card-body">
                     <p style="font-size: 12px; color: var(--text-muted);">
-                        Публичная веб-страница подписки клиента (без необходимости авторизации). Содержит живой векторный QR-код, прямую ссылку <code>csqtt://connect?...</code>, кнопку «Подключить в приложении CSQTT» (с нативным уведомлением в приложении), контрастную кнопку копирования и инструкции.
+                        Публичная веб-страница подписки клиента (без необходимости авторизации). Содержит живой векторный QR-код, прямую ссылку <code>csqtt://connect?...</code>, кнопку «Подключить в приложении reCSQTT» (с нативным уведомлением в приложении), контрастную кнопку копирования и инструкции.
                     </p>
                 </div>
             </div>
@@ -10604,7 +10604,7 @@ const PANEL_HTML_TEMPLATE: &str = r##"
                 </div>
                 <div class="api-card-body">
                     <p style="font-size: 12px; color: var(--text-muted);">
-                        Публичная адаптивная страница для группы. Выводит всех активных клиентов группы в виде аккуратной сетки с QR-кодами, ссылками, кнопками копирования и быстрого подключения в CSQTT.
+                        Публичная адаптивная страница для группы. Выводит всех активных клиентов группы в виде аккуратной сетки с QR-кодами, ссылками, кнопками копирования и быстрого подключения в reCSQTT.
                     </p>
                 </div>
             </div>
@@ -10898,11 +10898,11 @@ const PANEL_HTML_TEMPLATE: &str = r##"
                 <div class="api-card-header">
                     <span class="api-method post">POST</span>
                     <span class="api-path">/api/reboot</span>
-                    <span class="api-desc">Перезапуск сервера CSQTT</span>
+                    <span class="api-desc">Перезапуск сервера reCSQTT</span>
                 </div>
                 <div class="api-card-body">
                     <p style="font-size: 12px; color: var(--text-muted);">
-                        Инициирует контролируемый мягкий перезапуск процесса CSQTT на сервере.
+                        Инициирует контролируемый мягкий перезапуск процесса reCSQTT на сервере.
                     </p>
                 </div>
             </div>
@@ -10915,7 +10915,7 @@ const PANEL_HTML_TEMPLATE: &str = r##"
 
     <dialog id="rebootDlg">
         <h2>Перезапуск сервера</h2>
-        <p style="color: var(--text-muted); font-size: 15px; margin-bottom: 24px;">Вы уверены, что хотите перезапустить CSQTT? Активные соединения будут прерваны на несколько секунд.</p>
+        <p style="color: var(--text-muted); font-size: 15px; margin-bottom: 24px;">Вы уверены, что хотите перезапустить reCSQTT? Активные соединения будут прерваны на несколько секунд.</p>
         <div class="dlg-actions">
             <button class="btn btn-ghost" onclick="document.getElementById('rebootDlg').close()">Отмена</button>
             <button class="btn btn-primary" onclick="executeReboot()">Перезапустить</button>

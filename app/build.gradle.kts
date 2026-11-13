@@ -143,14 +143,14 @@ android {
         applicationId = "csqtt.quic.amurcanov"
         minSdk = 26
         targetSdk = 37
-        versionCode = 233
+        versionCode = 234
         // The release version plus an optional suffix supplied by CI: the beta
         // workflow passes -Pcsqtt.versionSuffix=-beta.<short-sha>. The literal
         // stays first: the sed/regex parsers in scripts/build_apk.sh,
         // scripts/install_apk.sh, .github/scripts/collect-release-assets.sh,
         // .github/scripts/release-note.sh, the "Verify APK identity" step and
         // scripts/gen_version_lockup.py all read versionName from this line.
-        versionName = "2.5.3" +
+        versionName = "2.5.4" +
             (providers.gradleProperty("csqtt.versionSuffix").orNull ?: "")
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"

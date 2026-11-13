@@ -141,7 +141,7 @@ ok
 # Отсутствующая запись install.sh: тот же отказ, установщик не запускается.
 NO_ENTRY_TAG=v9.9.7
 make_release "$NO_ENTRY_TAG"
-printf '%064d  csqtt-linux-amd64\n' 0 >"$TMP/repo/releases/download/$NO_ENTRY_TAG/SHA256SUMS"
+printf '%064d  recsqtt-linux-amd64\n' 0 >"$TMP/repo/releases/download/$NO_ENTRY_TAG/SHA256SUMS"
 run_sut "$BASE" --version "$NO_ENTRY_TAG"
 [[ "$STATUS" -ne 0 ]] || fail "missing SHA256SUMS entry must fail"
 assert_contains "$TMP/stderr.txt" "install.sh" "missing entry failure names install.sh"

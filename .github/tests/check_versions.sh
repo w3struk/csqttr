@@ -72,7 +72,7 @@ EOF
 
     cat >"$root/rust-server/main.rs" <<'EOF'
 fn banner() {
-    log_event(&app, "INFO", "SYSTEM", " CSQTT Server 2.5.2");
+    log_event(&app, "INFO", "SYSTEM", " reCSQTT Server 2.5.2");
 }
 EOF
 
@@ -144,7 +144,7 @@ expect_failure_naming "Cargo.lock rust-server с чужой версией" "rus
 
 # 7. Расхождение баннера в main.rs.
 write_fixture "$TMP_ROOT"
-sed -i 's/CSQTT Server 2\.5\.2/CSQTT Server 2.5.1/' "$TMP_ROOT/rust-server/main.rs"
+sed -i 's/reCSQTT Server 2\.5\.2/reCSQTT Server 2.5.1/' "$TMP_ROOT/rust-server/main.rs"
 expect_failure_naming "баннер main.rs с чужой версией" "rust-server/main.rs"
 
 # 8. Расхождение CACHE_NAME в web_panel.rs.

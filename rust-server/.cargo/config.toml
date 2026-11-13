@@ -1,12 +1,13 @@
 [build]
 target = "x86_64-unknown-linux-musl"
-# Один target-dir на clippy/test/release — тот же, что у build_linux.sh и
-# build_linux_variants.sh (build/csqtt-uring-linux-csqtt-linux-amd64).
+# Один target-dir на clippy/test/release — тот же, что у build_linux.sh,
+# build_linux_variants.sh и кеша в build.yml
+# (build/csqtt-uring-linux-recsqtt-linux-amd64).
 # Относительный путь резолвится от каталога этого файла (rust-server/), поэтому
 # конфиг действует только при cwd внутри rust-server; `cargo` из корня
 # репозитория его не увидит и создаст локальный target/. Переменная окружения
 # CARGO_TARGET_DIR перекрывает значение отсюда (так делают build_linux.sh и CI).
-target-dir = "../build/csqtt-uring-linux-csqtt-linux-amd64"
+target-dir = "../build/csqtt-uring-linux-recsqtt-linux-amd64"
 
 [target.x86_64-unknown-linux-musl]
 rustflags = ["-C", "link-self-contained=no"]

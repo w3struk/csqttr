@@ -1281,7 +1281,7 @@ class TunnelService : Service() {
     private fun createNotificationChannel() {
         val channel = NotificationChannel(
             TUNNEL_NOTIFICATION_CHANNEL_ID,
-            "CSQTT Туннель",
+            "reCSQTT Туннель",
             NotificationManager.IMPORTANCE_LOW
         ).apply {
             description = "Уведомление о работе туннеля"
@@ -1314,7 +1314,7 @@ class TunnelService : Service() {
         )
 
         return NotificationCompat.Builder(this, TUNNEL_NOTIFICATION_CHANNEL_ID)
-            .setContentTitle("CSQTT")
+            .setContentTitle("reCSQTT")
             .setContentText(text)
             .setSmallIcon(R.drawable.ic_stat_c)
             .setOngoing(true)

@@ -12,7 +12,7 @@
 #   * release.yml состоит из четырёх job'ов (resolve -> build -> image,
 #     publish): build вызывает build.yml с ref из needs.resolve.outputs.commit,
 #     publish публикует через needs.*, image собирает docker/Dockerfile из
-#     артефакта build и пушит ghcr.io/<owner>/csqtt:{<version>,latest} только
+#     артефакта build и пушит ghcr.io/<owner>/recsqtt:{<version>,latest} только
 #     вне dry-run; гейтов и сборки в файле нет;
 #   * image — единственный job с packages: write, зависит от build, но не от
 #     publish, и пинится на linux/amd64;
@@ -368,7 +368,7 @@ for secret_name in sorted(build_secrets):
 # --- image (GHCR) ------------------------------------------------------------
 # Образ сервера: единственный job, которому разрешён packages: write, и
 # единственный, кто публикует в GHCR. Артефакт — тот же, что у publish, так что
-# источник бинаря один: assets/csqtt-linux-amd64 из release-assets-<version>.
+# источник бинаря один: assets/recsqtt-linux-amd64 из release-assets-<version>.
 image_job = jobs["image"]
 want(isinstance(image_job, dict), "job image — не mapping")
 want(
@@ -438,7 +438,7 @@ want(
 stage = image_by_name.get("Stage server binary")
 want(stage is not None, "в image нет шага 'Stage server binary'")
 stage_run = str(stage.get("run", ""))
-for fragment in ("build-output/assets/csqtt-linux-amd64", "docker/csqtt"):
+for fragment in ("build-output/assets/recsqtt-linux-amd64", "docker/csqtt"):
     want(
         fragment in stage_run,
         "'Stage server binary' обязан содержать %r, получено:\n%s"
@@ -517,11 +517,11 @@ image_tags = [
 want(
     image_tags
     == [
-        "ghcr.io/${{ github.repository_owner }}/csqtt:"
+        "ghcr.io/${{ github.repository_owner }}/recsqtt:"
         "${{ needs.resolve.outputs.version }}",
-        "ghcr.io/${{ github.repository_owner }}/csqtt:latest",
+        "ghcr.io/${{ github.repository_owner }}/recsqtt:latest",
     ],
-    "теги образа обязаны быть <version> и latest под ghcr.io/<owner>/csqtt, "
+    "теги образа обязаны быть <version> и latest под ghcr.io/<owner>/recsqtt, "
     "получено %r" % (image_tags,),
 )
 
@@ -1384,12 +1384,20 @@ stage = by_name["Stage build outputs"]
 stage_run = str(stage.get("run", ""))
 server_sources = re.findall(r"app/build/generated/assets/[^\s\\\"']+", stage_run)
 want(
-    server_sources == ["app/build/generated/assets/csqtt-linux-amd64"],
+    server_sources == ["app/build/generated/assets/recsqtt-linux-amd64"],
     "'Stage build outputs' обязан иметь только один явный amd64 server source, "
     "получено %r" % (server_sources,),
 )
 want(
-    "csqtt-linux-arm64" not in stage_run and "csqtt-linux-armv7" not in stage_run,
+    all(
+        name not in stage_run
+        for name in (
+            "csqtt-linux-arm64",
+            "csqtt-linux-armv7",
+            "recsqtt-linux-arm64",
+            "recsqtt-linux-armv7",
+        )
+    ),
     "'Stage build outputs' не должен ссылаться на ARM server assets",
 )
 want(
@@ -1397,7 +1405,7 @@ want(
     "'Stage build outputs' не должен копировать серверные assets глобом",
 )
 want(
-    'cp -f app/build/generated/assets/csqtt-linux-amd64 "$STAGE/assets/"' in stage_run,
+    'cp -f app/build/generated/assets/recsqtt-linux-amd64 "$STAGE/assets/"' in stage_run,
     "'Stage build outputs' обязан явно копировать amd64 server в $STAGE/assets/",
 )
 want(

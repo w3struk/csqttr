@@ -6,7 +6,7 @@ FROM alpine:3.21
 RUN apk add --no-cache ca-certificates curl iproute2 iptables openssl
 
 # The binary is placed in the build context by CI (release asset
-# csqtt-linux-amd64). It is not built inside this image.
+# recsqtt-linux-amd64). It is not built inside this image.
 COPY csqtt /usr/local/bin/csqtt
 COPY entrypoint.sh healthcheck.sh /usr/local/lib/csqtt/
 RUN chmod 0755 /usr/local/bin/csqtt \

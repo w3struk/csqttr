@@ -4,7 +4,7 @@
 #
 # Linux-only replacement for scripts/run_wsl_checks.sh.
 #
-# Runs the four CSQTT system checks on the local Linux host:
+# Runs the four reCSQTT system checks on the local Linux host:
 #   1. native (musl) server test binary from the Rust build tree
 #   2. standalone TUN device + HTTPS web panel
 #   3. systemd service lifecycle (root only)
@@ -21,7 +21,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 
 # Server assets are generated into app/build/generated/assets (see rust-server/build_linux.sh).
-SERVER_BIN="$ROOT/app/build/generated/assets/csqtt-linux-amd64"
+SERVER_BIN="$ROOT/app/build/generated/assets/recsqtt-linux-amd64"
 
 STANDALONE_LISTEN_PORT="${STANDALONE_LISTEN_PORT:-46100}"
 STANDALONE_WEB_PORT="${STANDALONE_WEB_PORT:-46102}"
@@ -98,7 +98,7 @@ if [[ -r /etc/os-release ]]; then
 else
     OS_PRETTY="unknown Linux"
 fi
-echo "CSQTT Linux Environment Diagnostics: $OS_PRETTY"
+echo "reCSQTT Linux Environment Diagnostics: $OS_PRETTY"
 echo "============================================================"
 
 if [[ ! -x "$SERVER_BIN" ]]; then
@@ -211,7 +211,7 @@ else
     rm -f "$SERVICE_FILE"
     cat >"$SERVICE_FILE" <<EOF
 [Unit]
-Description=CSQTT Test Service
+Description=reCSQTT Test Service
 After=network.target
 
 [Service]

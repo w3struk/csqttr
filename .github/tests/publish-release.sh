@@ -469,7 +469,7 @@ chmod +x "$TMP/bin/gh"
 
 NOTE_FILE="$TMP/note.md"
 cat >"$NOTE_FILE" <<'EOF'
-## CSQTT 9.9.9
+## reCSQTT 9.9.9
 
 Тег: v9.9.9
 Wire-ревизия: CSQTT-WIRE-3
@@ -478,7 +478,7 @@ Wire-ревизия: CSQTT-WIRE-3
 EOF
 
 ASSET_ARGS=()
-for asset in CSQTT-9.9.9-universal.apk CSQTT-9.9.9-arm64-v8a.apk csqtt-linux-amd64; do
+for asset in recsqtt-9.9.9-universal.apk recsqtt-9.9.9-arm64-v8a.apk recsqtt-linux-amd64; do
     printf 'payload\n' >"$TMP/assets/$asset"
     ASSET_ARGS+=(--asset "$TMP/assets/$asset")
 done
@@ -561,7 +561,7 @@ run_sut() {
 
     env "${env_opts[@]}" "${env_args[@]}" bash "$SUT" \
         --tag "$TAG" \
-        --title "CSQTT 9.9.9" \
+        --title "reCSQTT 9.9.9" \
         --note-file "$NOTE_FILE" \
         "${ASSET_ARGS[@]}" \
         "$@"
@@ -599,9 +599,9 @@ expect_sut_ok
 
 assert_log_regex '^release create v9\.9\.9 -R o/r --verify-tag --generate-notes --draft ' \
     "the draft is created with -R, --verify-tag, --generate-notes and --draft"
-assert_log "--title CSQTT 9.9.9"
+assert_log "--title reCSQTT 9.9.9"
 assert_log "--notes $NOTE_ESCAPED"
-for asset in CSQTT-9.9.9-universal.apk CSQTT-9.9.9-arm64-v8a.apk csqtt-linux-amd64; do
+for asset in recsqtt-9.9.9-universal.apk recsqtt-9.9.9-arm64-v8a.apk recsqtt-linux-amd64; do
     assert_log "$TMP/assets/$asset"
 done
 assert_no_log_regex 'cleanup-tag' "the tag must never be deleted with the draft"
@@ -642,7 +642,7 @@ assert_eq "$(jq -r '.releases["v9.9.10"].draft' "$STATE")" "false" \
 new_scenario "body without the marker: no publication"
 TAG="v9.9.11"
 FAKE_BODY_OVERRIDE="$(
-    printf '## CSQTT 9.9.11\n\nТело без маркера.\n'
+    printf '## reCSQTT 9.9.11\n\nТело без маркера.\n'
 )"
 expect_sut_fail "does not contain"
 

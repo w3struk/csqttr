@@ -69,7 +69,7 @@ fun CsqttScreen(
                 ) {
                     Icon(
                         painter = painterResource(id = R.drawable.ic_csqtt_logo),
-                        contentDescription = "CSQTT",
+                        contentDescription = "reCSQTT",
                         tint = Color.Unspecified,
                         modifier = Modifier.height(22.dp)
                     )

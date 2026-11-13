@@ -63,8 +63,8 @@ restore_valid_fixture() {
         ASSET_DIR="$ROOT/app/build/generated/assets"
         MANIFEST="$ROOT/app/build/generated/provenance/csqtt-server.json"
     fi
-    AMD64="$ASSET_DIR/csqtt-linux-amd64"
-    VALID_ARGS=("${PATH_ARGS[@]}" --assets=csqtt-linux-amd64)
+    AMD64="$ASSET_DIR/recsqtt-linux-amd64"
+    VALID_ARGS=("${PATH_ARGS[@]}" --assets=recsqtt-linux-amd64)
     write_server_elf "$AMD64" 2 62 "$WIRE_REVISION" || fail "could not write amd64 ELF fixture"
     expect_success "restored fixture write" write "${VALID_ARGS[@]}"
     expect_success "restored fixture verify" verify "${VALID_ARGS[@]}"
@@ -72,7 +72,7 @@ restore_valid_fixture() {
 
 assert_amd64_manifest() {
     local manifest="$1"
-    jq -e '.schema == "csqtt.server-asset-provenance.v4" and (.artifacts | length) == 1 and .artifacts[0].assetName == "csqtt-linux-amd64" and .artifacts[0].target == "x86_64-unknown-linux-musl" and .artifacts[0].elfClass == 2 and .artifacts[0].elfMachine == 62' "$manifest" >/dev/null ||
+    jq -e '.schema == "csqtt.server-asset-provenance.v4" and (.artifacts | length) == 1 and .artifacts[0].assetName == "recsqtt-linux-amd64" and .artifacts[0].target == "x86_64-unknown-linux-musl" and .artifacts[0].elfClass == 2 and .artifacts[0].elfMachine == 62' "$manifest" >/dev/null ||
         fail "manifest must describe exactly the amd64 production artifact"
     jq -e '.marker == "CSQTT_RUST_SERVER_PRODUCTION_V1" and .producer == "rust-server/build_linux.sh" and .runtime == "rust" and .features == []' "$manifest" >/dev/null ||
         fail "production identity and default features must be preserved"
@@ -100,10 +100,10 @@ test_default_amd64_manifest() {
     unrelated_hash="$(sha256sum "$ASSET_DIR/csqtt-linux-mips")"
     # Known ARM names outside the selected assets directory are irrelevant.
     write_server_elf "$ROOT/app/build/generated/assets/csqtt-linux-arm64" 2 183 "$WIRE_REVISION"
-    expect_success "explicit amd64 and custom paths" write "${PATH_ARGS[@]}" --assets csqtt-linux-amd64
+    expect_success "explicit amd64 and custom paths" write "${PATH_ARGS[@]}" --assets recsqtt-linux-amd64
     assert_amd64_manifest "$MANIFEST"
     expect_success "equals-form assets and custom paths" verify --root "$ROOT" \
-        --assets=csqtt-linux-amd64 --assets-dir="$ASSET_DIR" --manifest="$MANIFEST"
+        --assets=recsqtt-linux-amd64 --assets-dir="$ASSET_DIR" --manifest="$MANIFEST"
     [[ "$(sha256sum "$ASSET_DIR/csqtt-linux-mips")" == "$unrelated_hash" ]] ||
         fail "custom write/verify changed an unrelated asset"
 }
@@ -111,11 +111,14 @@ test_default_amd64_manifest() {
 test_invalid_asset_selection() {
     local selection form mode class machine
     local -a selection_args
-    for selection in csqtt-linux-arm64 csqtt-linux-armv7 csqtt-linux-mips '' ',' \
-        csqtt-linux-amd64,csqtt-linux-amd64 csqtt-linux-amd64,csqtt-linux-arm64 \
-        csqtt-linux-amd64,csqtt-linux-arm64,csqtt-linux-armv7 \
-        ,csqtt-linux-amd64 csqtt-linux-amd64, csqtt-linux-amd64,, \
-        $'csqtt-linux-amd64\ncsqtt-linux-arm64'; do
+    # The pre-rebrand amd64 name is now just another unsupported selection, and
+    # it must stay rejected: accepting it would let an old asset slip past the
+    # renamed provenance allowlist.
+    for selection in csqtt-linux-amd64 csqtt-linux-arm64 csqtt-linux-armv7 csqtt-linux-mips '' ',' \
+        recsqtt-linux-amd64,recsqtt-linux-amd64 recsqtt-linux-amd64,csqtt-linux-arm64 \
+        recsqtt-linux-amd64,csqtt-linux-arm64,csqtt-linux-armv7 \
+        ,recsqtt-linux-amd64 recsqtt-linux-amd64, recsqtt-linux-amd64,, \
+        $'recsqtt-linux-amd64\ncsqtt-linux-arm64'; do
         for form in split equals; do
             for mode in write verify; do
                 restore_valid_fixture
@@ -211,11 +214,11 @@ test_integrity_and_features_fail_closed() {
             case "$mutation" in
                 missing)
                     rm -- "$AMD64"
-                    fragment="Linux server asset csqtt-linux-amd64 not found"
+                    fragment="Linux server asset recsqtt-linux-amd64 not found"
                     ;;
                 empty)
                     : >"$AMD64"
-                    fragment="Linux server asset csqtt-linux-amd64 is empty"
+                    fragment="Linux server asset recsqtt-linux-amd64 is empty"
                     ;;
                 short)
                     printf '\177ELF\002\001' >"$AMD64"

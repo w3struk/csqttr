@@ -6,7 +6,7 @@ import org.junit.Test
 
 /**
  * Проверка источника обновлений: приложение обязано смотреть в наш репозиторий
- * (`w3struk/csqttr`), а не в апстрим. Иначе «Проверить обновления» предлагает
+ * (`w3struk/recsqtt`), а не в апстрим. Иначе «Проверить обновления» предлагает
  * чужие релизы.
  */
 class UpdateSourceContractTest {
@@ -23,7 +23,7 @@ class UpdateSourceContractTest {
     @Test
     fun updateUrlsPointToOurRepository() {
         urls.forEach { url ->
-            assertTrue("URL должен вести в w3struk/csqttr: $url", url.contains("w3struk/csqttr"))
+            assertTrue("URL должен вести в w3struk/recsqtt: $url", url.contains("w3struk/recsqtt"))
         }
     }
 

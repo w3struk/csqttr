@@ -10,7 +10,7 @@
 
 set -Eeuo pipefail
 
-CSQTT_RELEASE_BASE="${CSQTT_RELEASE_BASE:-https://github.com/w3struk/csqttr}"
+CSQTT_RELEASE_BASE="${CSQTT_RELEASE_BASE:-https://github.com/w3struk/recsqtt}"
 readonly EXIT_INVALID_ARGUMENT=2
 readonly EXIT_PREFLIGHT_FAILED=20
 readonly CURL_OPTS=(-fsSL --retry 3 --connect-timeout 10)
@@ -19,7 +19,7 @@ usage() {
     cat <<'EOF'
 Usage: bootstrap.sh [--version <vX.Y.Z>] [install.sh arguments...]
 
-Downloads install.sh and SHA256SUMS from the CSQTT release, verifies the
+Downloads install.sh and SHA256SUMS from the reCSQTT release, verifies the
 SHA-256 of the installer and runs it with the remaining arguments.
 
   --version <vX.Y.Z>  pin the release (default: the latest release)
@@ -32,7 +32,7 @@ EOF
 }
 
 die() {
-    printf 'CSQTT bootstrap: %s\n' "$1" >&2
+    printf 'reCSQTT bootstrap: %s\n' "$1" >&2
     exit "${2:-$EXIT_PREFLIGHT_FAILED}"
 }
 
@@ -168,7 +168,7 @@ elif [[ -n "$version" ]]; then
 else
     label="(последний релиз)"
 fi
-printf 'CSQTT bootstrap: запуск install.sh %s\n' "$label"
+printf 'reCSQTT bootstrap: запуск install.sh %s\n' "$label"
 
 status=0
 if ((pinned)); then

@@ -5,14 +5,14 @@
 # Writes or verifies the provenance manifest of the server binaries published as
 # a separate release asset (never inside the APK). Both the binaries and the
 # manifest live under app/build/generated/.
-# Usage: server_asset_provenance.sh <write|verify> [--root DIR] [--assets csqtt-linux-amd64]
+# Usage: server_asset_provenance.sh <write|verify> [--root DIR] [--assets recsqtt-linux-amd64]
 #                                         [--assets-dir DIR] [--manifest FILE]
 
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 MODE=""
-ALL_ASSETS=(csqtt-linux-amd64)
+ALL_ASSETS=(recsqtt-linux-amd64)
 ASSETS=("${ALL_ASSETS[@]}")
 ASSET_DIR=""
 MANIFEST=""
@@ -40,7 +40,7 @@ require_cmd() {
 
 select_assets() {
     # Check the whole value: splitting would hide trailing commas or newlines.
-    [[ "$1" == "csqtt-linux-amd64" ]] || die "--assets must be exactly csqtt-linux-amd64"
+    [[ "$1" == "recsqtt-linux-amd64" ]] || die "--assets must be exactly recsqtt-linux-amd64"
     ASSETS=("$1")
 }
 
@@ -110,26 +110,26 @@ WIRE_REVISION_SOURCE="$ROOT/rust-server/main.rs"
 
 valid_asset() {
     case "$1" in
-        csqtt-linux-amd64) return 0 ;;
+        recsqtt-linux-amd64) return 0 ;;
         *) return 1 ;;
     esac
 }
 
 asset_target() {
     case "$1" in
-        csqtt-linux-amd64) printf 'x86_64-unknown-linux-musl\n' ;;
+        recsqtt-linux-amd64) printf 'x86_64-unknown-linux-musl\n' ;;
     esac
 }
 
 asset_elf_class() {
     case "$1" in
-        csqtt-linux-amd64) printf '2\n' ;;
+        recsqtt-linux-amd64) printf '2\n' ;;
     esac
 }
 
 asset_elf_machine() {
     case "$1" in
-        csqtt-linux-amd64) printf '62\n' ;;
+        recsqtt-linux-amd64) printf '62\n' ;;
     esac
 }
 

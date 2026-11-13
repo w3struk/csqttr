@@ -70,7 +70,7 @@ class InstallScriptContractTest {
     fun `reserved runtime directories recover from a failed previous install`() {
         val deploy = script()
         assertTrue(deploy.contains("ensure_csqtt_directory()"))
-        assertTrue(deploy.contains("rm -rf -- \"\$path\" || die \"Не удалось очистить путь CSQTT: \$path\""))
+        assertTrue(deploy.contains("rm -rf -- \"\$path\" || die \"Не удалось очистить путь reCSQTT: \$path\""))
         assertTrue(deploy.contains("ensure_persistent_directory \"\$CSQTT_CONFIG_DIR\" 700"))
         assertTrue(deploy.contains("ensure_csqtt_directory \"\$CSQTT_LIB_DIR\" 755"))
         assertTrue(deploy.contains("setup_csqtt_environment() {\n    ensure_persistent_directory \"\$CSQTT_CONFIG_DIR\" 700"))
@@ -224,7 +224,7 @@ class InstallScriptContractTest {
         assertTrue(deploy.contains("systemctl list-units --type=service --all --no-legend --plain 2>/dev/null || true"))
         assertTrue(deploy.contains("systemctl list-unit-files --type=service --no-legend --plain 2>/dev/null || true"))
         assertTrue(deploy.contains("if ! timeout 10 systemctl stop \"\$unit\" >/dev/null 2>&1; then"))
-        assertTrue(deploy.contains("systemctl is-active --quiet \"\$unit\"; then\n            die \"Не удалось остановить systemd runtime CSQTT: \$unit\""))
+        assertTrue(deploy.contains("systemctl is-active --quiet \"\$unit\"; then\n            die \"Не удалось остановить systemd runtime reCSQTT: \$unit\""))
     }
 
     @Test

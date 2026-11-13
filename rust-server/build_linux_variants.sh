@@ -21,7 +21,7 @@ TOOLCHAIN="1.97.1"
 
 VARIANT_NAMES=(amd64)
 VARIANT_TARGETS=(x86_64-unknown-linux-musl)
-VARIANT_ASSETS=(csqtt-linux-amd64)
+VARIANT_ASSETS=(recsqtt-linux-amd64)
 
 usage() {
   cat <<'EOF'

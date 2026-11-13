@@ -110,7 +110,7 @@ make_fixture() {
     ASSETS="$ROOT/app/build/generated/assets"
     DIST="$ROOT/rust-server/dist"
     MANIFEST="$ROOT/app/build/generated/provenance/csqtt-server.json"
-    CARGO_BINARY="$ROOT/build/csqtt-uring-linux-csqtt-linux-amd64/x86_64-unknown-linux-musl/release/csqtt"
+    CARGO_BINARY="$ROOT/build/csqtt-uring-linux-recsqtt-linux-amd64/x86_64-unknown-linux-musl/release/csqtt"
     OUT="$ROOT/stdout.txt" ERR="$ROOT/stderr.txt" CALLS="$ROOT/calls.jsonl"
     export SERVER_BUILD_CALLS="$CALLS" SERVER_BUILD_CARGO_MODE=ok
 }
@@ -162,9 +162,9 @@ builds = [c for c in calls if c['tool'] == 'cargo' and c['argv'] == payload]
 assert len(builds) == 1, builds
 build = builds[0]
 assert build['cwd'] == root + '/rust-server', build
-assert build['targetDir'] == root + '/build/csqtt-uring-linux-csqtt-linux-amd64', build
-assert build['globalCache'] == root + '/build/zig-cache/csqtt-linux-amd64/global', build
-assert build['localCache'] == root + '/build/zig-cache/csqtt-linux-amd64/local', build
+assert build['targetDir'] == root + '/build/csqtt-uring-linux-recsqtt-linux-amd64', build
+assert build['globalCache'] == root + '/build/zig-cache/recsqtt-linux-amd64/global', build
+assert build['localCache'] == root + '/build/zig-cache/recsqtt-linux-amd64/local', build
 # Один target-dir на clippy/test/release: иначе зависимости компилируются
 # трижды за прогон (clippy, тесты и финальная сборка в разных каталогах).
 for call in calls:
@@ -175,7 +175,7 @@ PY
 
 assert_payload() {
     local features="${1:-[]}" path sha size
-    for path in "$CARGO_BINARY" "$ASSETS/csqtt-linux-amd64" "$DIST/csqtt-linux-amd64"; do
+    for path in "$CARGO_BINARY" "$ASSETS/recsqtt-linux-amd64" "$DIST/recsqtt-linux-amd64"; do
         [[ -f "$path" && "$(stat -c '%a' "$path")" == 755 ]] || fail "missing or non-0755 payload: $path"
         cmp -s -- "$CARGO_BINARY" "$path" || fail "copy differs from Cargo output: $path"
     done
@@ -192,7 +192,7 @@ assert_payload() {
         .marker == "CSQTT_RUST_SERVER_PRODUCTION_V1" and
         .producer == "rust-server/build_linux.sh" and .runtime == "rust" and
         .features == $features and (.artifacts | length) == 1 and
-        .artifacts[0] == {assetName: "csqtt-linux-amd64", target: "x86_64-unknown-linux-musl",
+        .artifacts[0] == {assetName: "recsqtt-linux-amd64", target: "x86_64-unknown-linux-musl",
                          elfClass: 2, elfMachine: 62, binarySize: $size, binarySha256: $sha}
     ' "$MANIFEST" >/dev/null || fail "expected one-entry amd64 manifest with real hash/size and correct features"
 }
@@ -311,7 +311,7 @@ test_failed_or_missing_cargo_output() {
                     grep -qF 'binary missing' "$OUT" || fail "successful cargo without binary was not reported"
                 fi
                 if [[ "$script" == build_linux.sh ]]; then assert_calls producer no ''; else assert_calls variants no ''; fi
-                [[ ! -e "$ASSETS/csqtt-linux-amd64" && ! -e "$DIST/csqtt-linux-amd64" && ! -e "$MANIFEST" ]] ||
+                [[ ! -e "$ASSETS/recsqtt-linux-amd64" && ! -e "$DIST/recsqtt-linux-amd64" && ! -e "$MANIFEST" ]] ||
                     fail "failed/missing Cargo output reached copying or provenance"
             done
         done

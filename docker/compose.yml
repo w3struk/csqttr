@@ -1,8 +1,8 @@
-# CSQTT server. Self-provisioning: the first `up` creates identity, config and
+# reCSQTT server. Self-provisioning: the first `up` creates identity, config and
 # TLS in ./csqtt-data; the installer is not involved.
 services:
   csqtt:
-    image: ${CSQTT_IMAGE:-ghcr.io/w3struk/csqtt:2.5.3}
+    image: ${CSQTT_IMAGE:-ghcr.io/w3struk/recsqtt:2.5.4}
     container_name: csqtt
     labels:
       com.csqtt.managed: "true"
