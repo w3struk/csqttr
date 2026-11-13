@@ -2671,10 +2671,14 @@ EOF
 # ---------------------------------------------------------------------------
 
 t_seed_install_state() {
-    local mode="$1" panel_mode="$2" panel_host="$3" peer="$4" web="$5" ssh="$6"
+    local mode="$1" panel_mode="$2" panel_host="$3" peer="$4" web="$5" ssh="$6" version
+    # Версия берётся из установщика, а не литералом: иначе каждый бамп версии
+    # ломает кейсы «та же версия → no-op».
+    version="$(sed -n 's/^readonly SCRIPT_VERSION="\([^"]*\)".*/\1/p' "$DEPLOY_SCRIPT" | head -n 1)"
+    [ -n "$version" ] || version="2.5.2"
     mkdir -p "$FAKE_CFG"
-    printf '{"version":"2.5.2","mode":"%s","panel_mode":"%s","panel_host":"%s","peer_port":"%s","web_port":"%s","ssh_port":"%s","tls":"","installed_at":"1","updated_at":"1"}\n' \
-        "$mode" "$panel_mode" "$panel_host" "$peer" "$web" "$ssh" > "$FAKE_CFG/install.json"
+    printf '{"version":"%s","mode":"%s","panel_mode":"%s","panel_host":"%s","peer_port":"%s","web_port":"%s","ssh_port":"%s","tls":"","installed_at":"1","updated_at":"1"}\n' \
+        "$version" "$mode" "$panel_mode" "$panel_host" "$peer" "$web" "$ssh" > "$FAKE_CFG/install.json"
 }
 
 panel_env_value() {

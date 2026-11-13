@@ -1143,7 +1143,7 @@ async fn async_main() -> Result<()> {
         });
     }
 
-    log_event(&app, "INFO", "SYSTEM", " CSQTT Server 2.5.2");
+    log_event(&app, "INFO", "SYSTEM", " CSQTT Server 2.5.3");
     log_event(
         &app,
         "INFO",

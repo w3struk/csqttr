@@ -127,6 +127,8 @@ assert_line "$NOTE" '^Сервер:$' "server section header"
 assert_line "$NOTE" '^- csqtt-linux-amd64$' "amd64 binary listed"
 assert_no_line "$NOTE" '^- csqtt-linux-arm64$' "arm64 server binary is not listed"
 assert_no_line "$NOTE" '^- csqtt-linux-armv7$' "armv7 server binary is not listed"
+assert_line "$NOTE" '^Контейнерный образ: ghcr\.io/[^/]+/csqtt:[0-9]+\.[0-9]+\.[0-9]+ \(amd64\)$' \
+    "container image is listed with version and amd64" 
 assert_line "$NOTE" '^Контрольные суммы: SHA256SUMS$' "checksums line"
 assert_line "$NOTE" '^Права после скачивания: chmod \+x csqtt-linux-amd64$' "chmod hint names only the amd64 server"
 assert_line "$NOTE" '^Установщик: bootstrap\.sh → install\.sh$' "one-liner starts from bootstrap.sh"

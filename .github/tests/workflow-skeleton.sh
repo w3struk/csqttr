@@ -9,9 +9,13 @@
 # Проверяется только то, что можно проверить без запуска раннера:
 #   * YAML парсится, триггеры и permissions разнесены между workflow и job;
 #   * concurrency релиза — константная группа;
-#   * release.yml состоит из трёх job'ов (resolve -> build -> publish): build
-#     вызывает build.yml с ref из needs.resolve.outputs.commit, publish
-#     публикует через needs.*; гейтов и сборки в файле нет;
+#   * release.yml состоит из четырёх job'ов (resolve -> build -> image,
+#     publish): build вызывает build.yml с ref из needs.resolve.outputs.commit,
+#     publish публикует через needs.*, image собирает docker/Dockerfile из
+#     артефакта build и пушит ghcr.io/<owner>/csqtt:{<version>,latest} только
+#     вне dry-run; гейтов и сборки в файле нет;
+#   * image — единственный job с packages: write, зависит от build, но не от
+#     publish, и пинится на linux/amd64;
 #   * в теле publish нет подстановок шагов resolve/старта/подписи — после
 #     переноса это job'ы, а не шаги;
 #   * каждый `needs.<job>.outputs.<name>` объявлен у job'а (у вызывающего
@@ -185,8 +189,8 @@ want(
 jobs = doc.get("jobs")
 want(isinstance(jobs, dict), "нет блока jobs")
 want(
-    set(jobs) == {"resolve", "build", "publish"},
-    "jobs обязаны быть ровно {resolve, build, publish}, получено %r"
+    set(jobs) == {"resolve", "build", "image", "publish"},
+    "jobs обязаны быть ровно {resolve, build, image, publish}, получено %r"
     % (sorted(jobs),),
 )
 
@@ -360,6 +364,166 @@ for secret_name in sorted(build_secrets):
         "build.secrets.%s обязан быть ${{ secrets.%s }}, получено %r"
         % (secret_name, secret_name, build_secrets[secret_name]),
     )
+
+# --- image (GHCR) ------------------------------------------------------------
+# Образ сервера: единственный job, которому разрешён packages: write, и
+# единственный, кто публикует в GHCR. Артефакт — тот же, что у publish, так что
+# источник бинаря один: assets/csqtt-linux-amd64 из release-assets-<version>.
+image_job = jobs["image"]
+want(isinstance(image_job, dict), "job image — не mapping")
+want(
+    needs_list(image_job) == ["resolve", "build"],
+    "image.needs обязан быть [resolve, build], получено %r" % (image_job.get("needs"),),
+)
+want(
+    "publish" not in needs_list(image_job),
+    "image не должен зависеть от publish: образ полезен и при упавшей публикации",
+)
+want(
+    image_job.get("permissions") == {"contents": "read", "packages": "write"},
+    "permissions job'а image обязаны быть {contents: read, packages: write}, получено %r"
+    % (image_job.get("permissions"),),
+)
+want(
+    image_job.get("runs-on") == "ubuntu-24.04",
+    "image.runs-on должен быть 'ubuntu-24.04', получено %r"
+    % (image_job.get("runs-on"),),
+)
+want(
+    isinstance(image_job.get("timeout-minutes"), int),
+    "image.timeout-minutes должен быть целым числом, получено %r"
+    % (image_job.get("timeout-minutes"),),
+)
+want(
+    "if" not in image_job,
+    "у job'а image не должно быть job-level if: dry-run обязан собирать образ, "
+    "гейтится только push, получено %r" % (image_job.get("if"),),
+)
+
+image_steps = image_job.get("steps")
+want(isinstance(image_steps, list) and image_steps, "у job'а image нет шагов")
+image_by_name = {step.get("name"): step for step in image_steps}
+
+image_checkout = image_by_name.get("Checkout")
+want(image_checkout is not None, "в image нет шага 'Checkout'")
+want(
+    (image_checkout.get("with") or {}).get("ref")
+    == "${{ needs.resolve.outputs.commit }}",
+    "Checkout в image обязан чекаутить дерево needs.resolve.outputs.commit "
+    "(Dockerfile и entrypoint — из тега, а не из ветки), получено %r"
+    % ((image_checkout.get("with") or {}).get("ref"),),
+)
+
+image_download = image_by_name.get("Download build artifact")
+want(image_download is not None, "в image нет шага 'Download build artifact'")
+want(
+    str(image_download.get("uses", "")).startswith("actions/download-artifact@"),
+    "в image артефакт обязан скачиваться actions/download-artifact, получено %r"
+    % (image_download.get("uses"),),
+)
+image_download_with = image_download.get("with") or {}
+want(
+    image_download_with.get("name") == "${{ needs.build.outputs.artifact-name }}",
+    "image: 'Download build artifact'.name обязан быть "
+    "needs.build.outputs.artifact-name, получено %r"
+    % (image_download_with.get("name"),),
+)
+want(
+    image_download_with.get("path") == "${{ runner.temp }}/build-output",
+    "image: 'Download build artifact'.path обязан быть "
+    "${{ runner.temp }}/build-output, получено %r"
+    % (image_download_with.get("path"),),
+)
+
+stage = image_by_name.get("Stage server binary")
+want(stage is not None, "в image нет шага 'Stage server binary'")
+stage_run = str(stage.get("run", ""))
+for fragment in ("build-output/assets/csqtt-linux-amd64", "docker/csqtt"):
+    want(
+        fragment in stage_run,
+        "'Stage server binary' обязан содержать %r, получено:\n%s"
+        % (fragment, stage_run),
+    )
+
+buildx = image_by_name.get("Set up Buildx")
+want(buildx is not None, "в image нет шага 'Set up Buildx'")
+want(
+    str(buildx.get("uses", "")).startswith("docker/setup-buildx-action@"),
+    "шаг 'Set up Buildx' обязан использовать docker/setup-buildx-action, получено %r"
+    % (buildx.get("uses"),),
+)
+
+login = image_by_name.get("Log in to GHCR")
+want(login is not None, "в image нет шага 'Log in to GHCR'")
+want(
+    str(login.get("uses", "")).startswith("docker/login-action@"),
+    "шаг 'Log in to GHCR' обязан использовать docker/login-action, получено %r"
+    % (login.get("uses"),),
+)
+login_if = str(login.get("if", ""))
+want(
+    re.search(r"needs\.resolve\.outputs\.dry_run\s*==\s*'false'", login_if)
+    and "!=" not in login_if,
+    "логин в GHCR обязан быть только при dry_run == 'false', получено %r"
+    % (login_if,),
+)
+login_with = login.get("with") or {}
+want(
+    login_with.get("registry") == "ghcr.io",
+    "image: логин обязан идти в ghcr.io, получено %r" % (login_with.get("registry"),),
+)
+want(
+    login_with.get("username") == "${{ github.repository_owner }}",
+    "image: логин обязан использовать github.repository_owner, получено %r"
+    % (login_with.get("username"),),
+)
+want(
+    login_with.get("password") == "${{ github.token }}",
+    "image: пароль берётся из ${{ github.token }}, а не из секрета, получено %r"
+    % (login_with.get("password"),),
+)
+
+image_push = image_by_name.get("Build and push image")
+want(image_push is not None, "в image нет шага 'Build and push image'")
+want(
+    str(image_push.get("uses", "")).startswith("docker/build-push-action@"),
+    "шаг 'Build and push image' обязан использовать docker/build-push-action, "
+    "получено %r" % (image_push.get("uses"),),
+)
+image_push_with = image_push.get("with") or {}
+want(
+    image_push_with.get("context") == "docker"
+    and image_push_with.get("file") == "docker/Dockerfile",
+    "образ обязан собираться из context 'docker' и file 'docker/Dockerfile', "
+    "получено %r/%r"
+    % (image_push_with.get("context"), image_push_with.get("file")),
+)
+want(
+    image_push_with.get("platforms") == "linux/amd64",
+    "платформа образа обязана быть ровно linux/amd64, получено %r"
+    % (image_push_with.get("platforms"),),
+)
+want(
+    str(image_push_with.get("push", "")).strip()
+    == "${{ needs.resolve.outputs.dry_run == 'false' }}",
+    "job image обязан пушить образ (dry-run отсекается if job'а), получено %r"
+    % (image_push_with.get("push"),),
+)
+image_tags = [
+    line.strip()
+    for line in str(image_push_with.get("tags", "")).splitlines()
+    if line.strip()
+]
+want(
+    image_tags
+    == [
+        "ghcr.io/${{ github.repository_owner }}/csqtt:"
+        "${{ needs.resolve.outputs.version }}",
+        "ghcr.io/${{ github.repository_owner }}/csqtt:latest",
+    ],
+    "теги образа обязаны быть <version> и latest под ghcr.io/<owner>/csqtt, "
+    "получено %r" % (image_tags,),
+)
 
 # --- publish -----------------------------------------------------------------
 publish_job = jobs["publish"]
@@ -920,7 +1084,6 @@ TOOLCHAIN = [
 GATES = [
     "Gate: Kotlin unit tests",
     "Gate: Rust client",
-    "Gate: Rust server (musl via zig wrappers)",
 ]
 for name in TOOLCHAIN + GATES:
     require_step(name)
@@ -959,15 +1122,54 @@ want(
     by_name["Gate: Rust client"].get("working-directory") == "rust-client",
     "у 'Gate: Rust client' должен быть working-directory: rust-client",
 )
+
+# 10.8a Серверных pre-build проверок отдельным гейтом больше нет: fmt/clippy/test
+#       идут в шаге 'Build server binary', в том же CARGO_TARGET_DIR, что и сама
+#       сборка. Свой CARGO_TARGET_DIR шаг задавать не должен — иначе каталоги
+#       снова разъедутся и зависимости скомпилируются дважды.
+SERVER_BUILD = "Build server binary"
+server_build = require_step(SERVER_BUILD)
+server_build_run = str(server_build.get("run", ""))
 want(
-    by_name["Gate: Rust server (musl via zig wrappers)"].get("working-directory")
-    == "rust-server",
-    "у 'Gate: Rust server (musl via zig wrappers)' должен быть working-directory: rust-server",
+    server_build.get("working-directory") == "rust-server",
+    "у 'Build server binary' должен быть working-directory: rust-server",
 )
 want(
-    "musl-zig-env.sh"
-    in by_name["Gate: Rust server (musl via zig wrappers)"].get("run", ""),
-    "серверный гейт обязан source'ить .github/scripts/musl-zig-env.sh",
+    re.search(r"source\s+\S*musl-zig-env\.sh", server_build_run),
+    "'Build server binary' обязан source'ить .github/scripts/musl-zig-env.sh "
+    "(без него cc-rs не находит x86_64-linux-musl-g++)",
+)
+want(
+    re.search(r"build_linux\.sh\s+--tests\b", server_build_run),
+    "'Build server binary' обязан вызывать build_linux.sh --tests",
+)
+want(
+    "--no-tests" not in server_build_run,
+    "'Build server binary' не должен передавать --no-tests: fmt/clippy/test "
+    "живут в этом же шаге и каталоге",
+)
+want(
+    "CARGO_TARGET_DIR" not in server_build_run,
+    "'Build server binary' не должен задавать CARGO_TARGET_DIR: единый каталог "
+    "выбирает build_linux.sh",
+)
+server_build_position = names.index(SERVER_BUILD)
+want(
+    max(toolchain_positions) < server_build_position,
+    "'Build server binary' обязан идти после шагов тулчейна (cargo/zig/cargo-tools)",
+)
+want(
+    max(gate_positions) < server_build_position,
+    "'Build server binary' обязан идти после дешёвых гейтов",
+)
+want(
+    "Restore keystore" in names,
+    "нет шага 'Restore keystore'",
+)
+want(
+    server_build_position < names.index("Restore keystore"),
+    "'Build server binary' обязан идти до 'Restore keystore': серверной сборке "
+    "keystore не нужен, а падать она должна раньше, чем тратится время на APK",
 )
 
 # 10.9 Пины cargo-* совпадают с версиями в ключе кеша cargo-bin, а сама

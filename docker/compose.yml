@@ -1,0 +1,41 @@
+# CSQTT server. Self-provisioning: the first `up` creates identity, config and
+# TLS in ./csqtt-data; the installer is not involved.
+services:
+  csqtt:
+    image: ${CSQTT_IMAGE:-ghcr.io/w3struk/csqtt:2.5.3}
+    container_name: csqtt
+    labels:
+      com.csqtt.managed: "true"
+      com.csqtt.component: server
+    restart: unless-stopped
+    stop_grace_period: 5s
+    network_mode: host
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - NET_BIND_SERVICE
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    security_opt:
+      - seccomp=unconfined
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    volumes:
+      - ./csqtt-data:/etc/csqtt
+      - /run/csqtt:/run/csqtt
+      - /run/xtables.lock:/run/xtables.lock
+    environment:
+      CSQTT_SERVICE_MANAGER: docker
+      # Optional public domain (e.g. vpn.example.org). Empty means autodetect
+      # the public IPv4 on first start; ignored once csqtt.env exists.
+      CSQTT_HOST: ${CSQTT_HOST:-}
+    healthcheck:
+      test: ["CMD", "/usr/local/lib/csqtt/healthcheck.sh"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s

@@ -5,7 +5,7 @@ set -Eeuo pipefail
 export DEBIAN_FRONTEND=noninteractive
 export TERM="${TERM:-xterm}"
 
-readonly SCRIPT_VERSION="2.5.2"
+readonly SCRIPT_VERSION="2.5.3"
 # Журнал установки. Отдельная константа, потому что читающие подкоманды
 # (logs/status/credentials/panel) обязаны видеть настоящий путь, а писать в
 # журнал им нельзя: main перенаправляет их LOG_FILE в /dev/null.
@@ -59,7 +59,7 @@ CANDIDATE_ENV_FILE=""
 readonly CSQTT_SYSCTL_FILE="${CSQTT_SYSCTL_FILE-${CSQTT_SYSCTL_DIR}/99-csqtt.conf}"
 readonly CSQTT_UDP_SYSCTL_FILE="${CSQTT_UDP_SYSCTL_FILE-${CSQTT_SYSCTL_DIR}/99-csqtt-udp-buffers.conf}"
 readonly IPT_COMMENT="CSQTT_MANAGED"
-readonly CSQTT_DOCKER_IMAGE="csqtt:2.5.2"
+readonly CSQTT_DOCKER_IMAGE="csqtt:2.5.3"
 readonly CSQTT_DOCKER_CONTAINER="csqtt"
 readonly CSQTT_DOCKER_PREREQ_SERVICE="csqtt-docker-prereq.service"
 readonly CSQTT_DOCKER_PREREQ_HELPER="${CSQTT_DOCKER_PREREQ_HELPER-${CSQTT_LIB_DIR}/docker-prereq.sh}"
