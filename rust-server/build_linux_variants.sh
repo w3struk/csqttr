@@ -90,6 +90,21 @@ if ! cargo zigbuild --help >/dev/null 2>&1; then
   exit 1
 fi
 
+# Ручные zig-обёртки из .github/scripts/musl-zig-env.sh нужны только cc-rs
+# (clippy/test): cargo-zigbuild выставляет свои переменные лишь когда их нет.
+# Для ФИНАЛЬНОГО линка эти обёртки вредны: rustc вызывает линкер без --target,
+# обёртка подставляет только явно переданный --target, и zig линкует против
+# glibc хоста. Бинарь получается динамическим (interpreter
+# /lib64/ld-linux-x86-64.so.2): он не запускается в alpine-образе и вообще не
+# является musl-сборкой. Поэтому в окружении zigbuild эти переменные снимаем и
+# отдаём выбор cargo-zigbuild.
+MANUAL_MUSL_ENV_UNSET=(
+  -u CC_x86_64_unknown_linux_musl
+  -u CXX_x86_64_unknown_linux_musl
+  -u AR_x86_64_unknown_linux_musl
+  -u CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER
+)
+
 mkdir -p "$LOG_DIR"
 for asset in "${VARIANT_ASSETS[@]}"; do
   mkdir -p "$ROOT/build/csqtt-uring-linux-$asset"
@@ -113,6 +128,7 @@ build_one() {
     (
       cd "$SERVER_DIR"
       exec env \
+        ${MANUAL_MUSL_ENV_UNSET[@]+"${MANUAL_MUSL_ENV_UNSET[@]}"} \
         ZIG_GLOBAL_CACHE_DIR="$ROOT/build/zig-cache/$asset/global" \
         ZIG_LOCAL_CACHE_DIR="$ROOT/build/zig-cache/$asset/local" \
         CARGO_TARGET_DIR="$target_dir" \
@@ -125,6 +141,7 @@ build_one() {
     (
       cd "$SERVER_DIR"
       exec env \
+        ${MANUAL_MUSL_ENV_UNSET[@]+"${MANUAL_MUSL_ENV_UNSET[@]}"} \
         ZIG_GLOBAL_CACHE_DIR="$ROOT/build/zig-cache/$asset/global" \
         ZIG_LOCAL_CACHE_DIR="$ROOT/build/zig-cache/$asset/local" \
         CARGO_TARGET_DIR="$target_dir" \

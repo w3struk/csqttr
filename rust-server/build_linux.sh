@@ -259,6 +259,28 @@ bash "$SERVER_DIR/build_linux_variants.sh" ${VARIANT_ARGS[@]+"${VARIANT_ARGS[@]}
 section "Copying server assets"
 mkdir -p "$ASSETS_DIR" "$DIST_DIR" "$(dirname "$PROVENANCE_MANIFEST")"
 
+# musl-цель обязана дать статически слинкованный бинарь. Динамический ELF
+# (interpreter /lib64/ld-linux-x86-64.so.2) получается, когда финальный линк
+# идёт ручной zig-обёрткой без --target: такой бинарь не запускается в
+# alpine-образе и не является переносимым серверным ассетом. Проверяем здесь,
+# чтобы сборка падала на месте, а не в контейнере.
+assert_static_binary() {
+  local src="$1"
+  local asset="$2"
+
+  if command -v readelf >/dev/null 2>&1; then
+    if readelf -l "$src" 2>/dev/null | grep -q 'INTERP'; then
+      echo "Error: $asset is dynamically linked; expected a static musl binary" >&2
+      exit 1
+    fi
+  elif command -v file >/dev/null 2>&1; then
+    if ! file -b "$src" | grep -q 'statically linked'; then
+      echo "Error: $asset is not static: $(file -b "$src")" >&2
+      exit 1
+    fi
+  fi
+}
+
 copy_asset() {
   local target="$1"
   local asset="$2"
@@ -268,6 +290,7 @@ copy_asset() {
     echo "Error: expected binary not found: $src" >&2
     exit 1
   fi
+  assert_static_binary "$src" "$asset"
   install -m 0755 "$src" "$ASSETS_DIR/$asset"
   install -m 0755 "$src" "$DIST_DIR/$asset"
   echo "  $asset: $(stat -c '%s' "$ASSETS_DIR/$asset") bytes"
