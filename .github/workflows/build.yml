@@ -264,10 +264,10 @@ jobs:
             cargo-client-android-${{ runner.os }}-
 
       # Серверный target-dir (release + LTO) и zig-кеши. Имя каталога совпадает
-      # с build_linux_variants.sh и rust-server/build_linux.sh, поэтому гейт и
-      # финальная сборка переиспользуют уже собранные зависимости. Безопасно:
-      # cargo инвалидирует по исходникам, кеш ускоряет только неизменённые
-      # зависимости.
+      # с build_linux_variants.sh и rust-server/build_linux.sh: clippy/test и
+      # финальная сборка живут в нём же, поэтому шаг Build server binary
+      # переиспользует уже собранные зависимости. Безопасно: cargo инвалидирует
+      # по исходникам, кеш ускоряет только неизменённые зависимости.
       - name: Cache Rust server target
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
@@ -403,19 +403,31 @@ jobs:
           cargo clippy --all-targets -- -D warnings
           cargo test --quiet
 
+      # Серверный бинарник упаковывался в APK только пока приложение умело
+      # разворачивать сервер. Теперь он публикуется отдельным ассетом, поэтому
+      # CI собирает его здесь: collect-release-assets.sh у вызывающего читает
+      # app/build/generated/assets/csqtt-linux-amd64.
+      #
+      # --tests: fmt/clippy/test живут в этом же шаге и в том же
+      # CARGO_TARGET_DIR, что и сама сборка
+      # (build/csqtt-uring-linux-csqtt-linux-amd64), поэтому clippy и zigbuild
+      # делят собранные зависимости. Свой CARGO_TARGET_DIR здесь задавать
+      # нельзя — он снова развёл бы каталоги и удвоил компиляцию.
+      # musl-zig-env.sh даёт cc-rs musl C/C++ (без него cc-rs падает:
+      # "failed to find tool x86_64-linux-musl-g++"); cargo-zigbuild ставит
+      # свои обёртки только при отсутствии переменных (add_env_if_missing),
+      # поэтому линкер посреди прогона не меняется.
       # LC_ALL=C: вывод cargo (а позже keytool) локализуется, а парсеры английские.
-      # CARGO_TARGET_DIR — как в локальном рецепте, чтобы не мешать сборке
-      # `cargo zigbuild` из Gradle.
-      - name: 'Gate: Rust server (musl via zig wrappers)'
+      # Шаг стоит до keystore: серверной сборке подпись не нужна, а падать она
+      # должна раньше, чем тратится время на APK.
+      - name: Build server binary
         working-directory: rust-server
         run: |
           set -euo pipefail
           export LC_ALL=C
           # shellcheck source=../.github/scripts/musl-zig-env.sh
           source ../.github/scripts/musl-zig-env.sh
-          cargo fmt --all -- --check
-          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/build/linux-musl-tests" cargo clippy --release --target x86_64-unknown-linux-musl --all-targets -- -D warnings
-          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/build/linux-musl-tests" cargo test --target x86_64-unknown-linux-musl
+          bash build_linux.sh --tests
 
       # Пароль идёт через env, а не argv: verify-signing-identity.sh передаёт
       # keytool `-storepass:env`, поэтому секрет не всплывает даже при
@@ -440,16 +452,6 @@ jobs:
             --storepass-env ANDROID_KEYSTORE_PASSWORD \
             --alias "$ANDROID_KEY_ALIAS" \
             --expected-fingerprint "$ANDROID_KEYSTORE_FINGERPRINT"
-
-      # Серверный бинарник упаковывался в APK только пока приложение умело
-      # разворачивать сервер. Теперь он публикуется отдельным ассетом, поэтому
-      # CI собирает его здесь: collect-release-assets.sh у вызывающего читает
-      # app/build/generated/assets/csqtt-linux-amd64. --no-tests: fmt/clippy/test
-      # уже прогнаны гейтом Rust server выше.
-      - name: Build server binary
-        run: |
-          set -euo pipefail
-          bash rust-server/build_linux.sh --no-tests
 
       # Имена env — ровно те, что читает verifyReleaseSigning в
       # app/build.gradle.kts. Gradle зовёт нативные скрипты с --no-tests,

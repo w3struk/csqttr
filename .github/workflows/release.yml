@@ -19,10 +19,11 @@ concurrency:
   group: release
   cancel-in-progress: false
 
-# Три job'а вместо одного:
+# Четыре job'а вместо одного:
 #   resolve — определяет тег/коммит/версию и запоминает время старта;
 #   build   — reusable build.yml собирает, проверяет и публикует артефакт
 #             release-assets-<version> (apk/ и assets/);
+#   image   — собирает серверный образ из docker/ и публикует его в GHCR;
 #   publish — скачивает артефакт, собирает ассеты релиза, пишет note и
 #             публикует GitHub Release.
 #
@@ -39,6 +40,9 @@ concurrency:
 #      живут в отдельном job'е publish и берут версию/подпись из выходов build.
 #      Поэтому подстановки идут через needs.resolve.outputs.* и
 #      needs.build.outputs.* — выходов шагов из resolve/сборки в publish нет.
+#   5. Образ в GHCR — отдельный job image, который зависит от build, но не от
+#      publish: падение публикации релиза не отменяет образ. Порядок и гейты
+#      это не меняет — гейты живут только в build.yml.
 jobs:
   resolve:
     name: Resolve release target
@@ -102,6 +106,71 @@ jobs:
       ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
       ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
       ANDROID_KEYSTORE_FINGERPRINT: ${{ secrets.ANDROID_KEYSTORE_FINGERPRINT }}
+
+  # Серверный образ. Зависит от build, но не от publish: образ нужен и тогда,
+  # когда публикация релиза упала. Job собирает образ всегда, включая dry-run
+  # (сборка — часть репетиции); push гейтится строгим сравнением с 'false',
+  # чтобы опечатка в имени выхода не запушила образ случайно.
+  image:
+    name: Publish server image
+    needs: [resolve, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # Единственный job с packages: write — без него push в GHCR запрещён.
+    # Остальные job'ы остаются на contents: read.
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      # Dockerfile и entrypoint берутся из дерева релизного коммита, а не из
+      # ветки, с которой запущен workflow_dispatch.
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+          persist-credentials: false
+
+      - name: Download build artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ needs.build.outputs.artifact-name }}
+          path: ${{ runner.temp }}/build-output
+
+      # Dockerfile делает `COPY csqtt /usr/local/bin/csqtt` при контексте
+      # docker/, поэтому бинарь из assets/ артефакта кладём рядом с ним.
+      - name: Stage server binary
+        run: |
+          set -euo pipefail
+          install -m 0755 \
+            "$RUNNER_TEMP/build-output/assets/csqtt-linux-amd64" \
+            docker/csqtt
+          file docker/csqtt
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # GITHUB_TOKEN, а не отдельный секрет: allowlist секретов не расширяется.
+      # Логин нужен только когда будет push; в dry-run образ только собирается.
+      - name: Log in to GHCR
+        if: needs.resolve.outputs.dry_run == 'false'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
+
+      # Имя образа — ghcr.io/<owner>/csqtt; github.repository_owner отдаёт
+      # владельца в нижнем регистре, как требует GHCR.
+      - name: Build and push image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: docker
+          file: docker/Dockerfile
+          platforms: linux/amd64
+          push: ${{ needs.resolve.outputs.dry_run == 'false' }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/csqtt:${{ needs.resolve.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/csqtt:latest
 
   publish:
     name: Publish release

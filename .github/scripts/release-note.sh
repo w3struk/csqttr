@@ -208,7 +208,10 @@ note="$(
         printf '\nСервер:\n'
         printf '%s\n' '- csqtt-linux-amd64'
 
-        printf '\nКонтрольные суммы: SHA256SUMS\n\n'
+        printf '\nКонтейнерный образ: ghcr.io/%s/csqtt:%s (amd64)\n\n' \
+            "${repo_slug%%/*}" "$version"
+
+        printf 'Контрольные суммы: SHA256SUMS\n\n'
         # GitHub не хранит режим файла в ассетах: без chmod бинарь не запустится.
         printf 'Права после скачивания: chmod +x csqtt-linux-amd64\n\n'
 

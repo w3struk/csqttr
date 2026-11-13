@@ -5699,7 +5699,7 @@ static PWA_ICON_512_PNG: LazyLock<Vec<u8>> = LazyLock::new(|| {
         .unwrap_or_default()
 });
 
-const PWA_SERVICE_WORKER: &str = r##"const CACHE_NAME = 'csqtt-panel-shell-2.5.2-pwa5';
+const PWA_SERVICE_WORKER: &str = r##"const CACHE_NAME = 'csqtt-panel-shell-2.5.3-pwa5';
 const base = self.location.pathname.replace(/\/sw\.js$/, '');
 const SHELL_ASSETS = ['/manifest.webmanifest', '/pwa-icon.svg', '/pwa-icon-192.png', '/pwa-icon-512.png', '/qrcode.min.js'].map(p => (base ? base : '') + p);
 
