@@ -338,9 +338,42 @@ async fn recv_stream_message(stream: &mut TcpStream) -> Vec<u8> {
     let mut wire = vec![0u8; 20 + attributes];
     wire[..20].copy_from_slice(&header);
     if attributes > 0 {
-        stream.read_exact(&mut wire[20..]).await.unwrap();
+        // Same deadline as the header: a server that writes half the body and
+        // stalls must produce a diagnosable timeout, not a hung suite.
+        tokio::time::timeout(Duration::from_secs(3), stream.read_exact(&mut wire[20..]))
+            .await
+            .expect("timed out reading the TURN message body")
+            .expect("failed to read the TURN message body");
     }
     wire
+}
+
+#[tokio::test]
+async fn recv_stream_message_times_out_on_a_partial_body() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut header = [0u8; 20];
+        header[3] = 8; // the body promises 8 bytes
+        socket.write_all(&header).await.unwrap();
+        socket.write_all(&[0u8; 4]).await.unwrap(); // half the body only
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+    let client = tokio::spawn(async move {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let _ = recv_stream_message(&mut stream).await;
+    });
+    let outcome = tokio::time::timeout(Duration::from_secs(8), client).await;
+    server.abort();
+    match outcome {
+        Ok(Err(join_error)) => assert!(
+            join_error.is_panic(),
+            "the helper must fail on a partial body, not return a message"
+        ),
+        Ok(Ok(())) => panic!("the helper returned a message for a partial body"),
+        Err(_) => panic!("the helper hung instead of timing out"),
+    }
 }
 
 async fn recv_stream_channel_data(stream: &mut TcpStream) -> Vec<u8> {

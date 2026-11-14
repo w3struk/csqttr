@@ -24,7 +24,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -309,13 +309,42 @@ struct OutboundQueue {
     queue: ArrayQueue<PacketBuf>,
     waiter: Notify,
     space: Notify,
+    /// Packets popped from `queue` but not yet handed to the socket. The queue
+    /// being empty is not enough for `deallocate`: between `pop()` and
+    /// `try_send()` the queue is empty while the packet is still on its way.
+    in_flight: AtomicUsize,
     shared: Arc<DriverShared>,
     socket: Arc<UdpSocket>,
 }
 
+/// Marks one packet as in flight; dropping it wakes a waiting `deallocate`.
+/// Acquired *before* the pop: otherwise a packet popped between the emptiness
+/// check and the counter bump would be sent after the deallocate refresh.
+struct InFlightGuard<'a>(&'a OutboundQueue);
+
+impl<'a> InFlightGuard<'a> {
+    fn acquire(queue: &'a OutboundQueue) -> Self {
+        queue.in_flight.fetch_add(1, Ordering::AcqRel);
+        Self(queue)
+    }
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        if self.0.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.space.notify_one();
+        }
+    }
+}
+
 async fn outbound_writer_loop(queue: Arc<OutboundQueue>) {
     loop {
-        while let Some(mut packet) = queue.queue.pop() {
+        loop {
+            let in_flight = InFlightGuard::acquire(&queue);
+            let Some(mut packet) = queue.queue.pop() else {
+                drop(in_flight);
+                break;
+            };
             queue.space.notify_one();
             if queue.shared.closing.load(Ordering::Acquire) {
                 drop(packet);
@@ -503,6 +532,7 @@ impl TurnAllocation {
                     queue: ArrayQueue::new(OUTBOUND_QUEUE_CAPACITY),
                     waiter: Notify::new(),
                     space: Notify::new(),
+                    in_flight: AtomicUsize::new(0),
                     shared: shared.clone(),
                     socket: socket.clone(),
                 });
@@ -721,10 +751,12 @@ impl TurnAllocation {
         if let Some(queue) = &self.outbound_queue {
             queue.waiter.notify_one();
             let flush_deadline = Instant::now() + OUTBOUND_FLUSH_WAIT;
-            while !queue.queue.is_empty() && Instant::now() < flush_deadline {
+            while (!queue.queue.is_empty() || queue.in_flight.load(Ordering::Acquire) > 0)
+                && Instant::now() < flush_deadline
+            {
                 let remaining = flush_deadline.saturating_duration_since(Instant::now());
                 let space = queue.space.notified();
-                if queue.queue.is_empty() {
+                if queue.queue.is_empty() && queue.in_flight.load(Ordering::Acquire) == 0 {
                     break;
                 }
                 let _ = tokio::time::timeout(remaining, space).await;
