@@ -22,7 +22,7 @@ trap 'rm -rf "$TMP_ROOT"' EXIT
 
 write_fixture() {
     local root="$1"
-    mkdir -p "$root/app" "$root/rust-client" "$root/rust-server" "$root/scripts"
+    mkdir -p "$root/app" "$root/rust-client" "$root/rust-server" "$root/scripts" "$root/docker"
 
     cat >"$root/app/build.gradle.kts" <<'EOF'
 android {
@@ -79,6 +79,18 @@ EOF
     cat >"$root/rust-server/web_panel.rs" <<'EOF'
 const PWA_SERVICE_WORKER: &str = r##"const CACHE_NAME = 'csqtt-panel-shell-2.5.2-pwa5';
 "##;
+EOF
+
+    cat >"$root/docker/compose.yml" <<'EOF'
+services:
+  csqtt:
+    image: ${CSQTT_IMAGE:-ghcr.io/w3struk/recsqtt:2.5.2}
+    container_name: csqtt
+EOF
+
+    cat >"$root/docker/.env.example" <<'EOF'
+# Точная версия, не latest: тег должен совпадать с бинарём в образе.
+CSQTT_IMAGE=ghcr.io/w3struk/recsqtt:2.5.2
 EOF
 }
 
@@ -152,5 +164,20 @@ write_fixture "$TMP_ROOT"
 sed -i 's/csqtt-panel-shell-2\.5\.2-pwa5/csqtt-panel-shell-2.5.1-pwa5/' \
     "$TMP_ROOT/rust-server/web_panel.rs"
 expect_failure_naming "CACHE_NAME web_panel.rs с чужой версией" "rust-server/web_panel.rs"
+
+# 9. Отставший тег образа в docker/compose.yml.
+write_fixture "$TMP_ROOT"
+sed -i 's/recsqtt:2\.5\.2}/recsqtt:2.5.1}/' "$TMP_ROOT/docker/compose.yml"
+expect_failure_naming "тег образа в docker/compose.yml с чужой версией" "docker/compose.yml"
+
+# 10. Отставший тег образа в docker/.env.example.
+write_fixture "$TMP_ROOT"
+sed -i 's/recsqtt:2\.5\.2$/recsqtt:2.5.1/' "$TMP_ROOT/docker/.env.example"
+expect_failure_naming "тег образа в docker/.env.example с чужой версией" "docker/.env.example"
+
+# 11. Отсутствующий docker/compose.yml.
+write_fixture "$TMP_ROOT"
+rm -f "$TMP_ROOT/docker/compose.yml"
+expect_failure_naming "отсутствующий docker/compose.yml" "docker/compose.yml"
 
 echo "check_versions fixture: OK"

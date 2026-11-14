@@ -11,6 +11,9 @@
 #   bash scripts/check_versions.sh                    # корень = текущий каталог
 #   bash scripts/check_versions.sh --root /path/repo
 #   bash scripts/check_versions.sh --root . --tag v2.5.2
+#
+# Тег контейнерного образа сверяется в docker/compose.yml и docker/.env.example
+# рядом с локальным тегом установщика (`CSQTT_DOCKER_IMAGE` в scripts/install.sh).
 
 set -euo pipefail
 
@@ -27,7 +30,8 @@ Usage: scripts/check_versions.sh [--root PATH] [--tag vX.Y.Z]
 Проверяет versionCode и все места, где продублирована версия:
 app/build.gradle.kts, rust-client/Cargo.{toml,lock},
 rust-server/Cargo.{toml,lock}, scripts/install.sh,
-rust-server/main.rs и rust-server/web_panel.rs.
+rust-server/main.rs, rust-server/web_panel.rs,
+docker/compose.yml и docker/.env.example.
 EOF
 }
 
@@ -131,6 +135,21 @@ cargo_lock_version() {
     ' "$1"
 }
 
+# Тег контейнерного образа из строки с `recsqtt:<tag>`.
+# compose:     image: ${CSQTT_IMAGE:-ghcr.io/w3struk/recsqtt:2.5.4}
+# .env:        CSQTT_IMAGE=ghcr.io/w3struk/recsqtt:2.5.4
+# Тег — всё после последнего `:`; у compose-формы сначала отрезается `}`.
+image_tag() {
+    local path="$1" line value
+    # Anchor on the assignment itself: a comment or an unrelated line
+    # mentioning `recsqtt:` must not satisfy the gate.
+    line=$(sed -n -E 's/^[[:space:]]*image:[[:space:]]*(.*)$/\1/p;
+                      s/^[[:space:]]*CSQTT_IMAGE=(.*)$/\1/p' "$path" | head -n 1)
+    # Compose uses ${CSQTT_IMAGE:-...}, quoted forms are possible as well.
+    value=$(printf '%s' "$line" | sed -E 's/[[:space:]]+$//; s/[}"'"'"']+$//')
+    printf '%s' "${value##*:}"
+}
+
 # --- Каждое продублированное место ------------------------------------------
 
 check_cargo_toml() {
@@ -144,6 +163,13 @@ check_cargo_lock() {
     local path="$1" package="$2"
     if require_file "$path"; then
         check_version "$path ($package)" "$(cargo_lock_version "$path" "$package")"
+    fi
+}
+
+check_image_tag() {
+    local path="$1" label="$2"
+    if require_file "$path"; then
+        check_version "$label" "$(image_tag "$path")"
     fi
 }
 
@@ -171,6 +197,9 @@ if require_file "$WEB_PANEL"; then
     check_version "$WEB_PANEL (CACHE_NAME)" \
         "$(sed -n "s/.*CACHE_NAME = 'csqtt-panel-shell-\([0-9][0-9.]*\)-pwa[0-9]*'.*/\1/p" "$WEB_PANEL" | head -n 1)"
 fi
+
+check_image_tag "$ROOT/docker/compose.yml" "docker/compose.yml (тег образа)"
+check_image_tag "$ROOT/docker/.env.example" "docker/.env.example (тег образа)"
 
 # --- Необязательный тег ------------------------------------------------------
 

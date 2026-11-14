@@ -6,12 +6,19 @@
 # across restarts. The server itself creates the SQLite database on first run.
 # Later starts reuse the volume and only rebuild netfilter state, then exec the
 # server. Ports come from install.json, so one image serves every installation.
+#
+# The three flags accepted below exist for compatibility with scripts/install.sh,
+# which passes --listen/--web-port/--config-dir to its container. They are only a
+# bootstrap input: a complete install.json always wins (see bootstrap_configuration).
 set -eu
 
-CONFIG_DIR=/etc/csqtt
+# Test hooks: paths are fixed for real deployments, env overrides let the smoke
+# test run the script against a copy under /tmp.
+CONFIG_DIR=${CSQTT_DOCKER_CONFIG_DIR:-/etc/csqtt}
+CSQTT_BIN=${CSQTT_DOCKER_CSQTT_BIN:-/usr/local/bin/csqtt}
+TUN_DEV=${CSQTT_DOCKER_TUN_DEV:-/dev/net/tun}
 ENV_FILE="$CONFIG_DIR/csqtt.env"
 INSTALL_STATE="$CONFIG_DIR/install.json"
-CSQTT_BIN=/usr/local/bin/csqtt
 CSQTT_IFACE=csqtt1
 CSQTT_SUBNET=10.66.67.0/24
 IPT_COMMENT=CSQTT_MANAGED
@@ -27,6 +34,19 @@ warn() { printf '[recsqtt] warning: %s\n' "$*" >&2; }
 die() {
     printf '[recsqtt] error: %s\n' "$*" >&2
     exit 1
+}
+
+usage() {
+    cat >&2 <<'EOF'
+Использование: entrypoint.sh [--listen ADDR] [--web-port PORT] [--config-dir DIR]
+
+  --listen ADDR      адрес туннеля host:port; исполняется только порт (по умолчанию 46000)
+  --web-port PORT    порт панели (домен 443, IP 46002)
+  --config-dir DIR   только /etc/csqtt: том монтируется туда
+
+Флаги нужны для совместимости с scripts/install.sh. При полном install.json
+источник правды — он, а расходящиеся флаги игнорируются с предупреждением.
+EOF
 }
 
 json_get() {
@@ -226,8 +246,9 @@ bootstrap_configuration() {
 
     panel_host=$(env_file_value CSQTT_PUBLIC_IP "$ENV_FILE" 2>/dev/null || true)
     panel_host=$(normalize_host "$panel_host")
+    state_panel_host=$(normalize_host "$(json_get panel_host "$INSTALL_STATE" 2>/dev/null || true)")
     if [ -z "$panel_host" ]; then
-        panel_host=$(normalize_host "$(json_get panel_host "$INSTALL_STATE" 2>/dev/null || true)")
+        panel_host=$state_panel_host
     fi
 
     state_peer_port=$(json_get peer_port "$INSTALL_STATE" 2>/dev/null || true)
@@ -286,30 +307,46 @@ bootstrap_configuration() {
         write_env_file "$web_user" "$web_pass" "$panel_host" "$web_secret"
     fi
 
-    peer_port=$state_peer_port
-    case "$peer_port" in
-        ''|*[!0-9]*) peer_port=$DEFAULT_PEER_PORT ;;
-    esac
-    web_port=$state_web_port
-    case "$web_port" in
-        ''|*[!0-9]*) web_port=$default_web_port ;;
-    esac
-
-    state_complete=0
-    if [ -n "$panel_host" ]; then
-        state_complete=1
-    fi
+    # A complete install.json wins over CLI flags: state and runtime must always
+    # agree, and the flags only exist so the installer does not lose its ports on
+    # a fresh volume. A partial state (crashed first start) is completed from CLI
+    # values and rewritten, so the flags land in install.json too.
+    state_complete=1
+    [ -n "$state_panel_host" ] || state_complete=0
     case "$state_panel_mode" in
         ip|domain) ;;
         *) state_complete=0 ;;
     esac
-    case "$state_peer_port" in
-        ''|*[!0-9]*) state_complete=0 ;;
-    esac
-    case "$state_web_port" in
-        ''|*[!0-9]*) state_complete=0 ;;
-    esac
-    if [ "$state_complete" = 0 ]; then
+    port_in_range "$state_peer_port" || state_complete=0
+    port_in_range "$state_web_port" || state_complete=0
+
+    if [ "$state_complete" = 1 ]; then
+        peer_port=$state_peer_port
+        web_port=$state_web_port
+        if [ -n "$CLI_PEER_PORT" ] && [ "$CLI_PEER_PORT" != "$peer_port" ]; then
+            warn "--listen port $CLI_PEER_PORT ignored: $INSTALL_STATE keeps peer/udp $peer_port"
+        fi
+        if [ -n "$CLI_WEB_PORT" ] && [ "$CLI_WEB_PORT" != "$web_port" ]; then
+            warn "--web-port $CLI_WEB_PORT ignored: $INSTALL_STATE keeps web/tcp $web_port"
+        fi
+    else
+        if [ -n "$state_peer_port" ] && ! port_in_range "$state_peer_port"; then
+            warn "ignoring out-of-range peer_port '$state_peer_port' in $INSTALL_STATE"
+        fi
+        if [ -n "$state_web_port" ] && ! port_in_range "$state_web_port"; then
+            warn "ignoring out-of-range web_port '$state_web_port' in $INSTALL_STATE"
+        fi
+        if port_in_range "$state_peer_port"; then
+            peer_port=$state_peer_port
+        else
+            peer_port=${CLI_PEER_PORT:-$DEFAULT_PEER_PORT}
+        fi
+        if port_in_range "$state_web_port"; then
+            web_port=$state_web_port
+        else
+            web_port=${CLI_WEB_PORT:-$default_web_port}
+        fi
+
         case "$state_installed_at" in
             ''|*[!0-9]*) state_installed_at=$(date +%s) ;;
         esac
@@ -327,11 +364,94 @@ port_value() {
     key=$1
     default=$2
     value=$(json_get "$key" "$INSTALL_STATE" 2>/dev/null || true)
-    case "$value" in
-        ''|*[!0-9]*) printf '%s\n' "$default" ;;
-        *) printf '%s\n' "$value" ;;
-    esac
+    if port_in_range "$value"; then
+        printf '%s\n' "$value"
+    else
+        printf '%s\n' "$default"
+    fi
 }
+
+# Validates a port and leaves it in PORT_VALUE. Called without command
+# substitution on purpose: die then terminates the script, not a subshell that
+# would leave the caller with an empty value.
+# 1..65535, digits only. Length is checked before arithmetic: a huge numeric
+# string makes test(1) fail with "Illegal number" and the value would slip
+# through instead of being rejected.
+port_in_range() {
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "${#1}" -le 5 ] || return 1
+    [ "$1" -ge 1 ] && [ "$1" -le 65535 ] || return 1
+    return 0
+}
+
+validate_port() {
+    port_label=$1
+    port_raw=$2
+    case "$port_raw" in
+        ''|*[!0-9]*) usage; die "$port_label expects a numeric port 1..65535, got '$port_raw'" ;;
+    esac
+    PORT_VALUE=$port_raw
+    # Leading zeros make test's integer parsing ambiguous (octal in some shells).
+    while [ "${#PORT_VALUE}" -gt 1 ] && [ "${PORT_VALUE#0}" != "$PORT_VALUE" ]; do
+        PORT_VALUE=${PORT_VALUE#0}
+    done
+    port_in_range "$PORT_VALUE" || \
+        { usage; die "$port_label expects a port 1..65535, got '$port_raw'"; }
+}
+
+# parse_cli "$@" — the only argv parsing. Unknown flags die before any side
+# effect, so a typo never leaves a half-created identity on the volume.
+parse_cli() {
+    CLI_PEER_PORT=""
+    CLI_WEB_PORT=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --listen)
+                [ -n "${2:-}" ] || { usage; die "--listen requires a host:port value"; }
+                case "$2" in
+                    *:*) ;;
+                    *) usage; die "--listen expects host:port, got '$2'" ;;
+                esac
+                cli_listen_host=${2%:*}
+                validate_port "--listen" "${2##*:}"
+                CLI_PEER_PORT=$PORT_VALUE
+                if [ "$cli_listen_host" != "0.0.0.0" ]; then
+                    # The server is exec'd with 0.0.0.0:$CLI_PEER_PORT regardless:
+                    # a loopback bind inside a host-network container is silently
+                    # unreachable for clients.
+                    warn "--listen host '$cli_listen_host' is ignored; the tunnel binds 0.0.0.0"
+                fi
+                shift 2
+                ;;
+            --web-port)
+                [ -n "${2:-}" ] || { usage; die "--web-port requires a port value"; }
+                validate_port "--web-port" "$2"
+                CLI_WEB_PORT=$PORT_VALUE
+                shift 2
+                ;;
+            --config-dir)
+                [ -n "${2:-}" ] || { usage; die "--config-dir requires a directory"; }
+                cli_config_dir=$2
+                while [ "${#cli_config_dir}" -gt 1 ] && [ "${cli_config_dir%/}" != "$cli_config_dir" ]; do
+                    cli_config_dir=${cli_config_dir%/}
+                done
+                # The volume is bind-mounted at a fixed path; moving the whole
+                # directory is not supported by this image.
+                [ "$cli_config_dir" = "$CONFIG_DIR" ] || \
+                    die "--config-dir '$2' is not supported: the data volume is mounted at $CONFIG_DIR"
+                shift 2
+                ;;
+            *)
+                usage
+                die "unknown argument '$1'"
+                ;;
+        esac
+    done
+}
+
+parse_cli "$@"
 
 bootstrap_configuration
 
@@ -343,14 +463,6 @@ esac
 
 PEER_PORT=$(port_value peer_port "$DEFAULT_PEER_PORT")
 WEB_PORT=$(port_value web_port "$WEB_DEFAULT")
-
-# The panel moves between 443 (domain) and 46002 (IP). A stale ACCEPT from the
-# previous mode is still there because rules are only ever added.
-case "$WEB_PORT" in
-    443) STALE_WEB_PORT=46002 ;;
-    46002) STALE_WEB_PORT=443 ;;
-    *) STALE_WEB_PORT="" ;;
-esac
 
 # csqtt.env is shell- and systemd-compatible; sourcing with -a is what strips
 # the quoting. Compose env_file must not be used instead: it keeps the quotes
@@ -365,6 +477,12 @@ else
 fi
 
 PANEL_HOST=${CSQTT_PUBLIC_IP:-}
+# csqtt.env is the source of truth for the host (the panel reads it); a stale
+# install.json host otherwise diverges forever without a word.
+host_cmp=$(printf '%s' "$PANEL_HOST" | tr '[:upper:]' '[:lower:]')
+if [ -n "${state_panel_host:-}" ] && [ -n "$PANEL_HOST" ] && [ "$state_panel_host" != "$host_cmp" ]; then
+    warn "panel host mismatch: csqtt.env keeps '$PANEL_HOST', $INSTALL_STATE has '$state_panel_host'; the panel uses csqtt.env"
+fi
 ensure_certificate "$CERT_HOST" "$CERT_MODE" || true
 
 panel_url() {
@@ -392,7 +510,7 @@ if [ "$BOOTSTRAP_PRINT_CREDENTIALS" = 1 ]; then
     printf '──────────────────────────────────────────────────────────────\n'
 fi
 
-[ -c /dev/net/tun ] || die "/dev/net/tun is missing; run 'modprobe tun' on the host before starting the container"
+[ -c "$TUN_DEV" ] || die "$TUN_DEV is missing; run 'modprobe tun' on the host before starting the container"
 
 is_ignored_wan_interface() {
     ignored_iface=${1%%@*}
@@ -473,12 +591,6 @@ fi
 
 ipt() { iptables -w "$XT_WAIT" "$@"; }
 
-# Docker creates a missing bind source as a directory, and iptables cannot use a
-# directory as its lock file. The fix is on the host; just say it clearly.
-if [ -d /run/xtables.lock ]; then
-    warn "/run/xtables.lock is a directory (Docker created it); on the host run: docker compose down && sudo rmdir /run/xtables.lock && sudo touch /run/xtables.lock"
-fi
-
 # Check-then-add, same semantics as the installer's ipt_add_or_ensure.
 # Missing rule is normal; a rule that cannot be installed is reported once and
 # never fatal, so a degraded firewall does not hide the panel behind a crash.
@@ -497,23 +609,54 @@ ensure_rule() {
     return 1
 }
 
-remove_stale_panel_rule() {
-    [ -n "$STALE_WEB_PORT" ] || return 0
-    stale_attempt=1
-    while [ "$stale_attempt" -le 8 ]; do
-        stale_listing=$(ipt -S INPUT 2>/dev/null || true)
-        printf '%s\n' "$stale_listing" | \
-            grep -Eq -- "^-A INPUT .*--dport ${STALE_WEB_PORT}([[:space:]]|$).*${IPT_COMMENT}" || return 0
-        ipt -D INPUT -p tcp --dport "$STALE_WEB_PORT" -m comment --comment "$IPT_COMMENT" -j ACCEPT >/dev/null 2>&1 && return 0
-        stale_attempt=$((stale_attempt + 1))
+# Rules are only ever added, so an earlier start can leave an ACCEPT for a port
+# that is not the effective one (the panel moves between 443 for a domain and
+# 46002 for an IP, and a CLI/install.json override sits in between). Remove every
+# managed INPUT TCP ACCEPT whose port is not the current web port; other chains
+# and tables (FORWARD/nat/mangle) are never touched here.
+remove_stale_panel_rules() {
+    stale_listing=$(ipt -S INPUT 2>/dev/null || true)
+    [ -n "$stale_listing" ] || return 0
+    printf '%s\n' "$stale_listing" | while IFS= read -r stale_rule; do
+        case "$stale_rule" in
+            "-A INPUT "*) ;;
+            *) continue ;;
+        esac
+        case "$stale_rule" in
+            *"-p tcp"*) ;;
+            *) continue ;;
+        esac
+        case "$stale_rule" in
+            *"$IPT_COMMENT"*) ;;
+            *) continue ;;
+        esac
+        case "$stale_rule" in
+            *"-j ACCEPT"*) ;;
+            *) continue ;;
+        esac
+        stale_port=$(printf '%s\n' "$stale_rule" | sed -n -E 's/.*--dport[[:space:]=]+([0-9]+).*/\1/p')
+        [ -n "$stale_port" ] || continue
+        [ "$stale_port" = "$WEB_PORT" ] && continue
+        # LE HTTP-01 stays open on its own port; deleting and re-adding it on
+        # every start would briefly close the ACME path for an external renew.
+        [ "$stale_port" = "$LE_HTTP_PORT" ] && continue
+        stale_attempt=1
+        stale_removed=0
+        while [ "$stale_attempt" -le 8 ]; do
+            if ipt -D INPUT -p tcp --dport "$stale_port" -m comment --comment "$IPT_COMMENT" -j ACCEPT >/dev/null 2>&1; then
+                stale_removed=1
+                break
+            fi
+            stale_attempt=$((stale_attempt + 1))
+        done
+        [ "$stale_removed" = 1 ] || warn "iptables: stale TCP/$stale_port ACCEPT could not be removed"
     done
-    warn "iptables: stale TCP/$STALE_WEB_PORT ACCEPT could not be removed"
 }
 
 if ! ipt -S INPUT >/dev/null 2>&1; then
     warn "netfilter is unavailable (NET_ADMIN missing?); starting without iptables rules"
 else
-    remove_stale_panel_rule
+    remove_stale_panel_rules
 
     ensure_rule filter INPUT -p udp --dport "$PEER_PORT" -m comment --comment "$IPT_COMMENT" -j ACCEPT || true
     ensure_rule filter INPUT -p tcp --dport "$WEB_PORT" -m comment --comment "$IPT_COMMENT" -j ACCEPT || true
@@ -538,7 +681,12 @@ fi
 (
     umask 077
     mkdir -p "$(dirname "$NETWORK_READY_FILE")" 2>/dev/null || true
-    : >"$NETWORK_READY_FILE" 2>/dev/null || true
+    # printf, not ":" — a redirection error on a POSIX special builtin exits
+    # the shell even with "|| true", so a read-only runtime dir killed the
+    # container instead of only skipping the marker.
+    # Group redirection: a failed ">" is reported to the shell's stderr, so a
+    # per-command 2>/dev/null on the same line does not silence it in dash.
+    { printf '' >"$NETWORK_READY_FILE"; } 2>/dev/null || true
 )
 
 log "starting reCSQTT: peer/udp $PEER_PORT, web/tcp $WEB_PORT, mode ${PANEL_MODE:-unknown}"

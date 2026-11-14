@@ -52,23 +52,19 @@ assert'а порядка, а не таймаута.
 - Оба пункта выше — продакшн/tests-дефекты, а не проблемы раннера; изоляция
   тестов (`--test-threads=1`) их не лечит.
 
-## 5. Два Dockerfile расходятся (2026-11-13, follow-up)
+## 5–7. Docker follow-ups — закрыты (2026-11-13)
 
-`scripts/install.sh` строит локальный образ из генерируемых helper'ов
-(`network-up.sh`/`tun-recover.sh`, запечённые порты), а GHCR-образ
-(`docker/Dockerfile` + `docker/entrypoint.sh`) — self-bootstrap с динамическим
-чтением `install.json`. Установщик пока использует свой образ, поэтому не
-ломается, но паритет ничем не проверяется: если переключить установщик на
-GHCR-образ, его `$@` (`--listen/--web-port/--config-dir`) будет проигнорирован.
-
-## 6. Версия образа продублирована вне гейта (follow-up)
-
-`docker/compose.yml` и `docker/.env.example` содержат тег `2.5.4`, а
-`check_versions.sh` их не читает. Следующий бамп разъедется; нужен либо единый
-источник тега, либо проверка в `check_versions.sh`.
-
-## 7. Нет поведенческих тестов entrypoint (follow-up)
-
-`docker/entrypoint.sh` проверяется только `sh -n`/shellcheck; генерация
-identity, bootstrap частичного тома и iptables — без автотестов. Смоук-прогоны
-делались вручную.
+- **§5 Паритет entrypoint.** `docker/entrypoint.sh` принимает `--listen/--web-port/--config-dir`;
+  при существующем полном `install.json` CLI игнорируется с предупреждением (state wins),
+  `--config-dir` допускается только как `/etc/csqtt`. Установщик и GHCR-образ теперь
+  совместимы по контракту портов; stale `CSQTT_MANAGED` ACCEPT-правила чистятся по принципу
+  «dport ≠ эффективного» (LE-порт 80 не трогается).
+- **§6 Версия образа.** `scripts/check_versions.sh` сверяет тег `recsqtt:<ver>` в
+  `docker/compose.yml` (включая форму `${CSQTT_IMAGE:-…}`) и `docker/.env.example` с
+  `versionName`; фикстура ловит отставший и отсутствующий файл.
+- **§7 Поведенческие тесты.** `.github/tests/docker-entrypoint.sh` (106 ассертов) гоняет
+  shipped entrypoint через три env-хука и шимы `ip`/`iptables`/`csqtt`: bootstrap домен/IP,
+  state-wins на повторном старте, частичная TLS-пара (уцелевший файл не меняется),
+  stale netfilter с произвольным портом, неполный `install.json` + CLI, порты вне диапазона,
+  отсутствие TUN, ошибки флагов.
+- Вне тестов остаётся реальный netfilter/TUN/`docker run` и busybox-`sh` образа.

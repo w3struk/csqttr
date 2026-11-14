@@ -27,7 +27,6 @@ services:
     volumes:
       - ./csqtt-data:/etc/csqtt
       - /run/csqtt:/run/csqtt
-      - /run/xtables.lock:/run/xtables.lock
     environment:
       CSQTT_SERVICE_MANAGER: docker
       # Optional public domain (e.g. vpn.example.org). Empty means autodetect

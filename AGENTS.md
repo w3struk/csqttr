@@ -21,9 +21,10 @@ release-ассет `install.sh`).
 
 ## Доступ к тестовому серверу
 
-На тестовом VPS стоит живая установка reCSQTT (Debian, systemd-режим, панель на
-порту 46002). Конкретные адрес, hostname и пользователя **владелец называет в
-ответ на запрос** — они меняются, поэтому зашивать их сюда нельзя.
+На тестовом VPS стоит живая установка reCSQTT в Docker-режиме: домен, панель на
+443 с сертификатом Let’s Encrypt, конфиг и БД в `/etc/csqtt`. Конкретные адрес,
+hostname и пользователя **владелец называет в ответ на запрос** — они меняются,
+поэтому зашивать их сюда нельзя.
 
 Агент, которому нужно заглянуть на сервер, **не имеет доступа по умолчанию** —
 ни ключа, ни агента. Доступ даёт владелец, и только на время задачи.
@@ -56,8 +57,8 @@ ssh-add -l
 
 Если сокет занят засохшим файлом, удалить его: `rm -f "$HOME/.ssh/agent/opencode.sock"`.
 
-Агент использует ключ из `SSH_AUTH_SOCK="$HOME/.ssh/agent/opencode.sock"`; агент
-должен быть запущен в этой же сессии оболочки, иначе сокет не ответит.
+Агент берёт ключ из `SSH_AUTH_SOCK="$HOME/.ssh/agent/opencode.sock"` и должен
+работать в этой же сессии оболочки, иначе сокет не ответит.
 
 ### Как отозвать
 
@@ -89,23 +90,23 @@ ssh-add -d ~/.ssh/id_ed25519              # убрать только этот �
 | `rust-server/` | Крейт `csqtt`. cargo-zigbuild (статический musl, только amd64) → `app/build/generated/assets/` и `rust-server/dist/`. В APK не пакуется: release CI публикует бинарь отдельным ассетом. |
 | `shared/` | 3 файла `.rs`, компилируемых в **оба** крейта через `#[path = "../shared/..."] mod ...;` в каждом `main.rs`. Не cargo workspace и не path-зависимость. `dtls.rs` и `wire_protocol.rs` общие; `spsc_ring.rs` только для клиента. |
 | `scripts/` | `android_env.sh`, `device_abi.sh` (определяет ABI подключённого устройства), два скрипта provenance, `build_apk.sh`, `install_apk.sh`, `run_system_checks.sh`. Пути артефактов настраиваются флагами `--variant`, `--jni-libs-dir`, `--assets-dir`, `--manifest`; значения по умолчанию — `app/build/generated/`. |
-| `scripts/install.sh` | Публичный установщик на ~2.5k строк: скачивает серверный релиз и ставится на сервер вручную или one-liner'ом (режим systemd или docker). |
+| `scripts/install.sh` | Публичный установщик на ~5.7k строк: скачивает серверный релиз и ставится на сервер вручную или one-liner'ом (режим systemd или docker). |
 | `scripts/bootstrap.sh` | Тонкий вход one-liner'а: резолвит тег (`releases/latest`), скачивает `install.sh` и `SHA256SUMS`, сверяет SHA-256 и запускает установщик с проброшенными аргументами. Публикуется ассетом рядом с `install.sh`. |
 | `rust-server/data/` | Фиксированные ассеты маршрутизации: `domains_ru.txt` (515 доменов) и `ips_ru.txt` (6 710 CIDR) + `SOURCES.md` с источниками. Подключены `include_str!` в `rust-server/routing_assets.rs`; клиент и приложение своих копий не содержат. |
 
 ## Нативная часть: варианты и грабли
 
-Всё генерируемое Rust лежит в `app/build/generated/` — в `app/src` не попадает ничего, и
-`./gradlew clean` удаляет нативную часть целиком. Gradle собирает клиентскую часть и
-проверяет её по provenance; цепочка и свойства `-Pcsqtt.*` — в
+Всё генерируемое Rust лежит в `app/build/generated/` — в `app/src` ничего не
+попадает, а `./gradlew clean` удаляет нативную часть целиком. Gradle собирает
+клиентскую часть и проверяет её по provenance; цепочка и свойства `-Pcsqtt.*` — в
 [BUILDING.md](BUILDING.md#provenance-и-защита-от-протухших-бинарников).
 
 | Вариант Android | Каталог | Профиль Cargo |
 | --- | --- | --- |
-| `debug` | `app/build/generated/jniLibs/debug/` | `dev` (`opt-level = 1`, `debug = "line-tables-only"`) |
+| `debug` | `app/build/generated/jniLibs/debug/` | `android-debug` (`inherits = "dev"`: `opt-level = 1`, `strip = "debuginfo"`) |
 | `release` | `app/build/generated/jniLibs/release/` | `release` (`opt-level = 3`, LTO, `strip = true`) |
 
-Серверный бинарник вариантонезависим и всегда собирается в профиле `release`
+Серверный бинарник не зависит от варианта Android: он всегда собирается в профиле `release`
 вне Gradle — `rust-server/build_linux.sh` кладёт его в
 `app/build/generated/assets/` и `rust-server/dist/`. В APK он не попадает: это
 отдельный release-ассет и вход для `scripts/install.sh`.
@@ -153,7 +154,8 @@ ARM-режима нет; подробности сборки и очистки �
 ./gradlew :app:testDebugUnitTest
 ./gradlew :app:testDebugUnitTest --tests "com.csqtt.client.WifiAutoPausePolicyTest"
 
-# Rust-клиент — под хостовую цель; 362 теста, после компиляции проходят за секунды
+# Rust-клиент — под хостовую цель; 474 теста (11 E2E помечены #[ignore]),
+# после компиляции проходят за секунды
 cd rust-client && cargo test
 cd rust-client && cargo test turn_stream        # фильтр по подстроке
 cd rust-client && bash check_no_runtime_panics.sh
@@ -257,7 +259,7 @@ sudo csqttctl status
 
 ## Соглашения Kotlin
 
-- Логика, которую нужно тестировать, выносится в файлы вида `internal object *Policy` / top-level
+- Тестируемую логику выносите в файлы вида `internal object *Policy` / top-level
   `internal fun` (`TunnelServicePolicy.kt`, `WifiAutoPausePolicy.kt`, `WorkerCountPolicy.kt`, …), чтобы её
   можно было прогнать на JVM. Добавляя нетривиальную логику внутрь Service/Manager, выносите Policy,
   а не пытайтесь тестировать сам Service.

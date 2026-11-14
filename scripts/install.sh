@@ -1566,7 +1566,7 @@ restore_runtime_snapshot_files() {
     fi
     # Docker prereq подключается к docker.service через RequiredBy; csqtt_cleanup
     # эти ссылки снимает, поэтому откат обязан вернуть и их, иначе после reboot
-    # TUN/xtables lock не будут готовы до старта контейнера.
+    # TUN не будет готов до старта контейнера.
     if [ -d "$CSQTT_SYSTEMD_DIR" ] && [ -f "${CSQTT_SYSTEMD_DIR}/${CSQTT_DOCKER_PREREQ_SERVICE}" ]; then
         mkdir -p "${CSQTT_SYSTEMD_DIR}/docker.service.requires" 2>/dev/null || true
         ln -sfn "${CSQTT_SYSTEMD_DIR}/${CSQTT_DOCKER_PREREQ_SERVICE}" \
@@ -1689,7 +1689,6 @@ run_restored_docker_container() {
         --env CSQTT_SERVICE_MANAGER=docker \
         --volume "$CSQTT_CONFIG_DIR:$CSQTT_CONFIG_DIR" \
         --mount "type=bind,src=${CSQTT_RUNTIME_DIR},dst=${CSQTT_RUNTIME_DIR}" \
-        --mount "type=bind,src=/run/xtables.lock,dst=/run/xtables.lock" \
         "${DOCKER_PREVIOUS_IMAGE_ID:-${DOCKER_PREVIOUS_IMAGE_TAG:-$CSQTT_DOCKER_IMAGE}}" \
         --listen "0.0.0.0:${PEER_PORT}" \
         --web-port "$WEB_PORT" \
@@ -4544,8 +4543,6 @@ chmod 666 /dev/net/tun 2>/dev/null || true
 mkdir -p "${CSQTT_RUN_DIR}"
 chmod 0755 "${CSQTT_RUN_DIR}" 2>/dev/null || true
 rm -f "${CSQTT_DOCKER_NETWORK_READY}"
-touch /run/xtables.lock
-chmod 600 /run/xtables.lock 2>/dev/null || true
 PREREQ
     chmod 0755 "$CSQTT_DOCKER_PREREQ_HELPER"
 
@@ -4553,7 +4550,7 @@ PREREQ
     unit_tmp="$(mktemp)"
     cat > "$unit_tmp" << PREREQUNIT
 [Unit]
-Description=Prepare reCSQTT Docker TUN and xtables lock
+Description=Prepare reCSQTT Docker TUN
 After=local-fs.target
 Before=docker.service
 
@@ -4573,7 +4570,7 @@ PREREQUNIT
     "$CSQTT_DOCKER_PREREQ_HELPER" || \
         die "Не удалось обновить Docker runtime prerequisites"
     systemctl start "$CSQTT_DOCKER_PREREQ_SERVICE" || \
-        die "Не удалось подготовить TUN/xtables lock для Docker"
+        die "Не удалось подготовить Docker TUN"
 }
 
 write_csqtt_dockerfile() {
@@ -4707,7 +4704,6 @@ run_csqtt_docker_container() {
         --env CSQTT_SERVICE_MANAGER=docker \
         --volume "$CSQTT_CONFIG_DIR:$CSQTT_CONFIG_DIR" \
         --mount "type=bind,src=${CSQTT_RUNTIME_DIR},dst=${CSQTT_RUNTIME_DIR}" \
-        --mount "type=bind,src=/run/xtables.lock,dst=/run/xtables.lock" \
         "${CSQTT_DOCKER_RUN_IMAGE:-$CSQTT_DOCKER_IMAGE}" \
         --listen "0.0.0.0:${PEER_PORT}" \
         --web-port "$WEB_PORT" \

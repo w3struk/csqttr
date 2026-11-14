@@ -525,6 +525,24 @@ want(
     "получено %r" % (image_tags,),
 )
 
+want(
+    str(image_push_with.get("load", "")).strip()
+    == "${{ needs.resolve.outputs.dry_run == 'true' }}",
+    "в dry-run образ обязан грузиться локально (load), иначе смоук нечего "
+    "запускать, получено %r" % (image_push_with.get("load"),),
+)
+image_smoke = image_by_name.get("Smoke-test the image (TUN and panel)")
+want(
+    image_smoke is not None,
+    "в image нет шага 'Smoke-test the image (TUN and panel)'",
+)
+smoke_run = str((image_smoke or {}).get("run", ""))
+for needle in ("--device /dev/net/tun", "csqtt1", "<title>reCSQTT", "docker rm -f recsqtt-smoke"):
+    want(
+        needle in smoke_run,
+        "смоук образа обязан содержать %r, получено %r" % (needle, smoke_run[:200]),
+    )
+
 # --- publish -----------------------------------------------------------------
 publish_job = jobs["publish"]
 want(isinstance(publish_job, dict), "job publish — не mapping")

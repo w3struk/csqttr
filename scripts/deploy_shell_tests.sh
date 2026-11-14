@@ -1559,6 +1559,11 @@ test_docker_run_grants_net_bind_service() {
     t_run 'run_csqtt_docker_container'
     t_assert_contains "$CALL_LOG" "--cap-add NET_BIND_SERVICE" \
         "контейнер под --cap-drop ALL не забиндит 443 без этой capability"
+    # Образ на iptables-nft не открывает файл блокировки; монтирование файла
+    # создавало только ловушку «Docker сделал каталог».
+    if grep -qF -- 'xtables' "$CALL_LOG"; then
+        t_fail "docker run не должен монтировать /run/xtables.lock"
+    fi
 }
 
 # Кандидат занимает основной тег только после health-check, поэтому к моменту

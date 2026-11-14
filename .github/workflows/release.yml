@@ -170,9 +170,63 @@ jobs:
           file: docker/Dockerfile
           platforms: linux/amd64
           push: ${{ needs.resolve.outputs.dry_run == 'false' }}
+          # В dry-run образ никуда не уходит, поэтому грузим его в локальный
+          # docker, чтобы следующий шаг мог его запустить.
+          load: ${{ needs.resolve.outputs.dry_run == 'true' }}
           tags: |
             ghcr.io/${{ github.repository_owner }}/recsqtt:${{ needs.resolve.outputs.version }}
             ghcr.io/${{ github.repository_owner }}/recsqtt:latest
+
+      # Смоук на настоящем ядре: контейнер с NET_ADMIN и /dev/net/tun обязан
+      # поднять csqtt1 и ответить панелью. Шимы в
+      # .github/tests/docker-entrypoint.sh проверяют только решения скрипта,
+      # а не netfilter/TUN/ash из alpine.
+      - name: Smoke-test the image (TUN and panel)
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          DRY_RUN: ${{ needs.resolve.outputs.dry_run }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${{ github.repository_owner }}/recsqtt:${VERSION}"
+          if [ "$DRY_RUN" = "false" ]; then
+            docker pull "$image"
+          fi
+          sudo modprobe tun 2>/dev/null || true
+          if [ ! -e /dev/net/tun ]; then
+            sudo mkdir -p /dev/net
+            sudo mknod /dev/net/tun c 10 200
+            sudo chmod 666 /dev/net/tun
+          fi
+          work="$(mktemp -d)"
+          cleanup() { docker rm -f recsqtt-smoke >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          # IP-режим: панель на 46002, TUN csqtt1 в netns хоста (network host).
+          docker run -d --name recsqtt-smoke --network host \
+            --cap-add NET_ADMIN --cap-add NET_RAW --cap-add NET_BIND_SERVICE \
+            --device /dev/net/tun --security-opt seccomp=unconfined \
+            --ulimit nofile=65535:65535 \
+            -e CSQTT_HOST=203.0.113.7 \
+            -v "$work/data:/etc/csqtt" \
+            "$image"
+          tun=0
+          code=000
+          for _ in $(seq 1 60); do
+            if ip link show csqtt1 >/dev/null 2>&1; then tun=1; fi
+            secret=$(sed -n 's/^CSQTT_WEB_SECRET_PATH="\(.*\)"/\1/p' "$work/data/csqtt.env" 2>/dev/null || true)
+            if [ -n "$secret" ]; then
+              code=$(curl -sk -o "$work/body" -w '%{http_code}' "https://127.0.0.1:46002/$secret" || true)
+              if [ "$code" = "200" ]; then break; fi
+            fi
+            sleep 2
+          done
+          docker logs recsqtt-smoke >"$work/log" 2>&1 || true
+          if [ "$tun" != 1 ]; then cat "$work/log"; echo "TUN csqtt1 did not come up" >&2; exit 1; fi
+          if [ "$code" != "200" ]; then cat "$work/log"; echo "panel did not answer, last status $code" >&2; exit 1; fi
+          if ! grep -q '<title>reCSQTT' "$work/body"; then cat "$work/body"; echo "panel title is not reCSQTT" >&2; exit 1; fi
+          if [ "$(grep -c 'Пароль:' "$work/log" || true)" != 1 ]; then
+            cat "$work/log"; echo "credentials printed not exactly once" >&2; exit 1
+          fi
+          echo "smoke ok: TUN up, panel 200, title reCSQTT, credentials once"
 
   publish:
     name: Publish release

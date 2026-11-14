@@ -17,8 +17,8 @@ Gradle собирает и проверяет **только клиент** (`ca
 собирается отдельным скриптом локально или в CI и публикуется release-ассетом;
 чистый клон собирает APK без ручных шагов.
 
-В `app/src` не попадает ничего, а `./gradlew clean` удаляет нативную часть целиком
-(потребуется пересборка cargo — она инкрементальна).
+В `app/src` ничего не попадает, а `./gradlew clean` удаляет нативную часть
+целиком (пересборка cargo инкрементальна).
 
 ## Зависимости
 
@@ -132,7 +132,7 @@ debug другой `applicationId` (`…debug`).
 
 Передача APK идёт через `adb push -Z` (sync-протокол без сжатия) — самый быстрый
 путь, который есть у adb, а shell-транспорт и `adb push` без `-Z` остались запасными (в
-том числе для adb, не знающего `-Z`). Результатом переноса считается файл на устройстве, а не код возврата команды. Принудительный выбор —
+том числе для adb, не знающего `-Z`). Результат переноса — файл на устройстве, а не код возврата команды. Принудительный выбор —
 `PUSH_METHOD=shell|push|auto` (по умолчанию `auto`).
 
 ### Флаги
@@ -189,7 +189,7 @@ bash scripts/run_system_checks.sh   # требует root для TUN/systemd п�
          CXX_x86_64_unknown_linux_musl=/tmp/zigwrap/zigcxx \
          AR_x86_64_unknown_linux_musl=/tmp/zigwrap/zigar \
          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=/tmp/zigwrap/zigcc
-  cargo test --target x86_64-unknown-linux-musl   # 146 проходят, 1 пропущен
+  cargo test --target x86_64-unknown-linux-musl   # 279 проходят, 1 пропущен
   ```
 
   Каждая переменная окружения должна быть голым путём к исполняемому файлу — cargo
@@ -244,14 +244,14 @@ bash scripts/run_system_checks.sh   # требует root для TUN/systemd п�
 
 | Канал | Куда идёт | Debug | Release |
 | --- | --- | --- | --- |
-| Kotlin `Log.*` (67 вызовов) | `adb logcat`, теги по компонентам (`TunVpnService`, `TunnelService`, …) | всё видно | `Log.d`/`Log.v` вырезаются R8 (`-assumenosideeffects`), `i/w/e` остаются |
+| Kotlin `Log.*` (68 вызовов) | `adb logcat`, теги по компонентам (`TunVpnService`, `TunnelService`, …) | всё видно | `Log.d`/`Log.v` вырезаются R8 (`-assumenosideeffects`), `i/w/e` остаются |
 | Rust-клиент, stdout | `CSQTT/Protocol` | зеркалируется в logcat | не зеркалируется |
 | Rust-клиент, stderr | `CSQTT/Diagnostic` | зеркалируется в logcat | не зеркалируется |
 | In-app журнал (`TunnelManager.logs`) | экран приложения, копирование в отчёт | работает | работает; управляется тумблером `participant_show_logs` («Показывать логи»): выключен — только ошибки и статус, вкладка скрыта |
 
 Потоки ребёнка разведены (`redirectErrorStream(false)`): stdout несёт протокол и
 события `__CSQTT_EVENT__`, stderr — всё, что Rust пишет через `log_error!`/`log_info!`
-(это 181 из 183 вызовов). Зеркалирование в logcat (`mirrorRustLineToLogcat`) включено
+(196 вызовов). Зеркалирование в logcat (`mirrorRustLineToLogcat`) включено
 только под `BuildConfig.DEBUG`, поэтому release не получает поток Rust вообще.
 Строки длиннее 4000 символов режутся на части — logcat обрезает длинные записи.
 Severity — эвристика по содержимому (`Ошибка`/`error`/`FAIL`/`FATAL`/`panic` → `Log.e`),
@@ -264,7 +264,7 @@ adb logcat -s CSQTT/Protocol,CSQTT/Diagnostic
 ```
 
 Журнал в приложении и logcat не дублируют друг друга: на пути журнала нет `Log.*`
-(кроме debug-only зеркалирования выше), а 67 Kotlin-логов в UI не показываются.
+(кроме debug-only зеркалирования выше), а 68 Kotlin-логов в UI не показываются.
 
 ## Provenance и защита от «протухших» бинарников
 
@@ -382,8 +382,8 @@ CI — три workflow: `.github/workflows/build.yml` (`workflow_call`: гейт
 коммит, на котором стоит тег `v*`, бета пропускает — релизный APK публикует release.yml).
 Порядок выпуска: сначала тег, потом push `main`.
 
-Серверный бинарник собирается в `build.yml` шагом `Build server binary`
-(`bash rust-server/build_linux.sh --tests`) и публикуется отдельным ассетом.
+Шаг `Build server binary` в `build.yml` собирает серверный бинарник
+(`bash rust-server/build_linux.sh --tests`) и публикует его отдельным ассетом.
 Gradle сервер не собирает: APK содержит только клиент.
 
 Отдельного серверного гейта больше нет: `--tests` выполняется в том же шаге, что

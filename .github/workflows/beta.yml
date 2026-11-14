@@ -200,11 +200,6 @@ jobs:
             printf 'reCSQTT Beta\n\n'
             printf 'Version: %s (%s)\n' "$VERSION" "$VERSION_CODE"
             printf 'APK: %s\n\n' "$(basename -- "$dst")"
-            # Приложение — только участник: сервер в APK не едет и из
-            # приложения не ставится. Тестер узнаёт это из сообщения.
-            printf 'Внимание: приложение — только участник; сервер ставится через bootstrap.sh/install.sh и обслуживается csqttctl.\n'
-            printf 'Клиенты создаются в веб-панели, подключение — по ссылке csqtt://.\n'
-            printf 'Понижение версии — восстановление БД.\n\n'
             printf 'Commit: <a href="%s/%s/commit/%s">%s</a>\n' \
               "$server_url" "$GITHUB_REPOSITORY" "$COMMIT" "$commit_short"
             printf '%s\n' "$(escape_html "$subject")"
